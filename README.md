@@ -82,7 +82,7 @@ To turn it off for a whole organization, in managed settings:
 }
 ```
 
-The key is the plugin's ID: `mainwave@synced` for org sync, `mainwave@mainwave` for an install from this repository, or `mainwave` for a `--plugin-dir` load.
+The key is the plugin's ID: `mainwave@synced` for org sync, `mainwave@mainwave` for an install from this repository, or `mainwave` (or `mainwave@inline`) for a `--plugin-dir` load.
 
 ## Developing
 
@@ -92,10 +92,11 @@ The plugin sits at the repository's root: `.claude-plugin/plugin.json` (the mani
 claude plugin validate .        # reads the manifest, the marketplace and the hooks module the way Claude Code will
 claude plugin test .            # runs tests/*.test.ts against the engine
 scripts/check-version.sh        # plugin.json and hooks/version.ts agree
+scripts/check-hooks.sh          # the row hook is registered with its fail-open .catch, and session.end is hooked
 claude --plugin-dir .           # a session with the plugin loaded from this folder
 ```
 
-CI runs the first three on every pull request. The type check runs locally: start one interactive session with `claude --plugin-dir .`, which writes Claude Code's declarations to `.claude-plugin/types/` (gitignored), then run `npx -p typescript tsc -p .`.
+CI runs all but the last on every pull request. The type check runs locally: start one interactive session with `claude --plugin-dir .`, which writes Claude Code's declarations to `.claude-plugin/types/` (gitignored), then run `npx -p typescript@5.6.3 tsc -p .`.
 
 A release bumps the version in both `.claude-plugin/plugin.json` and `hooks/version.ts`.
 

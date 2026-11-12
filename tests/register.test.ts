@@ -154,16 +154,31 @@ describe('identity from rows', () => {
 
   test('a failed write never holds the row', async ($, on) => {
     const rig = boot(on)
-    on('state.set', () => { throw new Error('state refused in test') })
+    on('state.set', () => ({ deny: 'state refused in test' }) as never)
     const a = await log(rig, $, { ...inOrg, 'user.email': EMAIL })
     expect(ownedKeys(a)).toEqual(STAMPED)
   })
 
-  test('the identity is never stamped on the row by the plugin', async ($, on) => {
+  test('two rows that land together each keep their fields', async ($, on) => {
     const rig = boot(on)
-    const a = await log(rig, $, { 'organization.id': ORG })
-    expect(a['user.email']).toBeUndefined()
-    expect(a['user.id']).toBeUndefined()
+    const writes = watchIdentity(on)
+    // The two rows' updates overlap: the second write misses its version and is made again over the first one's value.
+    await Promise.all([
+      $.telemetry.log({ to: 'collector', event: 'a', attributes: { ...inOrg, 'user.email': EMAIL }, loggedAt: '2026-11-12T00:00:00.000Z' } as never),
+      $.telemetry.log({ to: 'collector', event: 'b', attributes: { ...inOrg, 'user.id': DEVICE }, loggedAt: '2026-11-12T00:00:00.000Z' } as never),
+    ])
+    expect(rig.rows.length).toBe(2)
+    expect(writes[writes.length - 1]).toEqual({ organizationId: ORG, email: EMAIL, deviceId: DEVICE })
+  })
+
+  test("the plugin adds no identity of its own: Claude Code's identity attributes go on as they came", async ($, on) => {
+    const rig = boot(on)
+    const a = await log(rig, $, { ...inOrg, 'user.email': EMAIL, 'user.id': DEVICE, 'user.account_uuid': ACCOUNT })
+    expect(a['user.email']).toBe(EMAIL)
+    expect(a['user.id']).toBe(DEVICE)
+    expect(a['user.account_uuid']).toBe(ACCOUNT)
+    for (const key of ownedKeys(a)) expect([EMAIL, DEVICE, ACCOUNT, ORG]).not.toContain(a[key])
+    expect(ownedKeys(a)).toEqual(STAMPED)
   })
 })
 

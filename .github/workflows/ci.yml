@@ -41,5 +41,7 @@ jobs:
         run: scripts/check-version.sh
       - name: Validate the plugin and its marketplace
         run: claude plugin validate .
+      - name: Hooks as the engine will load them
+        run: scripts/check-hooks.sh
       - name: Test
         run: claude plugin test .

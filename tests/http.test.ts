@@ -4,6 +4,7 @@ import type { EngineInterface, HttpInit, HttpResponse } from 'claude-code'
 import { describe, expect, test } from 'claude-code/testing'
 
 import { DEFAULT_TIMEOUT_MS, endSession, fetchWithin } from '../hooks/http.ts'
+import { sessionEnd } from '../hooks/register.ts'
 
 const URL = 'https://api.example.com/v1/ping'
 
@@ -118,6 +119,12 @@ describe('fetchWithin', () => {
     expect(await pending).toEqual({ ok: false, reason: 'stopped' })
   })
 
+  test('a sleep that fails early answers timeout, never an unbounded wait', async () => {
+    const f = fake(hang)
+    ;(f.$.clock as { sleep: unknown }).sleep = () => Promise.reject(new Error('refused by a hook'))
+    expect(await fetchWithin(f.$, URL)).toEqual({ ok: false, reason: 'timeout' })
+  })
+
   test('a clock that cannot be armed leaves the request to answer alone', async () => {
     const f = fake(respond(200, 'ok'), false)
     expect((await fetchWithin(f.$, URL)).ok).toBe(true)
@@ -125,7 +132,22 @@ describe('fetchWithin', () => {
 })
 
 describe('session.end', () => {
-  test("the plugin's session.end hook passes the event on", async ($, on) => {
+  // The kit loads the plugin in an environment of its own, so a request started here is answered through the hook's body, called directly.
+  test("the plugin's session.end hook ends a waiting request and passes the event on unchanged", async () => {
+    const pending = fetchWithin(fake(hang).$, URL, { timeoutMs: 60_000 })
+    await tick()
+    const event = { reason: 'clear', sessionId: 's-1' }
+    const passed: unknown[] = []
+    const next = (e: unknown) => {
+      passed.push(e)
+      return { sessionId: 's-1' }
+    }
+    expect(sessionEnd(undefined as never, event as never, next as never)).toEqual({ sessionId: 's-1' })
+    expect(passed).toEqual([event])
+    expect(await pending).toEqual({ ok: false, reason: 'stopped' })
+  })
+
+  test('the plugin passes session.end on to the engine', async ($, on) => {
     const ended: string[] = []
     on('session.end', (_$, e) => {
       ended.push((e as { sessionId: string }).sessionId)

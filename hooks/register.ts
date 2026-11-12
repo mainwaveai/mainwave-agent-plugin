@@ -6,7 +6,7 @@
 // owns, as Claude Code wrote it otherwise.
 
 import { atom, update } from 'claude-code'
-import type { CatchHandler, EngineInterface, Frozen, Next, Register, SettingsSource, TelemetryLogResult, TelemetryRecordEntry } from 'claude-code'
+import type { CatchHandler, EngineInterface, Frozen, Hook, Next, Register, SettingsSource, TelemetryLogResult, TelemetryRecordEntry } from 'claude-code'
 
 import type { RowIdentity } from '../types'
 import { endSession } from './http.ts'
@@ -22,6 +22,7 @@ type CollectorNext = Next<'telemetry.log', TelemetryRecordEntry, TelemetryLogRes
 type CollectorHook = ($: EngineInterface, e: Frozen<TelemetryRecordEntry>, next: CollectorNext) => TelemetryLogResult | Promise<TelemetryLogResult>
 type RowParams = Parameters<CollectorHook>
 type RowCatchParams = Parameters<CatchHandler<CollectorHook>>
+type SessionEndParams = Parameters<Hook<'session.end'>>
 
 /** The session's identity as its rows say (types/index.d.ts). */
 const identityAtom = atom({ plugin: 'mainwave', key: 'identity' } as const, {})
@@ -48,12 +49,16 @@ async function readEntrypoint($: EngineInterface): Promise<string> {
   }
 }
 
-/** Keeps what the row says about who the session is, writing `$.state` only when something changed. */
+/**
+ * Keeps what the row says about who the session is, writing `$.state` only when the row adds something. The write merges into the
+ * stored value, not this module's copy, so two rows that land together each keep their fields.
+ */
 async function noteIdentity($: EngineInterface, attributes: Readonly<Record<string, unknown>>): Promise<void> {
-  const next = mergeIdentity(held, identityOf(attributes))
-  if (next === held) return
-  await update($, identityAtom, () => next)
-  held = next
+  const seen = identityOf(attributes)
+  if (mergeIdentity(held, seen) === held) return
+  let merged = held
+  await update($, identityAtom, stored => (merged = mergeIdentity(stored, seen)))
+  held = merged
 }
 
 /**
@@ -101,9 +106,11 @@ export const register: Register = on => {
 
   on('telemetry.log', { to: 'collector' }, stampRow).catch(rowCatch)
 
-  // Requests still waiting for the ending session answer `stopped` (http.ts).
-  on('session.end', ($, e, next) => {
-    endSession()
-    return next(e)
-  })
+  on('session.end', sessionEnd)
+}
+
+/** Requests still waiting for the ending session answer `stopped` (http.ts); the event goes on unchanged. */
+export function sessionEnd(_$: SessionEndParams[0], e: SessionEndParams[1], next: SessionEndParams[2]) {
+  endSession()
+  return next(e)
 }

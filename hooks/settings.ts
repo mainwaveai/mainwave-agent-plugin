@@ -3,13 +3,15 @@
 // The order, first answer wins:
 //   1. the organization's managed settings (the `policy` layer), under any of the plugin's ids
 //   2. the person's own settings: `--settings` (the `flag` layer), then their user settings; never a repository's (`project`, `local`)
-//   3. the default: on once the row names an organization, off otherwise
+//   3. the default: on once the row names an organization (a UUID in `organization.id`), off otherwise
 //
 // A layer that cannot be read, or holds a malformed entry or a value that is not a boolean, ends the search with the switch off and
 // the source `error`: an administrator's or a person's mistake never reports more than they asked for.
 //
 // The option sits where Claude Code keeps every plugin's options: `pluginConfigs["<plugin id>"].options.reporting`, in managed settings
 // for the organization and in user settings for the person (the /config menu writes it there).
+
+import { isOrgId } from './identity.ts'
 
 /** A settings layer as `$.settings.read` answers it, or `unreadable` when the read failed. */
 export type Layer = Readonly<Record<string, unknown>> | 'unreadable'
@@ -67,7 +69,7 @@ export function resolveSwitch(policy: Vote, person: Vote, orgId: unknown, defaul
     if (vote.kind === 'set') return { on: vote.on, source }
     if (vote.kind === 'invalid') return { on: false, source: 'error' }
   }
-  return { on: defaultOn && typeof orgId === 'string' && orgId !== '', source: 'default' }
+  return { on: defaultOn && isOrgId(orgId), source: 'default' }
 }
 
 /** The reporting switch for one row, from the three layers it reads. */

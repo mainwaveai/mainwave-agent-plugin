@@ -7,13 +7,16 @@
 import type { RowIdentity } from '../types'
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** Whether a value is a Claude organization ID: a UUID. */
+export const isOrgId = (value: unknown): value is string => typeof value === 'string' && UUID.test(value)
 // One @, no spaces or controls, a dot in the domain; at most 254 characters (RFC 5321's path limit).
 const EMAIL = /^[^\s@\u0000-\u001f\u007f]{1,64}@[^\s@\u0000-\u001f\u007f]+\.[^\s@\u0000-\u001f\u007f]+$/
 const DEVICE = /^[A-Za-z0-9._:-]{1,128}$/
 
 /** The row attribute each field is read from, and the shape it must have. */
 export const IDENTITY_FIELDS: readonly { field: keyof RowIdentity; attribute: string; fits: (v: string) => boolean }[] = [
-  { field: 'organizationId', attribute: 'organization.id', fits: v => UUID.test(v) },
+  { field: 'organizationId', attribute: 'organization.id', fits: isOrgId },
   { field: 'accountUuid', attribute: 'user.account_uuid', fits: v => UUID.test(v) },
   { field: 'email', attribute: 'user.email', fits: v => v.length <= 254 && EMAIL.test(v) },
   { field: 'deviceId', attribute: 'user.id', fits: v => DEVICE.test(v) },

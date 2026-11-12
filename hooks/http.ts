@@ -4,7 +4,9 @@
 // raced against the engine's clock and against the end of its session; whichever comes first answers. The request itself may still
 // finish on the host, but nothing waits for it and its answer is dropped. It never throws: every outcome is a value.
 //
-// Nothing calls it yet. It is here for the plugin's own requests to Mainwave, which come in a later version.
+// Nothing calls it yet. It is here for the plugin's own requests to Mainwave, which come in a later version. The wait is billed to the
+// calling hook's own time budget (`$.clock.sleep` counts there), so a caller makes its requests from `session.start` or a timer, not
+// from a row's hook, and names a limit that fits.
 
 import type { EngineInterface, HttpInit } from 'claude-code'
 
@@ -46,11 +48,16 @@ export async function fetchWithin($: EngineInterface, url: string, init: HttpIni
     onEnd = () => resolve({ ok: false, reason: 'stopped' })
     session.addEventListener('abort', onEnd, { once: true })
   })
-  // A clock that cannot be armed leaves the request to answer alone, as it would without this wrapper. The sleep is aborted once the
-  // race is settled, and its rejection then answers nothing.
+  // The sleep is aborted once the race is settled, and its rejection then answers nothing. A sleep that fails before that (refused by
+  // a hook, or its dispatch abandoned) answers `timeout` at once: the request never waits without a limit. Only a clock that cannot be
+  // armed at all leaves the request to answer alone, as it would without this wrapper.
+  const TIMEOUT: FetchOutcome = { ok: false, reason: 'timeout' }
   let limit: Promise<FetchOutcome>
   try {
-    limit = $.clock.sleep(timeoutMs, { signal: timer.signal }).then(() => ({ ok: false, reason: 'timeout' }) as const, () => NEVER)
+    limit = $.clock.sleep(timeoutMs, { signal: timer.signal }).then(
+      () => TIMEOUT,
+      () => (timer.signal.aborted ? NEVER : TIMEOUT),
+    )
   } catch {
     limit = NEVER
   }

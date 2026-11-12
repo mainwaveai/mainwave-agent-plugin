@@ -62,7 +62,7 @@ describe('resolveSwitch', () => {
   })
   test('the default is on once the organization is known', () => {
     expect(resolveSwitch(absent, absent, ORG)).toEqual({ on: true, source: 'default' })
-    for (const unknown of [undefined, '', 7, null]) expect(resolveSwitch(absent, absent, unknown)).toEqual({ on: false, source: 'default' })
+    for (const unknown of [undefined, '', 7, null, 'not-a-uuid']) expect(resolveSwitch(absent, absent, unknown)).toEqual({ on: false, source: 'default' })
   })
 })
 
