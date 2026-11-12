@@ -1,0 +1,7 @@
+# Type declarations Claude Code writes beside a plugin it loads from disk. tsc reads them; git must not.
+.claude-plugin/types/
+# Local Claude Code settings for this checkout.
+.claude/settings.local.json
+node_modules/
+.DS_Store
+*.log
