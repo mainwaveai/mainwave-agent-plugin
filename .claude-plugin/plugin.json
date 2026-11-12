@@ -1,0 +1,18 @@
+{
+  "name": "mainwave",
+  "displayName": "Mainwave",
+  "version": "0.1.0",
+  "description": "Reports your Claude Code and Cowork sessions to Mainwave. Today it adds the plugin's name, version and entry point to the telemetry rows Claude Code already sends to your organization's collector, and reads the organization, account, email and device ID those rows carry. It makes no network calls of its own. Your organization's managed settings can turn reporting on or off; where they say nothing, you can turn it off.",
+  "author": {
+    "name": "Mainwave"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "reporting": {
+      "type": "boolean",
+      "title": "Report this session to Mainwave",
+      "description": "On by default once a session's telemetry names an organization. Off: the plugin adds nothing to your telemetry rows. Your organization's managed settings override this, and a repository's settings never change it.",
+      "default": true
+    }
+  }
+}

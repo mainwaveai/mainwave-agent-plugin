@@ -1,0 +1,24 @@
+# Mainwave agent plugin
+
+A Claude Code mod at the repository root: `.claude-plugin/plugin.json` (manifest), `.claude-plugin/marketplace.json` (this repo as a marketplace), `hooks/` (the hooks module `register.ts` and what it imports), `types/index.d.ts` (the `$.state` contract) and `tests/`. `README.md` says what it does and how it is installed; keep it true when behavior changes.
+
+## Commands
+
+```sh
+claude plugin validate .        # manifest, marketplace and hooks module, read the way Claude Code will
+claude plugin test .            # tests/*.test.ts against the engine
+scripts/check-version.sh        # plugin.json and hooks/version.ts agree
+scripts/check-hooks.sh          # the row hook keeps its fail-open .catch; session.end is hooked
+```
+
+CI runs all four on every pull request. The type check is local only (README, Developing).
+
+## Rules
+
+- **This repository goes public.** No internal references in any file, commit message or PR: no ticket IDs, internal docs or specs, review records, Claude organization IDs, internal email addresses or local paths. Tests use example IDs and `example.com` addresses.
+- **No AI attribution** on commits or PRs (`.claude/settings.json` turns the footers off; don't add them by hand).
+- Commits: `<type>(<scope>): <imperative, lowercase>`. Types: feat fix chore refactor docs test perf ci.
+- Never commit to `main`: branch, open a PR, and have a fresh sub-agent that didn't write the change review it before marking it ready. Don't merge without the owner's approval.
+- Hooks fail open: a fault never holds a row, a tool call or the session.
+- A new stamp key needs a shape rule in `hooks/stamps.ts`, an owned prefix if it starts a new one, and an entry in the test contract in `tests/rig.ts`, which is written independently of `hooks/`.
+- A release bumps the version in `.claude-plugin/plugin.json` and `hooks/version.ts` together.

@@ -1,0 +1,47 @@
+# The gate: every pull request to main, and main itself, must pass `claude plugin validate` and `claude plugin test`.
+#
+# Not here: the TypeScript type check. It needs the declarations Claude Code writes beside a plugin it loads from disk
+# (.claude-plugin/types/), which only a session writes, so it runs locally (README, Developing).
+# Actions are pinned by commit SHA.
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # What people run: Claude Code updates itself, so a break from a new release is a real signal.
+  CLAUDE_CODE_VERSION: latest
+  DISABLE_AUTOUPDATER: '1'
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Install Claude Code
+        run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && claude --version
+      - name: Versions match
+        run: scripts/check-version.sh
+      - name: Validate the plugin and its marketplace
+        run: claude plugin validate .
+      - name: Hooks as the engine will load them
+        run: scripts/check-hooks.sh
+      - name: Test
+        run: claude plugin test .
