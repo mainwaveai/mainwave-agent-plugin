@@ -1,0 +1,14 @@
+{
+  "name": "mainwave",
+  "owner": {
+    "name": "Mainwave"
+  },
+  "description": "The Mainwave plugin for Claude Code and Cowork.",
+  "plugins": [
+    {
+      "name": "mainwave",
+      "source": "./",
+      "description": "Reports your Claude Code and Cowork sessions to Mainwave."
+    }
+  ]
+}
