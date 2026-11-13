@@ -17,7 +17,7 @@ import { identityOf, isOrgId, mergeIdentity } from './identity.ts'
 import { add, collect, newMeter, type Meter } from './meter.ts'
 import type { CopiedRow } from './otlp.ts'
 import {
-  agentSpawned, newRebuild, observeRow, parseTraceparent, sessionStarted, stepAbandoned, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
+  agentSpawned, newRebuild, observeRow, parseTraceparent, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
 } from './rebuild.ts'
 import { adopt, configure, enqueue, ensureTimer, finish, isCopying, snapshot } from './sender.ts'
 import { applyStamps, entrypointOf, filterStamps, PLUGIN_NAME, stripOwned } from './stamps.ts'
@@ -272,22 +272,21 @@ export async function turnCompleteHook($: TurnCompleteParams[0], e: TurnComplete
 /** One model request: its start, and its stop reason and usage once it is whole. The stream passes through untouched. */
 export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepParams[2]) {
   let r: Rebuild | null = null
+  let startMs = 0
   try {
     r = await rebuildOf($)
-    if (r !== null) stepStart(r, e.agentId, e.model, await $.clock.now())
+    if (r !== null) {
+      stepStart(r, e.agentId, e.model)
+      startMs = await $.clock.now()
+    }
   } catch {
     r = null
   }
-  let result
-  try {
-    result = yield* next(e)
-  } catch (err) {
-    if (r !== null) stepAbandoned(r, e.agentId)
-    throw err
-  }
+  // A stream closed early (interrupted, or no longer read) leaves here and sends nothing: its row, if one comes, goes alone.
+  const result = yield* next(e)
   if (r !== null) {
     try {
-      await emit($, stepEnd(r, e.agentId, result, await $.clock.now()))
+      await emit($, stepEnd(r, e.agentId, startMs, result, await $.clock.now()))
     } catch {
       // The request's span goes without its stop reason.
     }

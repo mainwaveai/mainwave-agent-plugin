@@ -81,7 +81,6 @@ export type Rebuild = {
   /** The span ids the rows named that are not an Agent call's execution: interactions and permission decisions. */
   knownIds: Set<string>
   loopModel: Map<string, string>
-  stepStarts: Map<string, number[]>
   steps: Step[]
   waiting: Waiting[]
   tools: Map<string, Tool>
@@ -116,7 +115,7 @@ export function randomHex(hexLength: 16 | 32): string {
 
 export function newRebuild(settings: Settings, mint: Rebuild['mint'] = randomHex): Rebuild {
   return {
-    settings, common: {}, sequence: 0, interactionIds: new Set(), knownIds: new Set(), loopModel: new Map(), stepStarts: new Map(),
+    settings, common: {}, sequence: 0, interactionIds: new Set(), knownIds: new Set(), loopModel: new Map(),
     steps: [], waiting: [], tools: new Map(), agentTool: new Map(), parentAgent: new Map(), execOfAgent: new Map(), mint,
   }
 }
@@ -212,7 +211,10 @@ function readRowEvent(r: Rebuild, row: RowIn): Emit {
   const a = row.attributes
   const ctx = validCtx(row.span)
   const agentId = str(a['agent_id'])
-  if (agentId && ctx && !r.knownIds.has(ctx.spanId) && row.event !== 'tool_decision' && row.event !== 'user_prompt' && !r.execOfAgent.has(agentId)) {
+  // A subagent's model requests are logged inside the Agent call's run: their span is that run's. Other rows of a subagent may be
+  // logged inside another span (a permission decision, a hook), so only a request names it.
+  const subagentRequest = (row.event === 'api_request' || row.event === 'api_error') && metricQuerySource(a['query_source']) === 'subagent'
+  if (agentId && ctx && subagentRequest && !r.knownIds.has(ctx.spanId) && !r.execOfAgent.has(agentId)) {
     r.execOfAgent.set(agentId, ctx.spanId)
   }
   switch (row.event) {
@@ -222,7 +224,8 @@ function readRowEvent(r: Rebuild, row: RowIn): Emit {
         r.interactionIds.add(ctx.spanId)
         r.knownIds.add(ctx.spanId)
       }
-      if (r.interaction && !r.interaction.prompt) r.interaction.prompt = prompt
+      const it = r.interaction
+      if (it && !it.prompt && (promptFits(prompt, it.text) || (ctx !== undefined && it.ctx?.spanId === ctx.spanId))) it.prompt = prompt
       else r.heldPrompt = prompt
       return none()
     }
@@ -267,6 +270,11 @@ function learnInteraction(r: Rebuild, row: RowIn, ctx: Ctx | undefined) {
     r.interaction.ctx = ctx
     r.interactionIds.add(ctx.spanId)
     r.knownIds.add(ctx.spanId)
+    // A prompt row whose text the turn's did not match (pastes expanded, say) is still this turn's when it names the same span.
+    if (!r.interaction.prompt && r.heldPrompt?.ctx?.spanId === ctx.spanId) {
+      r.interaction.prompt = r.heldPrompt
+      r.heldPrompt = undefined
+    }
   }
 }
 
@@ -325,24 +333,17 @@ function pairRequest(r: Rebuild, row: RowIn): Emit {
   return none()
 }
 
-/** A `turn.step` began: the loop's next request starts now, on this model. */
-export function stepStart(r: Rebuild, agentId: string | undefined, model: string, nowMs: number): void {
-  const loop = loopOf(agentId)
-  r.loopModel.set(loop, model)
-  const starts = r.stepStarts.get(loop) ?? []
-  starts.push(nowMs)
-  r.stepStarts.set(loop, starts)
+/** A `turn.step` began: the loop's requests run on this model (the lines a file edit counts are credited to it). */
+export function stepStart(r: Rebuild, agentId: string | undefined, model: string): void {
+  r.loopModel.set(loopOf(agentId), model)
 }
 
-/** A `turn.step` was abandoned (interrupted, its stream closed): its start goes, so the loop's next request keeps its own. */
-export function stepAbandoned(r: Rebuild, agentId: string | undefined): void {
-  r.stepStarts.get(loopOf(agentId))?.shift()
-}
-
-/** A `turn.step` settled: its stop reason and usage pair with the request's row, now or when the row comes. */
-export function stepEnd(r: Rebuild, agentId: string | undefined, result: { stopReason: string | null; usage: StepUsage | null } | undefined, nowMs: number): Emit {
+/**
+ * A `turn.step` settled, its request having started at `startMs` (the step's own hook keeps it, so a step whose stream was closed early
+ * moves no other's): its stop reason and usage pair with the request's row, now or when the row comes.
+ */
+export function stepEnd(r: Rebuild, agentId: string | undefined, startMs: number, result: { stopReason: string | null; usage: StepUsage | null } | undefined, nowMs: number): Emit {
   const loop = loopOf(agentId)
-  const startMs = r.stepStarts.get(loop)?.shift() ?? nowMs
   const step: Step = { loop, startMs, endMs: nowMs, stopReason: result?.stopReason ?? null, usage: result?.usage ?? null }
   const i = r.waiting.findIndex(w => loopOf(w.row.attributes['agent_id']) === loop && (w.row.event === 'api_error' ? step.usage === null : sameUsage(step.usage, w.row.attributes)))
   if (i >= 0) {
@@ -409,11 +410,18 @@ function llmSpan(r: Rebuild, row: RowIn, step: Step | undefined): BuiltSpan {
 
 // ── Turns ─────────────────────────────────────────────────────────────────────
 
+/**
+ * Whether a prompt row is the one a turn began with: its length is the turn's text's. A prompt that started no turn (one a hook
+ * blocked, one folded into a running turn) is not taken by the next.
+ */
+const promptFits = (prompt: Prompt, text: string) => prompt.length === text.length
+
 /** A main-loop turn began: an interaction opens, with the prompt row that came before it, if one did. */
 export function turnStart(r: Rebuild, e: { turnId: string; text: string; agentId?: string }): void {
   if (e.agentId !== undefined) return
   r.sequence += 1
-  r.interaction = { turnId: e.turnId, sequence: r.sequence, text: e.text, ...(r.heldPrompt ? { prompt: r.heldPrompt } : {}) }
+  const held = r.heldPrompt && promptFits(r.heldPrompt, e.text) ? r.heldPrompt : undefined
+  r.interaction = { turnId: e.turnId, sequence: r.sequence, text: e.text, ...(held ? { prompt: held } : {}) }
   r.heldPrompt = undefined
 }
 

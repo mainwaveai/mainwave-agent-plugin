@@ -5,7 +5,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import type { BuiltSpan } from '../hooks/otlp.ts'
 import {
-  agentSpawned, commonOf, newRebuild, observeRow, parseTraceparent, sessionStarted, stepAbandoned, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart,
+  agentSpawned, commonOf, newRebuild, observeRow, parseTraceparent, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart,
   type Emit, type Rebuild, type RowIn, type Settings,
 } from '../hooks/rebuild.ts'
 import { ORG } from './rig.ts'
@@ -56,16 +56,16 @@ describe('one turn', () => {
     const out: Emit[] = []
     turnStart(r, { turnId: 't1', text: 'run it' })
     out.push(observeRow(r, row('user_prompt', 100, { prompt: 'run it', prompt_length: '6' }, INTERACTION)))
-    stepStart(r, undefined, 'claude-haiku-5-5', 110)
+    stepStart(r, undefined, 'claude-haiku-5-5')
     toolStart(r, { tool: 'Bash', tool_use_id: 'toolu_1', command: 'echo e2e', description: 'x' }, 130)
     out.push(observeRow(r, row('tool_decision', 135, { decision: 'accept', source: 'config', tool_name: 'Bash', tool_use_id: 'toolu_1' }, BLOCKED)))
-    out.push(stepEnd(r, undefined, { stopReason: 'tool_use', usage: usage(1201) }, 140))
+    out.push(stepEnd(r, undefined, 110, { stopReason: 'tool_use', usage: usage(1201) }, 140))
     out.push(observeRow(r, request(141, 1201)))
     out.push(observeRow(r, row('tool_result', 180, { tool_name: 'Bash', tool_use_id: 'toolu_1', success: 'true' }, INTERACTION)))
     out.push(toolEnd(r, 'toolu_1', { result: { stdout: 'e2e' } }, 181))
-    stepStart(r, undefined, 'claude-haiku-5-5', 190)
+    stepStart(r, undefined, 'claude-haiku-5-5')
     out.push(observeRow(r, request(220, 1202)))
-    out.push(stepEnd(r, undefined, { stopReason: 'end_turn', usage: usage(1202) }, 221))
+    out.push(stepEnd(r, undefined, 190, { stopReason: 'end_turn', usage: usage(1202) }, 221))
     out.push(turnComplete(r, { turnId: 't1', durationMs: 150 }, 230))
     return all(...out)
   }
@@ -143,6 +143,33 @@ describe('one turn', () => {
     expect(spans[0]!.attributes['interaction.sequence']).toBe(2)
   })
 
+  test("a prompt row that started no turn is not taken by the next turn", () => {
+    const r = rebuild()
+    observeRow(r, row('user_prompt', 10, { prompt: 'blocked by a hook', prompt_length: '17' }, 'f00df00df00df00d'))
+    turnStart(r, { turnId: 't9', text: 'go' })
+    observeRow(r, row('user_prompt', 20, { prompt: 'go', prompt_length: '2' }, INTERACTION))
+    const { spans } = turnComplete(r, { turnId: 't9', durationMs: 5 }, 30)
+    expect(spans[0]!.spanId).toBe(INTERACTION)
+    expect(spans[0]!.attributes['user_prompt']).toBe('go')
+  })
+
+  test("a prompt row whose text the turn's does not match is still the turn's when its requests name the same span", () => {
+    const r = rebuild()
+    turnStart(r, { turnId: 't8', text: 'see [Pasted text #1]' })
+    observeRow(r, row('user_prompt', 10, { prompt: 'see a long pasted text', prompt_length: '22' }, INTERACTION))
+    observeRow(r, request(20, 1201))
+    const { spans } = turnComplete(r, { turnId: 't8', durationMs: 5 }, 30)
+    expect(spans[0]!.spanId).toBe(INTERACTION)
+    expect(spans[0]!.attributes['user_prompt']).toBe('see a long pasted text')
+  })
+
+  test("only a subagent's own request names its Agent call's run", () => {
+    const r = rebuild()
+    observeRow(r, row('hook_execution_complete', 5, { agent_id: 'a7' }, '3333333333333333'))
+    observeRow(r, request(6, 900, { agent_id: 'a7', query_source: 'agent:builtin:Explore' }, AGENT_EXEC))
+    expect(r.execOfAgent.get('a7')).toBe(AGENT_EXEC)
+  })
+
   test('a turn started under TRACEPARENT joins its trace', () => {
     const r = rebuild({ traceparent: parseTraceparent(`00-${TRACE}-0123456789abcdef-01`)! })
     const { spans } = turn(r)
@@ -163,15 +190,6 @@ describe('pairing', () => {
     expect(s!.attributes['stop_reason']).toBeUndefined()
   })
 
-  test('an interrupted request leaves no start behind for the next one', () => {
-    const r = rebuild()
-    stepStart(r, undefined, 'claude-haiku-5-5', 100)
-    stepAbandoned(r, undefined)
-    stepStart(r, undefined, 'claude-haiku-5-5', 500)
-    stepEnd(r, undefined, { stopReason: 'end_turn', usage: usage(1201) }, 540)
-    expect(observeRow(r, request(541, 1201)).spans[0]!.startMs).toBe(500)
-  })
-
   test("a request outside the loops (a title, a summary) goes at once, with no step", () => {
     const r = rebuild()
     const { spans } = observeRow(r, request(1_000, 50, { query_source: 'generate_session_title' }, ''))
@@ -189,8 +207,8 @@ describe('pairing', () => {
 
   test('a failed request is an error span, its attempt and status as the row says', () => {
     const r = rebuild()
-    stepStart(r, undefined, 'claude-haiku-5-5', 100)
-    stepEnd(r, undefined, { stopReason: null, usage: null }, 150)
+    stepStart(r, undefined, 'claude-haiku-5-5')
+    stepEnd(r, undefined, 100, { stopReason: null, usage: null }, 150)
     const { spans } = observeRow(r, row('api_error', 160, { model: 'claude-haiku-5-5', error: 'Overloaded', status_code: '529', attempt: 3, duration_ms: 50, query_source: 'sdk' }, INTERACTION))
     expect(spans[0]!.status).toEqual({ code: 2, message: 'Overloaded' })
     expect(spans[0]!.attributes).toEqual(expect.objectContaining({ success: false, status_code: 529, error: 'Overloaded', attempt: 3 }))
@@ -239,8 +257,8 @@ describe('tools', () => {
     const ended = toolEnd(r, 'toolu_5', { result: { status: 'async_launched' } }, 21)
     expect(ended.spans.map(s => s.name)).toEqual(['claude_code.tool', 'claude_code.tool.blocked_on_user'])
     expect(ended.spans[0]!.attributes['subagent_type']).toBe('general-purpose')
-    stepStart(r, 'a123', 'claude-haiku-5-5', 30)
-    stepEnd(r, 'a123', { stopReason: 'end_turn', usage: usage(1300) }, 50)
+    stepStart(r, 'a123', 'claude-haiku-5-5')
+    stepEnd(r, 'a123', 30, { stopReason: 'end_turn', usage: usage(1300) }, 50)
     const { spans, measures } = observeRow(r, request(51, 1300, { agent_id: 'a123', query_source: 'agent:builtin:general-purpose', 'agent.name': 'general-purpose' }, AGENT_EXEC))
     const [req] = named(spans, 'llm_request')
     const [exec] = named(spans, 'tool.execution')
@@ -263,7 +281,7 @@ describe('tools', () => {
   test('file edits count their lines and permission decisions; a commit counts', () => {
     const r = rebuild()
     observeRow(r, row('user_prompt', 0, {}, INTERACTION))
-    stepStart(r, undefined, 'claude-opus-5-5', 1)
+    stepStart(r, undefined, 'claude-opus-5-5')
     toolStart(r, { tool: 'Write', tool_use_id: 'toolu_7', file_path: '/w/a.txt', content: 'one\ntwo\n' }, 10)
     const decided = observeRow(r, row('tool_decision', 11, { decision: 'accept', source: 'config', tool_name: 'Write', tool_use_id: 'toolu_7' }, BLOCKED))
     expect(decided.measures).toEqual([{ name: 'claude_code.code_edit_tool.decision', value: 1, atMs: 11, attributes: { ...COMMON, decision: 'accept', source: 'config', tool_name: 'Write', language: 'Plain text' } }])

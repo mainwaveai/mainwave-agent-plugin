@@ -4,7 +4,8 @@
 // original record for record.
 //
 // The hooks only queue (`enqueue`): they never wait on the network. One queue holds all three signals, each entry tagged with its own,
-// so they share the caps, the outbox and the end of the session. A timer sends the queue in batches every few seconds, each batch one
+// so they share the caps, the outbox and the end of the session; each signal waits on its own after a failure, so a path that fails
+// holds back only its own records. A timer sends the queue in batches every few seconds, each batch one
 // signal to that signal's path, and `session.end` sends one more batch of each signal at once within its short bound. A batch that fails for a reason that can pass (no network, a timeout, the
 // collector busy) goes back to the head of the queue and the timer waits longer before the next try. A batch the collector refuses
 // as malformed is dropped. A refused key stops sending until the plugin loads again, keeping the queue.
@@ -63,16 +64,27 @@ type Queued = Item & { resource: string; size: number }
 export const OUTBOX_VERSION = 2
 type Outbox = { v: 2; updatedAt: number; resources: string[]; items: { s: Signal; r: number; d: unknown }[] }
 
-export type Verdict = 'sent' | 'retry' | 'drop' | 'stop'
+export type Verdict = 'sent' | 'retry' | 'drop' | 'stop' | 'off'
 
-/** What becomes of a batch after one try. */
+/**
+ * What becomes of a batch after one try. `stop`: the key is refused, so nothing more is sent this load. `off`: the collector has no
+ * such path, so that signal alone is not sent this load. Either way the records are kept for a later load.
+ */
 export function verdictOf(outcome: FetchOutcome): Verdict {
   if (outcome.ok) return 'sent'
   if (outcome.reason !== 'status') return 'retry'
   if (outcome.status === 401 || outcome.status === 403) return 'stop'
+  if (outcome.status === 404 || outcome.status === 405) return 'off'
   if (outcome.status === 400 || outcome.status === 413 || outcome.status === 422) return 'drop'
   return 'retry'
 }
+
+/**
+ * Whether a request may have reached the collector though no answer said so: it timed out, or the session ended while it waited. Log
+ * rows and spans sent twice are one record to the collector (it keeps one per id); a metric's delta point sent twice would count twice,
+ * so a metric batch with such an outcome is dropped, not tried again.
+ */
+const mayHaveLanded = (outcome: FetchOutcome) => !outcome.ok && (outcome.reason === 'timeout' || outcome.reason === 'stopped')
 
 // Per load of the module; `configure` starts them over.
 let key: string | null = null
@@ -84,8 +96,9 @@ let sending = false
 let ticking = false
 let stopped = false
 let refused = false
-let backoffMs = 0
-let nextTryAt = 0
+/** Each signal waits on its own: a path that fails holds back only its own records. */
+let waits: Record<Signal, { backoffMs: number; nextTryAt: number }> = freshWaits()
+let off = new Set<Signal>()
 let timer: Timer | null = null
 let resource: Promise<string> | null = null
 let scopeVersion: string | undefined
@@ -93,6 +106,10 @@ let dirty = false
 let persistedAt = 0
 let adoptedAt = Number.NEGATIVE_INFINITY
 let counts = { sent: 0, dropped: 0 }
+
+function freshWaits(): Record<Signal, { backoffMs: number; nextTryAt: number }> {
+  return { logs: { backoffMs: 0, nextTryAt: 0 }, traces: { backoffMs: 0, nextTryAt: 0 }, metrics: { backoffMs: 0, nextTryAt: 0 } }
+}
 
 function newId(): string {
   try {
@@ -114,8 +131,8 @@ export function configure(options: PluginOptions | undefined): void {
   ticking = false
   stopped = false
   refused = false
-  backoffMs = 0
-  nextTryAt = 0
+  waits = freshWaits()
+  off = new Set()
   timer = null
   resource = null
   scopeVersion = undefined
@@ -130,7 +147,8 @@ export const isCopying = (): boolean => key !== null && !refused
 
 /** What the sender holds now, for tests and the end-of-session debug line. Never the key. */
 export function snapshot() {
-  return { queued: queue.length, inflight: inflight.length, sent: counts.sent, dropped: counts.dropped, stopped, refused, backoffMs }
+  const backoffMs = Math.max(...SIGNALS.map(sig => waits[sig].backoffMs))
+  return { queued: queue.length, inflight: inflight.length, sent: counts.sent, dropped: counts.dropped, stopped, refused, backoffMs, off: [...off] }
 }
 
 async function readResource($: EngineInterface): Promise<string> {
@@ -189,8 +207,16 @@ export function ensureTimer($: EngineInterface): void {
   }
 }
 
-/** The oldest records of one signal (the oldest record's, unless named), in order; the rest of the queue keeps its order. */
-function takeBatch(signal: Signal | undefined = queue[0]?.s): Queued[] {
+/** Whether a signal may be sent now: its path answers, and it is not waiting after a failure. */
+const ready = (signal: Signal, now: number) => !off.has(signal) && now >= waits[signal].nextTryAt
+
+/** The signal of the oldest queued record that may be sent now, if any. */
+function nextSignal(now: number): Signal | undefined {
+  return queue.find(item => ready(item.s, now))?.s
+}
+
+/** The oldest records of one signal, in order; the rest of the queue keeps its order. */
+function takeBatch(signal: Signal): Queued[] {
   const batch: Queued[] = []
   const rest: Queued[] = []
   let bytes = 0
@@ -254,13 +280,22 @@ async function repositoryNamesKey($: EngineInterface): Promise<boolean> {
   return true
 }
 
-/** Sends one batch to its signal's path within `limit`. Never throws: a fault is an outcome. */
-async function send($: EngineInterface, batch: readonly Queued[], limit: number, now: number): Promise<FetchOutcome> {
+/**
+ * Sends one batch to its signal's path within `limit`. Never throws: a fault is an outcome. A batch that cannot be written as a
+ * request body at all answers `unwritable`: no later try would fare better.
+ */
+async function send($: EngineInterface, batch: readonly Queued[], limit: number, now: number): Promise<FetchOutcome | 'unwritable'> {
+  let body: string
+  try {
+    body = bodyOf(batch, now)
+  } catch {
+    return 'unwritable'
+  }
   try {
     return await fetchWithin($, DEV_URLS[batch[0]!.s], {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-      body: bodyOf(batch, now),
+      body,
       timeoutMs: limit,
     })
   } catch {
@@ -268,28 +303,32 @@ async function send($: EngineInterface, batch: readonly Queued[], limit: number,
   }
 }
 
-/** Settles one batch's outcome: counted, dropped, or put back with the wait before the next try. False when sending should stop now. */
-function settle(batch: Queued[], outcome: FetchOutcome, now: number): boolean {
+/** Settles one batch's outcome: counted, dropped, or put back with its signal's wait before the next try. */
+function settle(batch: Queued[], outcome: FetchOutcome | 'unwritable', now: number): void {
   dirty = true
+  const signal = batch[0]!.s
+  if (outcome === 'unwritable') {
+    counts.dropped += batch.length
+    return
+  }
   const verdict = verdictOf(outcome)
   if (verdict === 'sent') {
     counts.sent += batch.length
-    backoffMs = 0
-    nextTryAt = 0
-    return true
+    waits[signal] = { backoffMs: 0, nextTryAt: 0 }
+    return
   }
-  if (verdict === 'drop') {
+  if (verdict === 'drop' || (signal === 'metrics' && verdict === 'retry' && mayHaveLanded(outcome))) {
     counts.dropped += batch.length
-    return true
+    return
   }
   putBack(batch)
-  // A request cut off by the session's end says nothing about the collector: the next session tries again at once.
   if (verdict === 'stop') stopped = true
+  else if (verdict === 'off') off.add(signal)
+  // A request cut off by the session's end says nothing about the collector: the next session tries again at once.
   else if (outcome.ok || outcome.reason !== 'stopped') {
-    backoffMs = Math.min(Math.max(backoffMs * 2, FLUSH_MS), BACKOFF_MAX_MS)
-    nextTryAt = now + backoffMs
+    const backoffMs = Math.min(Math.max(waits[signal].backoffMs * 2, FLUSH_MS), BACKOFF_MAX_MS)
+    waits[signal] = { backoffMs, nextTryAt: now + backoffMs }
   }
-  return false
 }
 
 /**
@@ -306,8 +345,8 @@ export async function flush($: EngineInterface, opts: { timeoutMs: number | (() 
     if (opts.together) {
       const now = await $.clock.now()
       const limit = limitNow()
-      if (now < nextTryAt || !(limit >= END_MIN_MS)) return
-      const batches = SIGNALS.map(sig => takeBatch(sig)).filter(b => b.length > 0)
+      if (!(limit >= END_MIN_MS)) return
+      const batches = SIGNALS.filter(sig => ready(sig, now)).map(sig => takeBatch(sig)).filter(b => b.length > 0)
       inflight = batches.flat()
       const outcomes = await Promise.all(batches.map(b => send($, b, limit, now)))
       inflight = []
@@ -316,14 +355,15 @@ export async function flush($: EngineInterface, opts: { timeoutMs: number | (() 
     }
     for (let i = 0; i < opts.maxBatches && queue.length > 0 && !stopped; i++) {
       const now = await $.clock.now()
-      if (now < nextTryAt) break
+      const signal = nextSignal(now)
+      if (signal === undefined) break
       const limit = limitNow()
       if (!(limit >= END_MIN_MS)) break
-      const batch = takeBatch()
+      const batch = takeBatch(signal)
       inflight = batch
       const outcome = await send($, batch, limit, now)
       inflight = []
-      if (!settle(batch, outcome, now)) break
+      settle(batch, outcome, now)
     }
   } catch {
     // A fault in sending never reaches the caller: the records stay queued.

@@ -4,7 +4,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { boot, KEY, LOGGED_AT, memoryStore, network, ORG, type Post } from './rig.ts'
+import { boot, KEY, LOGGED_AT, memoryStore, network, ORG, type Post, type Reply } from './rig.ts'
 
 const withKey = { options: { devIngestKey: KEY } }
 const TRACES_URL = 'https://collector.dev.mainwave.com/v1/traces'
@@ -16,10 +16,10 @@ const START = 1_800_000_000_000
 const COMMON = { 'organization.id': ORG, 'user.id': 'device-1', 'session.id': 's-1', 'anthropic.provider': 'firstParty' }
 const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 
-function world(on: On) {
+function world(on: On, opts: { reply?: (n: number, post: Post) => Reply; store?: Record<string, unknown> } = {}) {
   const clock = mock.clock(on, { now: START })
-  memoryStore(on)
-  const posts = network(on)
+  memoryStore(on, opts.store)
+  const posts = network(on, opts.reply)
   const rig = boot(on, { entrypoint: 'cli', env: { OTEL_LOG_TOOL_DETAILS: '1', OTEL_RESOURCE_ATTRIBUTES: 'mainwave.source=coding_agent.claude_code' } })
   on('session.start', (_$, e) => ({ cwd: (e as { cwd: string }).cwd }) as never)
   on('session.end', (_$, e) => ({ sessionId: (e as { sessionId: string }).sessionId }) as never)
@@ -36,9 +36,9 @@ function world(on: On) {
 }
 
 /** Logs one collector row, as Claude Code raises it. */
-async function row($: Engine, event: string, attributes: Record<string, unknown>, spanId?: string) {
+async function row($: Engine, event: string, attributes: Record<string, unknown>, spanId?: string, loggedAt = LOGGED_AT) {
   await $.telemetry.log({
-    to: 'collector', event, loggedAt: LOGGED_AT, ...(spanId ? { span: { traceId: TRACE, spanId, traceFlags: 1 } } : {}),
+    to: 'collector', event, loggedAt, ...(spanId ? { span: { traceId: TRACE, spanId, traceFlags: 1 } } : {}),
     attributes: { ...COMMON, 'event.name': event, 'event.sequence': 1, ...attributes },
   } as never)
 }
@@ -147,6 +147,31 @@ describe('with a key', () => {
   })
 })
 
+describe('a model stream closed early', () => {
+  test("moves no later request's start", withKey, async ($, on) => {
+    const { clock, posts } = world(on)
+    await $.turn.start({ turnId: 't1', text: 'go' } as never)
+    await row($, 'user_prompt', { prompt: 'go', prompt_length: '2' }, INTERACTION)
+    const closed = $.turn.step({ turnId: 't1', index: 0, model: 'claude-haiku-5-5', messageCount: 1 } as never)
+    await closed.next()
+    await closed.return(undefined as never)
+    await clock.advance(10_000)
+    const stream = $.turn.step({ turnId: 't1', index: 1, model: 'claude-haiku-5-5', messageCount: 2 } as never)
+    while (!(await stream.next()).done) {
+      // read to the end
+    }
+    await row($, 'api_request', {
+      model: 'claude-haiku-5-5', input_tokens: 1201, output_tokens: 20, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 0.25,
+      duration_ms: 10, ttft_ms: 4, request_id: 'req_2', speed: 'normal', query_source: 'sdk', effort: 'medium',
+    }, INTERACTION, new Date(START + 10_050).toISOString())
+    await clock.advance(5_000)
+    const body = JSON.parse(posts.find(p => p.url === TRACES_URL)!.body)
+    const span = body.resourceSpans[0].scopeSpans[0].spans[0]
+    expect(span.name).toBe('claude_code.llm_request')
+    expect(span.startTimeUnixNano).toBe(`${START + 10_000}000000`)
+  })
+})
+
 describe('without a key', () => {
   test('nothing is rebuilt or sent, and every event goes on as it was', async ($, on) => {
     const { clock, posts, rig } = world(on)
@@ -158,5 +183,51 @@ describe('without a key', () => {
     expect(step).toEqual(expect.objectContaining({ stopReason: 'tool_use' }))
     expect((tool as { result: { stdout: string } }).result.stdout).toBe('hi')
     expect(rig.rows.length).toBe(4)
+  })
+})
+
+describe('each signal on its own path', () => {
+  const LOGS_URL = 'https://collector.dev.mainwave.com/v1/logs'
+  const count = (posts: readonly Post[], url: string) => posts.filter(p => p.url === url).length
+
+  for (const [name, status] of [['has no traces path (404)', 404], ['is busy on its traces path (503)', 503]] as const) {
+    test(`a collector that ${name} holds back neither the log rows nor the metrics`, withKey, async ($, on) => {
+      const { clock, posts } = world(on, { reply: (_n, p) => (p.url === TRACES_URL ? { status } : { status: 200 }) })
+      await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+      await turn($)
+      await clock.advance(5_000)
+      for (let i = 0; i < 3; i++) {
+        await row($, 'tool_result', { tool_name: 'Bash', tool_use_id: `later_${i}`, success: 'true' }, INTERACTION)
+        await clock.advance(5_000)
+      }
+      await clock.advance(60_000)
+      expect(count(posts, LOGS_URL)).toBeGreaterThanOrEqual(4)
+      expect(count(posts, METRICS_URL)).toBe(1)
+      // A missing path is not asked again this load; a busy one is, after its own wait.
+      if (status === 404) expect(count(posts, TRACES_URL)).toBe(1)
+      else expect(count(posts, TRACES_URL)).toBeGreaterThan(1)
+    })
+  }
+
+  test('a metric batch whose request may have landed (it timed out) is dropped, never sent twice', withKey, async ($, on) => {
+    const { clock, posts } = world(on, { reply: (_n, p) => (p.url === METRICS_URL && posts.filter(x => x.url === METRICS_URL).length === 1 ? 'hang' : { status: 200 }) })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await turn($)
+    await clock.advance(60_000)
+    await clock.advance(15_000)
+    await clock.advance(60_000)
+    expect(count(posts, METRICS_URL)).toBe(1)
+  })
+
+  test('a stored record that cannot be written as a request is dropped, and the rest go on', withKey, async ($, on) => {
+    const resources = [JSON.stringify({ 'service.name': 'claude-code' })]
+    const bad = { traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), name: 'claude_code.tool', startMs: 1, endMs: 2, attributes: {}, events: [null] }
+    const box = { v: 2, updatedAt: START - 120_000, resources, items: [{ s: 'traces', r: 0, d: bad }, { s: 'logs', r: 0, d: { event: 'api_request', loggedAt: LOGGED_AT, attributes: { 'event.sequence': 1 } } }] }
+    const { clock, posts } = world(on, { store: { 'outbox:gone': box } })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await clock.advance(5_000)
+    await clock.advance(5_000)
+    expect(count(posts, TRACES_URL)).toBe(0)
+    expect(count(posts, LOGS_URL)).toBe(1)
   })
 })
