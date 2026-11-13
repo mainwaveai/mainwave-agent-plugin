@@ -27,6 +27,10 @@ const PLUGIN_KEY = 'mw_dev_e2e_key_0001'
 const HOST_ONLY = new Set(['os.type', 'os.version', 'host.arch'])
 /** Attribute keys that differ by design between the two paths. */
 const ROUTE = 'mainwave.telemetry.route'
+/** Rows Claude Code raises while it starts, before any plugin's hooks are registered: no plugin ever sees them. */
+const STARTUP = new Set(['managed_settings_resolved', 'plugin_loaded'])
+/** An example organization, put on every row through the resource so the plugin's stamping path runs as in a real organization. */
+const ORG = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
 
 // ── The mock model ───────────────────────────────────────────────────────────
 // A request that offers tools and has no tool result yet gets one Bash call; every other request gets a short text answer.
@@ -116,12 +120,14 @@ const env = {
   CLAUDE_CODE_ENABLE_TELEMETRY: '1',
   OTEL_LOGS_EXPORTER: 'otlp',
   OTEL_METRICS_EXPORTER: 'none',
-  OTEL_TRACES_EXPORTER: 'none',
+  // Traces on, and the beta that ties log rows to spans: so rows carry trace and span ids, and the comparison checks them.
+  OTEL_TRACES_EXPORTER: 'otlp',
+  CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: '1',
   OTEL_EXPORTER_OTLP_PROTOCOL: 'http/json',
   OTEL_EXPORTER_OTLP_ENDPOINT: base,
   OTEL_EXPORTER_OTLP_HEADERS: `Authorization=Bearer ${EXPORTER_KEY}`,
   OTEL_LOGS_EXPORT_INTERVAL: '500',
-  OTEL_RESOURCE_ATTRIBUTES: 'mainwave.source=coding_agent.claude_code,service.name=claude-code,deployment.environment=e2e',
+  OTEL_RESOURCE_ATTRIBUTES: `mainwave.source=coding_agent.claude_code,service.name=claude-code,deployment.environment=e2e,organization.id=${ORG}`,
   OTEL_LOG_USER_PROMPTS: '1',
   OTEL_LOG_TOOL_DETAILS: '1',
   MW_E2E_RECEIVER: `${base}/plugin`,
@@ -155,8 +161,9 @@ function plain(v) {
   if (v === undefined || v === null) return v
   if ('stringValue' in v) return { t: 'string', v: v.stringValue }
   if ('boolValue' in v) return { t: 'bool', v: v.boolValue }
-  if ('intValue' in v) return { t: 'int', v: String(v.intValue) }
-  if ('doubleValue' in v) return { t: 'double', v: Number(v.doubleValue) }
+  // Raw, so a number and a numeric string differ, as they do on the wire.
+  if ('intValue' in v) return { t: 'int', v: v.intValue }
+  if ('doubleValue' in v) return { t: 'double', v: v.doubleValue }
   if ('arrayValue' in v) return { t: 'array', v: (v.arrayValue.values ?? []).map(plain) }
   return { t: 'other', v: JSON.stringify(v) }
 }
@@ -210,12 +217,15 @@ const pl = byKey(plugin)
 const onlyExporter = [...ex.keys()].filter(k => !pl.has(k))
 const onlyPlugin = [...pl.keys()].filter(k => !ex.has(k))
 for (const k of onlyPlugin) problems.push(`the plugin sent ${k}, which the exporter did not`)
-// Claude Code raises a few rows while it starts, before any plugin's hooks are registered (managed_settings_resolved, plugin_loaded):
-// no plugin ever sees them. They are a known gap, reported, not failed. A row the exporter sent after the plugin's first is a failure.
-const seq = r => Number(r.attributes['event.sequence']?.v)
-const firstSeen = pl.size === 0 ? Number.NEGATIVE_INFINITY : Math.min(...[...pl.values()].map(seq))
-const beforePlugin = onlyExporter.filter(k => seq(ex.get(k)) < firstSeen)
+// Rows Claude Code raises while it starts are a known gap, reported, not failed. Any other row the exporter sent alone is a failure.
+const beforePlugin = onlyExporter.filter(k => STARTUP.has(ex.get(k).attributes['event.name']?.v))
 for (const k of onlyExporter) if (!beforePlugin.includes(k)) problems.push(`the exporter sent ${k}, which the plugin did not`)
+
+// The paths a real organization's session takes, so the comparison checks them and does not pass by having nothing to check.
+const matched = [...ex.values()].filter(r => pl.has(r.key))
+if (!matched.some(r => r.attributes['mainwave.mod.name']?.v === 'mainwave')) problems.push("no matched row carries the plugin's stamps")
+if (!matched.some(r => /^[0-9a-f]{32}$/.test(r.traceId) && /^[0-9a-f]{16}$/.test(r.spanId))) problems.push('no matched row carries a trace and span id')
+if (!matched.some(r => r.attributes['event.name']?.v === 'api_request')) problems.push('no api_request row was matched')
 
 const fieldDiffs = new Map()
 const noteDiff = (what, k) => fieldDiffs.set(what, [...(fieldDiffs.get(what) ?? []), k])
