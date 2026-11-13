@@ -8,8 +8,11 @@ describe('parseResourceAttributes', () => {
   test('pairs split by commas, trimmed, values percent-decoded', () => {
     expect(parseResourceAttributes(' a=1 , b = two,c=x%2Cy ')).toEqual({ a: '1', b: 'two', c: 'x,y' })
   })
-  test('a pair without a key, without =, or with a bad escape is skipped', () => {
-    expect(parseResourceAttributes('=v,novalue,bad=%E0%A4%A,ok=1')).toEqual({ ok: '1' })
+  test('a pair without a key, without =, with two =, or with a bad escape is skipped', () => {
+    expect(parseResourceAttributes('=v,novalue,bad=%E0%A4%A,two=a=b,ok=1')).toEqual({ ok: '1' })
+  })
+  test('quotes around a value are taken off', () => {
+    expect(parseResourceAttributes('a="quoted",b= "spaced" ')).toEqual({ a: 'quoted', b: 'spaced' })
   })
   test('unset is empty', () => expect(parseResourceAttributes(undefined)).toEqual({}))
   test('a key named __proto__ stays a plain key', () => {
@@ -29,15 +32,15 @@ describe('resourceOf', () => {
 })
 
 describe('anyValue', () => {
-  test('typed as the OpenTelemetry SDK types a JavaScript value', () => {
+  test('typed as the OpenTelemetry JS SDK types a JavaScript value, numbers as JSON numbers', () => {
     expect(anyValue('x')).toEqual({ stringValue: 'x' })
     expect(anyValue(false)).toEqual({ boolValue: false })
-    expect(anyValue(124)).toEqual({ intValue: '124' })
-    expect(anyValue(0)).toEqual({ intValue: '0' })
+    expect(anyValue(124)).toEqual({ intValue: 124 })
+    expect(anyValue(0)).toEqual({ intValue: 0 })
+    expect(anyValue(2 ** 60)).toEqual({ intValue: 2 ** 60 })
     expect(anyValue(0.0001241)).toEqual({ doubleValue: 0.0001241 })
     expect(anyValue(['a', 'b'])).toEqual({ arrayValue: { values: [{ stringValue: 'a' }, { stringValue: 'b' }] } })
-    expect(anyValue(Number.NaN)).toEqual({ stringValue: 'NaN' })
-    expect(anyValue(2 ** 60)).toEqual({ doubleValue: 2 ** 60 })
+    expect(JSON.stringify(anyValue(Number.NaN))).toBe('{"doubleValue":null}')
   })
 })
 

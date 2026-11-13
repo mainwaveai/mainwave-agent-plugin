@@ -22,14 +22,17 @@ export const SCOPE_NAME = 'com.anthropic.claude_code.events'
 /** `service.name` when nothing names one. */
 export const DEFAULT_SERVICE_NAME = 'claude-code'
 
-/** `OTEL_RESOURCE_ATTRIBUTES`: `key=value` pairs split by commas, values percent-decoded. A pair that does not parse is skipped. */
+/**
+ * `OTEL_RESOURCE_ATTRIBUTES` as the OpenTelemetry JS SDK reads it: `key=value` pairs split by commas, a pair with no `=` or more than
+ * one skipped, the value trimmed, stripped of surrounding quotes and percent-decoded. A pair that does not decode is skipped.
+ */
 export function parseResourceAttributes(raw: string | undefined): Record<string, string> {
   const out: Record<string, string> = {}
   for (const pair of (raw ?? '').split(',')) {
-    const eq = pair.indexOf('=')
-    if (eq <= 0) continue
-    const key = pair.slice(0, eq).trim()
-    let value = pair.slice(eq + 1).trim()
+    const parts = pair.split('=')
+    if (parts.length !== 2) continue
+    const key = parts[0]!.trim()
+    let value = parts[1]!.trim().replace(/^"|"$/g, '')
     try {
       value = decodeURIComponent(value)
     } catch {
@@ -52,19 +55,18 @@ export function resourceOf(input: { resourceAttributes?: string; serviceName?: s
 type AnyValue =
   | { stringValue: string }
   | { boolValue: boolean }
-  | { intValue: string }
+  | { intValue: number }
   | { doubleValue: number }
   | { arrayValue: { values: AnyValue[] } }
 
-/** One attribute value, typed as the OpenTelemetry SDK types a JavaScript value: a whole number an int, any other a double. */
+/**
+ * One attribute value, as the OpenTelemetry JS SDK's JSON exporter writes a JavaScript value: a whole number an int, any other number
+ * a double, each as a JSON number. (A double that is not finite comes out as `null`, as it does from the SDK.)
+ */
 export function anyValue(v: unknown): AnyValue {
   if (typeof v === 'string') return { stringValue: v }
   if (typeof v === 'boolean') return { boolValue: v }
-  if (typeof v === 'number') {
-    if (Number.isSafeInteger(v)) return { intValue: String(v) }
-    if (Number.isFinite(v)) return { doubleValue: v }
-    return { stringValue: String(v) }
-  }
+  if (typeof v === 'number') return Number.isInteger(v) ? { intValue: v } : { doubleValue: v }
   if (Array.isArray(v)) return { arrayValue: { values: v.map(anyValue) } }
   return { stringValue: String(v) }
 }

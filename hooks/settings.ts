@@ -1,15 +1,21 @@
 // Where the plugin's dev ingest key may come from, and the shape it must have. Pure: tests call it directly.
 //
-// The key is the person's own: `/config` keeps a sensitive option in secure storage and hands it to `register` as `options`. A
-// repository's settings (`project`, `local`) are not the person's. A repository that names the option under any of the plugin's
-// ids could be trying to send the person's rows somewhere they did not choose, so the plugin then sends nothing. A repository
-// layer that cannot be read counts as naming it.
+// The key is the person's own: `claude plugin configure` keeps a sensitive option in secure storage, and the engine hands it to
+// `register` as `options`. A repository's settings (`project`, `local`) are not the person's. A repository that names the option
+// under any of the plugin's ids could be trying to send the person's rows somewhere they did not choose, so the plugin then sends
+// nothing. A repository layer that cannot be read counts as naming it.
+//
+// This guards against settings only. Another plugin the person has installed runs beside this one and can read or rewrite its
+// requests (`http.fetch` hooks see every plugin's) and the settings it reads; nothing a plugin does can keep its key from those.
 
 /** A settings layer as `$.settings.read` answers it, or `unreadable` when the read failed. */
 export type Layer = Readonly<Record<string, unknown>> | 'unreadable'
 
-/** The plugin's ids in `pluginConfigs`: bare (a `--plugin-dir` load), or installed from this repository's marketplace or by org sync. */
-export const PLUGIN_ID = /^mainwave(@(mainwave|inline|synced))?$/
+/**
+ * The plugin's ids in `pluginConfigs`: bare (a `--plugin-dir` load), or `mainwave@<marketplace>` from any marketplace (this
+ * repository's, org sync, `inline`, or one that does not exist yet). Wide on purpose: an id this misses is one a repository could use.
+ */
+export const PLUGIN_ID = /^mainwave(@[^@\s]+)?$/
 
 /** The option that holds the dev ingest key. */
 export const KEY_OPTION = 'devIngestKey'

@@ -20,8 +20,9 @@ describe('namesOption', () => {
     ['@inline', cfg({ 'mainwave@inline': opt('x') }), true],
     ['an empty value still names it', cfg({ mainwave: opt('') }), true],
     ['a value of any type names it', cfg({ mainwave: opt(null) }), true],
-    ['another marketplace with our name', cfg({ 'mainwave@elsewhere': opt('x') }), false],
+    ['our name from any marketplace, one that does not exist yet included', cfg({ 'mainwave@elsewhere': opt('x') }), true],
     ['a longer name', cfg({ 'mainwave-telemetry': opt('x') }), false],
+    ['two marketplaces', cfg({ 'mainwave@a@b': opt('x') }), false],
     ['unreadable', 'unreadable', true],
   ]
   for (const [name, layer, want] of cases) test(name, () => expect(namesOption(layer)).toBe(want))

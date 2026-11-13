@@ -121,6 +121,26 @@ describe('the copy', () => {
     expect(sentSequences(posts)).toEqual(Array.from({ length: 450 }, (_, i) => i + 1))
   })
 
+  test("a row too big for a batch is not copied; the exporter's goes on", withKey, async ($, on) => {
+    const { clock, posts, rig } = world(on)
+    const a = await logRow($, rig, row(1, { tool_output: 'x'.repeat(1_100_000) }))
+    expect(a['tool_output']).toBeDefined()
+    await logRow($, rig, row(2))
+    await clock.advance(TICK)
+    expect(sentSequences(posts)).toEqual([2])
+  })
+
+  test('past 1 MB of queued rows the oldest go first', withKey, async ($, on) => {
+    const { clock, posts, rig } = world(on, { reply: n => (n === 1 ? { status: 503 } : { status: 200 }) })
+    const big = (i: number) => ({ 'event.sequence': i, padding: 'p'.repeat(100_000) })
+    await logRow($, rig, big(1))
+    await clock.advance(TICK)
+    for (let i = 2; i <= 12; i++) await logRow($, rig, big(i))
+    for (let i = 0; i < 6; i++) await clock.advance(TICK)
+    const sent = sentSequences(posts.slice(1))
+    expect(sent).toEqual([4, 5, 6, 7, 8, 9, 10, 11, 12])
+  })
+
   test("the exporter's row never waits on the network", withKey, async ($, on) => {
     const { clock, rig } = world(on, { reply: () => 'hang' })
     await logRow($, rig, row(1))
@@ -233,11 +253,50 @@ describe('across sessions', () => {
   })
 
   test('an outbox of the wrong shape is cleared, not sent', withKey, async ($, on) => {
-    const { clock, posts, rig } = world(on, { store: { 'outbox:bad': { v: 9, rows: 'x' } } })
+    const { clock, posts, rig, data } = world(on, { store: { 'outbox:bad': { v: 1, rows: 'x' } } })
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
     await logRow($, rig, row(1))
     await clock.advance(TICK)
     expect(sentSequences(posts)).toEqual([1])
+    expect(data.has('outbox:bad')).toBe(false)
+  })
+
+  test('an outbox a later version wrote is left alone', withKey, async ($, on) => {
+    const later = { v: 2, updatedAt: 0, anything: ['new'] }
+    const { clock, posts, data } = world(on, { store: { 'outbox:later': later } })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await clock.advance(20 * TICK)
+    expect(posts).toEqual([])
+    expect(data.get('outbox:later')).toEqual(later)
+  })
+
+  test("a session a repository refuses takes over no other session's outbox", withKey, async ($, on) => {
+    const resources = [JSON.stringify({ 'service.name': 'claude-code' })]
+    const gone = { v: 1, updatedAt: START - 120_000, resources, rows: [{ r: 0, event: 'api_request', loggedAt: LOGGED_AT, attributes: row(7) }] }
+    const { clock, posts, data } = world(on, { store: { 'outbox:gone': gone }, layers: { local: 'reject' } })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await clock.advance(20 * TICK)
+    expect(posts).toEqual([])
+    expect(data.get('outbox:gone')).toEqual(gone)
+  })
+
+  test('a batch still in flight at session end is kept, so a later session sends it', withKey, async ($, on) => {
+    const { clock, rig, data } = world(on, { reply: () => 'hang' })
+    await logRow($, rig, row(1))
+    await clock.advance(TICK)
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume } as never)
+    const boxes = [...data.entries()].filter(([k]) => k.startsWith('outbox:')).map(([, v]) => v as { rows: { attributes: Record<string, unknown> }[] })
+    expect(boxes.flatMap(b => b.rows.map(r => r.attributes['event.sequence']))).toEqual([1])
+  })
+
+  test('after a /clear, rows the end could not send go on being sent, with no new row', withKey, async ($, on) => {
+    const { clock, posts, rig } = world(on, { reply: n => (n <= 2 ? { status: 503 } : { status: 200 }) })
+    await logRow($, rig, row(1))
+    await clock.advance(TICK)
+    await $.session.end({ reason: 'clear', sessionId: 's-1', resume } as never)
+    await clock.advance(20 * TICK)
+    expect(sentSequences(posts).at(-1)).toBe(1)
+    expect(posts.length).toBe(3)
   })
 })
 

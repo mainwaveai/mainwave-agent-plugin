@@ -129,7 +129,7 @@ export async function sessionStart($: SessionStartParams[0], e: SessionStartPara
  */
 export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1], next: SessionEndParams[2]) {
   try {
-    await finish($, next.budget.remainingMs)
+    await finish($, next.budget)
     if (isCopying()) {
       const s = snapshot()
       $.ui.log(`mainwave: copy to dev: ${s.sent} sent, ${s.dropped} dropped, ${s.queued} kept for a later session`, { to: 'debug' })

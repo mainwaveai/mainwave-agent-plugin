@@ -27,9 +27,11 @@ export const BACKOFF_MAX_MS = 60_000
 /** A batch: at most this many rows and about this many bytes of JSON. */
 export const BATCH_ROWS = 200
 export const BATCH_BYTES = 1_000_000
-/** The queue: at most this many rows and bytes; past either, the oldest go. Well under `$.store`'s 4 MiB, with two loads' outboxes. */
+/** The queue: at most this many rows and characters of JSON; past either, the oldest go. Three loads' outboxes fit `$.store`'s 4 MiB. */
 export const QUEUE_ROWS = 5_000
-export const QUEUE_BYTES = 1_500_000
+export const QUEUE_BYTES = 1_000_000
+/** New rows are saved at most this often (session end and taking over an outbox save at once): a crash loses at most this much. */
+export const PERSIST_MS = 10_000
 /** Batches one timer tick may send. */
 export const BATCHES_PER_TICK = 5
 /** An outbox untouched this long belongs to a load that has gone, and may be taken over. */
@@ -225,8 +227,11 @@ async function repositoryNamesKey($: EngineInterface): Promise<boolean> {
   return true
 }
 
-/** Sends up to `maxBatches` batches, each within `timeoutMs`. Never throws; never runs twice at once. */
-export async function flush($: EngineInterface, opts: { timeoutMs: number; maxBatches: number }): Promise<void> {
+/**
+ * Sends up to `maxBatches` batches, each within `timeoutMs`, read again before each request (at session end it is what the bound has
+ * left); a limit under `END_MIN_MS` sends nothing more. Never throws; never runs twice at once.
+ */
+export async function flush($: EngineInterface, opts: { timeoutMs: number | (() => number); maxBatches: number }): Promise<void> {
   if (sending || !isCopying() || stopped || queue.length === 0) return
   sending = true
   try {
@@ -234,6 +239,8 @@ export async function flush($: EngineInterface, opts: { timeoutMs: number; maxBa
     for (let i = 0; i < opts.maxBatches && queue.length > 0 && !stopped; i++) {
       const now = await $.clock.now()
       if (now < nextTryAt) break
+      const limit = typeof opts.timeoutMs === 'function' ? opts.timeoutMs() : opts.timeoutMs
+      if (!(limit >= END_MIN_MS)) break
       const batch = takeBatch()
       inflight = batch
       let outcome: FetchOutcome
@@ -242,7 +249,7 @@ export async function flush($: EngineInterface, opts: { timeoutMs: number; maxBa
           method: 'POST',
           headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
           body: logsBody(groups(batch), scopeVersion, now),
-          timeoutMs: opts.timeoutMs,
+          timeoutMs: limit,
         })
       } catch {
         outcome = { ok: false, reason: 'failed' }
@@ -321,16 +328,21 @@ export function writeOutbox(rows: readonly Queued[], updatedAt: number): Outbox 
 export async function persist($: EngineInterface, force = false): Promise<void> {
   try {
     const now = await $.clock.now()
+    const due = force || now - persistedAt >= PERSIST_MS
     const rows = [...inflight, ...queue]
+    // Marked clean before the write: a row queued while it is under way marks it dirty again, and is saved by the next one.
     if (rows.length === 0) {
-      if (dirty || force) await $.store.delete(outboxKey)
-    } else if (dirty || force || now - persistedAt >= STALE_MS / 3) {
+      if (!(dirty || force)) return
+      dirty = false
+      await $.store.delete(outboxKey)
+    } else if ((dirty && due) || force || now - persistedAt >= STALE_MS / 3) {
+      dirty = false
       await $.store.set(outboxKey, writeOutbox(rows, now))
     } else return
-    dirty = false
     persistedAt = now
   } catch {
-    // The store refused (full, or gone): the queue in memory still sends.
+    // The store refused (full, or gone): the queue in memory still sends, and the next save tries again.
+    dirty = true
   }
 }
 
@@ -338,11 +350,16 @@ export async function persist($: EngineInterface, force = false): Promise<void> 
 export async function adopt($: EngineInterface): Promise<void> {
   if (!isCopying()) return
   try {
+    // A load a repository refuses takes over nothing: other sessions' rows stay where they are for a load that may send them.
+    if (await repositoryNamesKey($)) return
     const now = await $.clock.now()
     adoptedAt = now
     for (const k of await $.store.keys()) {
       if (!k.startsWith(OUTBOX_PREFIX) || k === outboxKey) continue
-      const box = readOutbox(await $.store.get(k))
+      const raw = await $.store.get(k)
+      // An outbox a later version wrote is left for that version to send.
+      if (raw !== null && typeof raw === 'object' && typeof (raw as { v?: unknown }).v === 'number' && (raw as { v: number }).v > 1) continue
+      const box = readOutbox(raw)
       if (box !== null && now - box.updatedAt < STALE_MS) continue
       await $.store.delete(k)
       if (box === null || box.rows.length === 0) continue
@@ -352,7 +369,7 @@ export async function adopt($: EngineInterface): Promise<void> {
       dropOldest()
     }
     // What was taken over is this load's to keep from now on, before anything else can go wrong.
-    if (dirty) await persist($)
+    if (dirty) await persist($, true)
     if (queue.length > 0) ensureTimer($)
   } catch {
     // An outbox that cannot be read now is looked at again later.
@@ -374,15 +391,14 @@ export async function tick($: EngineInterface): Promise<void> {
   }
 }
 
-/** At `session.end`: stop the timer, keep the queue, send one batch if the bound leaves room, and keep what is left. */
-export async function finish($: EngineInterface, remainingMs: number): Promise<void> {
-  timer?.cancel()
-  timer = null
+/**
+ * At `session.end`: keep the queue, then send one batch if the bound leaves room, sized by what is left just before the request, and
+ * keep what is left. The timer goes on: after a /clear or a resume the process goes on, and so does sending.
+ */
+export async function finish($: EngineInterface, budget: { readonly remainingMs: number }): Promise<void> {
   if (!isCopying()) return
   await persist($, true)
-  const room = remainingMs - END_MARGIN_MS
-  if (room >= END_MIN_MS && !sending) {
-    await flush($, { timeoutMs: Math.min(room, END_TIMEOUT_MS), maxBatches: 1 })
-    await persist($, true)
-  }
+  if (sending) return
+  await flush($, { timeoutMs: () => Math.min(budget.remainingMs - END_MARGIN_MS, END_TIMEOUT_MS), maxBatches: 1 })
+  await persist($, true)
 }
