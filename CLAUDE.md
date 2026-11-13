@@ -9,9 +9,10 @@ claude plugin validate .        # manifest, marketplace and hooks module, read t
 claude plugin test .            # tests/*.test.ts against the engine
 scripts/check-version.sh        # plugin.json and hooks/version.ts agree
 scripts/check-hooks.sh          # the row hook keeps its fail-open .catch; session.end is hooked
+node tests/e2e/compare.mjs      # one real session, model mocked: the plugin's copy against the exporter's rows
 ```
 
-CI runs all four on every pull request. The type check is local only (README, Developing).
+CI runs all five on every pull request. The type check is local only (README, Developing).
 
 ## Rules
 
