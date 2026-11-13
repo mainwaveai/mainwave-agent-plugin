@@ -6,14 +6,14 @@ It is a Claude Code mod: TypeScript that runs inside Claude Code and Cowork. Not
 
 ## What it does today
 
-Version 0.2.0 does two things.
+The plugin does two things.
 
 **It stamps Claude Code's rows.** Where an organization already sends Claude Code's OpenTelemetry to Mainwave (the managed `env` block from Mainwave's org-wide setup), the plugin adds four attributes to every log row Claude Code exports that names an organization:
 
 | Attribute | Value |
 | --- | --- |
 | `mainwave.mod.name` | `mainwave` |
-| `mainwave.mod.version` | the plugin's version, such as `0.2.0` |
+| `mainwave.mod.version` | the plugin's version, such as `0.1.0` |
 | `mainwave.mod.entrypoint` | where the session runs, from `CLAUDE_CODE_ENTRYPOINT` (`cli`, `claude-vscode`, `remote_cowork` and so on); `other` for anything else |
 | `mainwave.telemetry.route` | which path the row took: `exporter` on the row Claude Code's exporter sends, `plugin` on the plugin's own copy |
 

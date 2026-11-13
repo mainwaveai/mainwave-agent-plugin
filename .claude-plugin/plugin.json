@@ -1,7 +1,7 @@
 {
   "name": "mainwave",
   "displayName": "Mainwave",
-  "version": "0.2.0",
+  "version": "0.1.0",
   "description": "Reports your Claude Code and Cowork sessions to Mainwave. It adds the plugin's name, version, entry point and route to the telemetry rows Claude Code already sends to your organization's collector, and reads the organization, account, email and device ID those rows carry. With a Mainwave dev ingest key set, it also sends its own copy of each of those rows to Mainwave's dev collector, so the two paths can be compared.",
   "author": {
     "name": "Mainwave"
