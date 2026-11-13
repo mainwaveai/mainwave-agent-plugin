@@ -48,6 +48,8 @@ const ORG = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
 const TIME_TOLERANCE_MS = 50
 /** How far a metric point's start or end may be: the plugin's collections run on its own clock, from when it loads. */
 const METRIC_TIME_TOLERANCE_MS = 250
+/** How far the session count's start may be: Claude Code counts the session before any plugin loads, the plugin once it has. */
+const SESSION_COUNT_TOLERANCE_MS = 2_000
 
 // ── The mock model ───────────────────────────────────────────────────────────
 // The main loop's prompt names a script of tool calls, one per request; the subagent's prompt names its own. Every other request
@@ -493,6 +495,10 @@ function compare(pass, details, { captured, run }) {
     if (pp.attrs[ROUTE]?.v !== 'plugin') noteDiff(`metric plugin route ${JSON.stringify(pp.attrs[ROUTE])}`, k)
     for (const [f, ef, pf] of [['start', ep.startMs, pp.startMs], ['time', ep.timeMs, pp.timeMs]]) {
       const d = Math.abs(ef - pf)
+      if (f === 'start' && k.startsWith('claude_code.session.count ') && d <= SESSION_COUNT_TOLERANCE_MS) {
+        noteKnown(`metrics: session.count counted when the plugin starts, ${d.toFixed(0)} ms after Claude Code counts it (within ${SESSION_COUNT_TOLERANCE_MS} ms)`)
+        continue
+      }
       worstTime.metric = Math.max(worstTime.metric, d)
       if (d > METRIC_TIME_TOLERANCE_MS) noteDiff(`metric ${f} ${d.toFixed(1)} ms from the exporter's`, k)
       else if (d > 0) noteKnown(`metrics: point ${f} taken by the plugin's own clock, within ${METRIC_TIME_TOLERANCE_MS} ms`)

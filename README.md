@@ -58,6 +58,7 @@ Every span and data point starts with the attributes Claude Code puts first on a
 | `language` on `code_edit_tool.decision` for less common file types | Claude Code knows a syntax highlighter's whole list; the plugin knows the common extensions and reads the rest as `unknown` |
 | `active_time.total` of `type` `user` | It counts the person's typing, which a plugin does not see |
 | `start_type` other than `fresh` on `session.count` | A plugin cannot tell a resumed or continued session from a new one |
+| The start of `session.count`'s point | Claude Code counts the session as its telemetry starts, before any plugin loads; the plugin counts it when it starts, a few hundred milliseconds later |
 | Line counts for NotebookEdit calls | Their results carry no patch |
 | Metric points' start and end times | The plugin collects on its own clock, from when it loads; each series' sum is the exporter's |
 | Spans in flight when the plugin reloads; the interaction count across a reload | They live in the plugin's memory |
