@@ -12,7 +12,7 @@ export const PLUGIN_NAME = 'mainwave'
 export const OWNED_PREFIXES: readonly string[] = ['mainwave.mod.', 'mainwave.telemetry.']
 
 /** Every key the plugin stamps. */
-export type StampKey = 'mainwave.mod.name' | 'mainwave.mod.version' | 'mainwave.mod.entrypoint' | 'mainwave.telemetry.source'
+export type StampKey = 'mainwave.mod.name' | 'mainwave.mod.version' | 'mainwave.mod.entrypoint' | 'mainwave.telemetry.route'
 
 /** `CLAUDE_CODE_ENTRYPOINT` values the plugin reports as they are; anything else is reported as `other`. */
 export const ENTRYPOINTS: readonly string[] = [
@@ -22,8 +22,8 @@ export const ENTRYPOINTS: readonly string[] = [
   'claude-code-github-action', 'claude-security', 'other',
 ]
 
-/** Where the reporting switch's answer came from (settings.ts). */
-export const SWITCH_SOURCES: readonly string[] = ['policy', 'user', 'default']
+/** Which path a row took to Mainwave: Claude Code's own exporter, or the plugin's copy (sender.ts). */
+export const ROUTES: readonly string[] = ['exporter', 'plugin']
 
 const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/
 
@@ -32,7 +32,7 @@ export const STAMP_RULES: Readonly<Record<StampKey, (value: string) => boolean>>
   'mainwave.mod.name': v => v === PLUGIN_NAME,
   'mainwave.mod.version': v => v.length <= 64 && SEMVER.test(v),
   'mainwave.mod.entrypoint': v => ENTRYPOINTS.includes(v),
-  'mainwave.telemetry.source': v => SWITCH_SOURCES.includes(v),
+  'mainwave.telemetry.route': v => ROUTES.includes(v),
 }
 
 /** `CLAUDE_CODE_ENTRYPOINT`, normalized to the list above. */

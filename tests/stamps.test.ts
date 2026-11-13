@@ -25,7 +25,7 @@ describe('filterStamps', () => {
       'mainwave.mod.name': 'mainwave',
       'mainwave.mod.version': '1.2.3-rc.1+build.5',
       'mainwave.mod.entrypoint': 'remote_cowork',
-      'mainwave.telemetry.source': 'policy',
+      'mainwave.telemetry.route': 'plugin',
     })
     expect(dropped).toEqual([])
     expect(Object.keys(kept).length).toBe(4)
@@ -36,8 +36,9 @@ describe('filterStamps', () => {
     ['mainwave.mod.version', '1.2'],
     ['mainwave.mod.version', `1.2.3-${'a'.repeat(70)}`],
     ['mainwave.mod.entrypoint', 'made-up'],
-    ['mainwave.telemetry.source', 'error'],
-    ['mainwave.telemetry.source', 'someone'],
+    ['mainwave.telemetry.route', 'collector'],
+    ['mainwave.telemetry.route', ''],
+    ['mainwave.telemetry.source', 'policy'],
     ['mainwave.mod.unknown', 'x'],
     ['user.email', 'dev@example.com'],
     ['mainwave.mod.name', 7],

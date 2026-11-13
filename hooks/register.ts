@@ -1,18 +1,19 @@
-// The plugin's hooks module. Report-only for now: it stamps the telemetry rows Claude Code exports to the organization's collector
-// (where the organization configured one) and keeps the identity those rows carry for the session. It sends nothing of its own,
-// draws nothing and registers no command or tool.
+// The plugin's hooks module. It stamps the telemetry rows Claude Code exports to the organization's collector (where the organization
+// configured one), keeps the identity those rows carry for the session, and, where the person set a dev ingest key, sends its own
+// copy of each row to Mainwave's dev collector (sender.ts). It draws nothing and registers no command or tool.
 //
-// Fail open: a hook that throws never holds up a row or the session. A row whose stamping failed goes on without any key the plugin
-// owns, as Claude Code wrote it otherwise.
+// The exporter's row always goes on: the copy is queued beside it, never in its place. Fail open: a hook that throws never holds up a
+// row or the session. A row whose stamping failed goes on without any key the plugin owns, as Claude Code wrote it otherwise.
 
 import { atom, update } from 'claude-code'
-import type { CatchHandler, EngineInterface, Frozen, Hook, Next, Register, SettingsSource, TelemetryLogResult, TelemetryRecordEntry } from 'claude-code'
+import type { CatchHandler, EngineInterface, Frozen, Hook, Next, Register, TelemetryAttribute, TelemetryLogResult, TelemetryRecordEntry } from 'claude-code'
 
 import type { RowIdentity } from '../types'
 import { endSession } from './http.ts'
-import { identityOf, mergeIdentity } from './identity.ts'
-import { reportingSwitch, type Layer } from './settings.ts'
-import { applyStamps, entrypointOf, PLUGIN_NAME, stripOwned } from './stamps.ts'
+import { identityOf, isOrgId, mergeIdentity } from './identity.ts'
+import type { CopiedRow } from './otlp.ts'
+import { adopt, configure, enqueue, ensureTimer, finish, isCopying, snapshot } from './sender.ts'
+import { applyStamps, entrypointOf, filterStamps, PLUGIN_NAME, stripOwned } from './stamps.ts'
 import { VERSION } from './version.ts'
 
 export { VERSION }
@@ -22,6 +23,7 @@ type CollectorNext = Next<'telemetry.log', TelemetryRecordEntry, TelemetryLogRes
 type CollectorHook = ($: EngineInterface, e: Frozen<TelemetryRecordEntry>, next: CollectorNext) => TelemetryLogResult | Promise<TelemetryLogResult>
 type RowParams = Parameters<CollectorHook>
 type RowCatchParams = Parameters<CatchHandler<CollectorHook>>
+type SessionStartParams = Parameters<Hook<'session.start'>>
 type SessionEndParams = Parameters<Hook<'session.end'>>
 
 /** The session's identity as its rows say (types/index.d.ts). */
@@ -30,15 +32,6 @@ const identityAtom = atom({ plugin: 'mainwave', key: 'identity' } as const, {})
 // Per load of the module: a reload starts these over. `$.state` outlives a reload, so the first row after one writes the identity again.
 let entrypoint: Promise<string> | null = null
 let held: RowIdentity = {}
-
-/** One settings layer; a read that fails, for any reason, is `unreadable`. */
-async function readLayer($: EngineInterface, source: SettingsSource): Promise<Layer> {
-  try {
-    return await $.settings.read({ source })
-  } catch {
-    return 'unreadable'
-  }
-}
 
 /** `CLAUDE_CODE_ENTRYPOINT`, normalized; `other` when it cannot be read. */
 async function readEntrypoint($: EngineInterface): Promise<string> {
@@ -61,28 +54,45 @@ async function noteIdentity($: EngineInterface, attributes: Readonly<Record<stri
   held = merged
 }
 
+/** The copy of a row the plugin sends: plain data, its route `plugin`. */
+function copyOf(e: Frozen<TelemetryRecordEntry>, attributes: Record<string, TelemetryAttribute>): CopiedRow {
+  const span = e.span === undefined ? undefined : { traceId: e.span.traceId, spanId: e.span.spanId, traceFlags: e.span.traceFlags }
+  const route = filterStamps({ 'mainwave.telemetry.route': 'plugin' }).kept
+  return { event: e.event, loggedAt: e.loggedAt, ...(span ? { span } : {}), attributes: { ...attributes, ...route } }
+}
+
 /**
- * Stamps one collector row. The switch is read on every row: nothing that allows stamping is cached, so an organization that turns
- * reporting off stops it at the next row. Off, the row goes on without any key the plugin owns. On, it carries the plugin's name,
- * version, entry point and where the switch's answer came from.
+ * Stamps one collector row and queues the plugin's copy of it. A row that names an organization carries the plugin's name, version,
+ * entry point and route (`exporter`); one that does not goes on without any key the plugin owns. Either way the row goes on to the
+ * exporter, and the copy, where the plugin copies at all, is queued with route `plugin`.
  */
 export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams[2]): Promise<TelemetryLogResult> {
-  entrypoint ??= readEntrypoint($)
-  const [policy, flag, user, ep] = await Promise.all([readLayer($, 'policy'), readLayer($, 'flag'), readLayer($, 'user'), entrypoint])
-  const reporting = reportingSwitch({ policy, flag, user }, e.attributes['organization.id'])
-  if (!reporting.on) return next({ ...e, attributes: stripOwned(e.attributes) })
-  try {
-    await noteIdentity($, e.attributes)
-  } catch {
-    // The identity is the session's to keep, not the row's: a failed write never holds the row.
+  let attributes: Record<string, TelemetryAttribute>
+  if (isOrgId(e.attributes['organization.id'])) {
+    entrypoint ??= readEntrypoint($)
+    const ep = await entrypoint
+    try {
+      await noteIdentity($, e.attributes)
+    } catch {
+      // The identity is the session's to keep, not the row's: a failed write never holds the row.
+    }
+    attributes = applyStamps(e.attributes, {
+      'mainwave.mod.name': PLUGIN_NAME,
+      'mainwave.mod.version': VERSION,
+      'mainwave.mod.entrypoint': ep,
+      'mainwave.telemetry.route': 'exporter',
+    })
+  } else {
+    attributes = stripOwned(e.attributes)
   }
-  const stamps = {
-    'mainwave.mod.name': PLUGIN_NAME,
-    'mainwave.mod.version': VERSION,
-    'mainwave.mod.entrypoint': ep,
-    'mainwave.telemetry.source': reporting.source,
+  if (isCopying()) {
+    try {
+      await enqueue($, copyOf(e, attributes))
+    } catch {
+      // The copy is the plugin's own: a fault queueing it never holds the exporter's row.
+    }
   }
-  return next({ ...e, attributes: applyStamps(e.attributes, stamps) })
+  return next({ ...e, attributes })
 }
 
 /**
@@ -100,17 +110,45 @@ export function rowCatch($: RowCatchParams[0], e: RowCatchParams[1], next: RowCa
   return next(row)
 }
 
-export const register: Register = on => {
+/** Starts the send timer and takes over outboxes earlier sessions left; the event goes on unchanged. */
+export async function sessionStart($: SessionStartParams[0], e: SessionStartParams[1], next: SessionStartParams[2]) {
+  if (isCopying()) {
+    try {
+      ensureTimer($)
+      await adopt($)
+    } catch {
+      // Sending starts with the next row instead.
+    }
+  }
+  return next(e)
+}
+
+/**
+ * Sends what it can of the queue within the session's end bound and keeps the rest for a later session. Requests still waiting for
+ * the ending session then answer `stopped` (http.ts); the event goes on unchanged.
+ */
+export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1], next: SessionEndParams[2]) {
+  try {
+    await finish($, next.budget.remainingMs)
+    if (isCopying()) {
+      const s = snapshot()
+      $.ui.log(`mainwave: copy to dev: ${s.sent} sent, ${s.dropped} dropped, ${s.queued} kept for a later session`, { to: 'debug' })
+    }
+  } catch {
+    // What could not be kept is lost to the copy alone: the exporter's rows went on.
+  }
+  endSession()
+  return next(e)
+}
+
+export const register: Register = (on, options) => {
   entrypoint = null
   held = {}
+  configure(options)
+
+  on('session.start', sessionStart)
 
   on('telemetry.log', { to: 'collector' }, stampRow).catch(rowCatch)
 
   on('session.end', sessionEnd)
-}
-
-/** Requests still waiting for the ending session answer `stopped` (http.ts); the event goes on unchanged. */
-export function sessionEnd(_$: SessionEndParams[0], e: SessionEndParams[1], next: SessionEndParams[2]) {
-  endSession()
-  return next(e)
 }

@@ -1,18 +1,19 @@
 {
   "name": "mainwave",
   "displayName": "Mainwave",
-  "version": "0.1.0",
-  "description": "Reports your Claude Code and Cowork sessions to Mainwave. Today it adds the plugin's name, version and entry point to the telemetry rows Claude Code already sends to your organization's collector, and reads the organization, account, email and device ID those rows carry. It makes no network calls of its own. Your organization's managed settings can turn reporting on or off; where they say nothing, you can turn it off.",
+  "version": "0.2.0",
+  "description": "Reports your Claude Code and Cowork sessions to Mainwave. It adds the plugin's name, version, entry point and route to the telemetry rows Claude Code already sends to your organization's collector, and reads the organization, account, email and device ID those rows carry. With a Mainwave dev ingest key set, it also sends its own copy of each of those rows to Mainwave's dev collector, so the two paths can be compared.",
   "author": {
     "name": "Mainwave"
   },
   "types": "./types/index.d.ts",
   "userConfig": {
-    "reporting": {
-      "type": "boolean",
-      "title": "Report this session to Mainwave",
-      "description": "On by default once a session's telemetry names an organization. Off: the plugin adds nothing to your telemetry rows. Your organization's managed settings override this, and a repository's settings never change it.",
-      "default": true
+    "devIngestKey": {
+      "type": "string",
+      "title": "Mainwave dev ingest key",
+      "description": "An ingest key for Mainwave's dev collector. Set: the plugin sends a copy of each Claude Code telemetry row to the dev collector, and nowhere else. Unset: it sends nothing of its own. Only your own settings count: a repository's settings that name this option stop the copy.",
+      "sensitive": true,
+      "default": ""
     }
   }
 }
