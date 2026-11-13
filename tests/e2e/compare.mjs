@@ -11,7 +11,7 @@
 // reach it.
 
 import { spawn } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -134,6 +134,7 @@ const args = [
   '--settings', settings,
   '--allowedTools', 'Bash(echo e2e)',
   '--model', 'claude-haiku-5-5',
+  '--debug-file', join(config, 'debug.log'),
 ]
 
 const run = await new Promise(r => {
@@ -212,7 +213,7 @@ for (const k of onlyPlugin) problems.push(`the plugin sent ${k}, which the expor
 // Claude Code raises a few rows while it starts, before any plugin's hooks are registered (managed_settings_resolved, plugin_loaded):
 // no plugin ever sees them. They are a known gap, reported, not failed. A row the exporter sent after the plugin's first is a failure.
 const seq = r => Number(r.attributes['event.sequence']?.v)
-const firstSeen = Math.min(...[...pl.values()].map(seq))
+const firstSeen = pl.size === 0 ? Number.NEGATIVE_INFINITY : Math.min(...[...pl.values()].map(seq))
 const beforePlugin = onlyExporter.filter(k => seq(ex.get(k)) < firstSeen)
 for (const k of onlyExporter) if (!beforePlugin.includes(k)) problems.push(`the exporter sent ${k}, which the plugin did not`)
 
@@ -244,6 +245,18 @@ if (beforePlugin.length) console.log(`known difference: ${beforePlugin.length} s
 const hostOnly = [...HOST_ONLY].filter(k => exporter[0]?.resource[k] !== undefined)
 if (hostOnly.length) console.log(`known difference: the copy's resource has no ${hostOnly.join(', ')}`)
 
+if (problems.length) {
+  // What the session itself said about the plugins, and what the plugin kept: enough to see why without --keep.
+  const debug = join(config, 'debug.log')
+  if (existsSync(debug)) {
+    const lines = readFileSync(debug, 'utf8').split('\n').filter(l => /mainwave|plugin|hook|telemetry|http/i.test(l))
+    console.error(`\ndebug log, plugin lines (${lines.length}):\n${lines.slice(-80).join('\n')}`)
+  }
+  const store = join(config, 'plugins', 'store')
+  if (existsSync(store)) for (const f of readdirSync(store)) if (f.startsWith('mainwave')) console.error(`\nstore ${f}: ${readFileSync(join(store, f), 'utf8').slice(0, 1500)}`)
+  if (captured.other.length) console.error(`\nother requests: ${captured.other.join(', ')}`)
+  console.error(`\n${problems.length} problem${problems.length === 1 ? '' : 's'}:\n- ${problems.join('\n- ')}`)
+}
 if (keep) {
   const out = join(config, 'e2e-captures.json')
   writeFileSync(out, JSON.stringify({ captured, run }, null, 2))
@@ -253,8 +266,5 @@ if (keep) {
   rmSync(work, { recursive: true, force: true })
 }
 
-if (problems.length) {
-  console.error(`\n${problems.length} problem${problems.length === 1 ? '' : 's'}:\n- ${problems.join('\n- ')}`)
-  process.exit(1)
-}
+if (problems.length) process.exit(1)
 console.log('the copy matches the exporter')
