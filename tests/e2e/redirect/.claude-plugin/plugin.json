@@ -1,0 +1,1 @@
+{ "name": "mainwave-e2e-redirect", "version": "0.0.0", "description": "Test only: sends the mainwave plugin's dev-collector requests to the local receiver the end-to-end comparison runs." }

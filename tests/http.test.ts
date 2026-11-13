@@ -138,11 +138,11 @@ describe('session.end', () => {
     await tick()
     const event = { reason: 'clear', sessionId: 's-1' }
     const passed: unknown[] = []
-    const next = (e: unknown) => {
+    const next = Object.assign((e: unknown) => {
       passed.push(e)
       return { sessionId: 's-1' }
-    }
-    expect(sessionEnd(undefined as never, event as never, next as never)).toEqual({ sessionId: 's-1' })
+    }, { budget: { ms: 2_000, remainingMs: 2_000 } })
+    expect(await sessionEnd(undefined as never, event as never, next as never)).toEqual({ sessionId: 's-1' })
     expect(passed).toEqual([event])
     expect(await pending).toEqual({ ok: false, reason: 'stopped' })
   })

@@ -1,75 +1,46 @@
-// The reporting switch's order and its failure rules, called directly.
+// Where the dev ingest key may come from and the shape it must have, called directly.
 
 import { describe, expect, test } from 'claude-code/testing'
 
-import { layerVote, personVote, reportingSwitch, resolveSwitch, type Layer } from '../hooks/settings.ts'
+import { ingestKeyOf, namesOption, type Layer } from '../hooks/settings.ts'
 
-const ORG = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
 const cfg = (entries: Record<string, unknown>): Layer => ({ pluginConfigs: entries })
-const opt = (value: unknown) => ({ options: { reporting: value } })
-const set = (on: boolean) => ({ kind: 'set', on }) as const
-const absent = { kind: 'absent' } as const
-const invalid = { kind: 'invalid' } as const
+const opt = (value: unknown) => ({ options: { devIngestKey: value } })
 
-describe('layerVote', () => {
-  const cases: [string, Layer, unknown][] = [
-    ['no pluginConfigs', {}, absent],
-    ['pluginConfigs not an object', { pluginConfigs: [] }, invalid],
-    ['another plugin only', cfg({ other: opt(false) }), absent],
-    ['our entry without options', cfg({ mainwave: {} }), absent],
-    ['our options without the field', cfg({ mainwave: { options: { x: 1 } } }), absent],
-    ['bare id, on', cfg({ mainwave: opt(true) }), set(true)],
-    ['@mainwave, off', cfg({ 'mainwave@mainwave': opt(false) }), set(false)],
-    ['@synced, off', cfg({ 'mainwave@synced': opt(false) }), set(false)],
-    ['@inline, on', cfg({ 'mainwave@inline': opt(true) }), set(true)],
-    ['another marketplace with our name', cfg({ 'mainwave@elsewhere': opt(false) }), absent],
-    ['a longer name', cfg({ 'mainwave-telemetry': opt(false) }), absent],
-    ['an off under one id beats an on under another', cfg({ mainwave: opt(true), 'mainwave@synced': opt(false) }), set(false)],
-    ['an off beats a malformed entry', cfg({ mainwave: 'x', 'mainwave@synced': opt(false) }), set(false)],
-    ['a malformed entry with an on', cfg({ mainwave: 'x', 'mainwave@synced': opt(true) }), invalid],
-    ['options not an object', cfg({ mainwave: { options: 'x' } }), invalid],
-    ['a string value', cfg({ mainwave: opt('false') }), invalid],
-    ['a null value', cfg({ mainwave: opt(null) }), invalid],
-    ['unreadable', 'unreadable', invalid],
+describe('namesOption', () => {
+  const cases: [string, Layer, boolean][] = [
+    ['no pluginConfigs', {}, false],
+    ['pluginConfigs not an object', { pluginConfigs: [] }, false],
+    ['another plugin only', cfg({ other: opt('x') }), false],
+    ['our entry without options', cfg({ mainwave: {} }), false],
+    ['our options without the field', cfg({ mainwave: { options: { x: 1 } } }), false],
+    ['bare id', cfg({ mainwave: opt('mw_dev_example_key_0001') }), true],
+    ['@mainwave', cfg({ 'mainwave@mainwave': opt('x') }), true],
+    ['@synced', cfg({ 'mainwave@synced': opt('x') }), true],
+    ['@inline', cfg({ 'mainwave@inline': opt('x') }), true],
+    ['an empty value still names it', cfg({ mainwave: opt('') }), true],
+    ['a value of any type names it', cfg({ mainwave: opt(null) }), true],
+    ['our name from any marketplace, one that does not exist yet included', cfg({ 'mainwave@elsewhere': opt('x') }), true],
+    ['a longer name', cfg({ 'mainwave-telemetry': opt('x') }), false],
+    ['two marketplaces', cfg({ 'mainwave@a@b': opt('x') }), false],
+    ['unreadable', 'unreadable', true],
   ]
-  for (const [name, layer, want] of cases) test(name, () => expect(layerVote(layer)).toEqual(want))
+  for (const [name, layer, want] of cases) test(name, () => expect(namesOption(layer)).toBe(want))
 })
 
-describe('personVote', () => {
-  test('--settings answers before the user layer', () => {
-    expect(personVote({ flag: cfg({ mainwave: opt(true) }), user: cfg({ mainwave: opt(false) }) })).toEqual(set(true))
-  })
-  test('the user layer answers when --settings says nothing', () => {
-    expect(personVote({ flag: {}, user: cfg({ mainwave: opt(false) }) })).toEqual(set(false))
-  })
-  test('a broken --settings layer is invalid, whatever the user layer says', () => {
-    expect(personVote({ flag: 'unreadable', user: cfg({ mainwave: opt(true) }) })).toEqual(invalid)
-  })
-})
-
-describe('resolveSwitch', () => {
-  test('the organization answers first', () => {
-    expect(resolveSwitch(set(false), set(true), ORG)).toEqual({ on: false, source: 'policy' })
-    expect(resolveSwitch(set(true), set(false), ORG)).toEqual({ on: true, source: 'policy' })
-  })
-  test('an invalid organization vote is off, without asking the person', () => {
-    expect(resolveSwitch(invalid, set(true), ORG)).toEqual({ on: false, source: 'error' })
-  })
-  test('the person answers when the organization says nothing', () => {
-    expect(resolveSwitch(absent, set(false), ORG)).toEqual({ on: false, source: 'user' })
-    expect(resolveSwitch(absent, set(true), undefined)).toEqual({ on: true, source: 'user' })
-    expect(resolveSwitch(absent, invalid, ORG)).toEqual({ on: false, source: 'error' })
-  })
-  test('the default is on once the organization is known', () => {
-    expect(resolveSwitch(absent, absent, ORG)).toEqual({ on: true, source: 'default' })
-    for (const unknown of [undefined, '', 7, null, 'not-a-uuid']) expect(resolveSwitch(absent, absent, unknown)).toEqual({ on: false, source: 'default' })
-  })
-})
-
-describe('reportingSwitch', () => {
-  test('reads the three layers in order', () => {
-    const layers = { policy: {}, flag: {}, user: cfg({ 'mainwave@mainwave': opt(false) }) }
-    expect(reportingSwitch(layers, ORG)).toEqual({ on: false, source: 'user' })
-    expect(reportingSwitch({ ...layers, policy: cfg({ 'mainwave@synced': opt(true) }) }, ORG)).toEqual({ on: true, source: 'policy' })
-  })
+describe('ingestKeyOf', () => {
+  const cases: [string, unknown, string | null][] = [
+    ['a plain key', 'mw_dev_example_key_0001', 'mw_dev_example_key_0001'],
+    ['spaces around it', '  mw_dev_example_key_0001\n', 'mw_dev_example_key_0001'],
+    ['with Bearer in front', 'Bearer mw_dev_example_key_0001', 'mw_dev_example_key_0001'],
+    ['with bearer in front, lowercase', 'bearer mw_dev_example_key_0001', 'mw_dev_example_key_0001'],
+    ['unset', '', null],
+    ['not a string', 42, null],
+    ['too short', 'abc', null],
+    ['a space inside', 'mw_dev example', null],
+    ['a line break inside (no header injection)', 'mw_dev_key\r\nx-evil: 1', null],
+    ['too long', 'k'.repeat(513), null],
+    ['non-ASCII', 'mw_dev_ключ_0001', null],
+  ]
+  for (const [name, raw, want] of cases) test(name, () => expect(ingestKeyOf(raw)).toBe(want))
 })

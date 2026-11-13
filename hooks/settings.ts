@@ -1,78 +1,48 @@
-// The reporting switch: whether the plugin stamps this session's rows. Pure: tests call it directly.
+// Where the plugin's dev ingest key may come from, and the shape it must have. Pure: tests call it directly.
 //
-// The order, first answer wins:
-//   1. the organization's managed settings (the `policy` layer), under any of the plugin's ids
-//   2. the person's own settings: `--settings` (the `flag` layer), then their user settings; never a repository's (`project`, `local`)
-//   3. the default: on once the row names an organization (a UUID in `organization.id`), off otherwise
+// The key is the person's own: `claude plugin configure` keeps a sensitive option in secure storage, and the engine hands it to
+// `register` as `options`. A repository's settings (`project`, `local`) are not the person's. A repository that names the option
+// under any of the plugin's ids could be trying to send the person's rows somewhere they did not choose, so the plugin then sends
+// nothing. A repository layer that cannot be read counts as naming it.
 //
-// A layer that cannot be read, or holds a malformed entry or a value that is not a boolean, ends the search with the switch off and
-// the source `error`: an administrator's or a person's mistake never reports more than they asked for.
-//
-// The option sits where Claude Code keeps every plugin's options: `pluginConfigs["<plugin id>"].options.reporting`, in managed settings
-// for the organization and in user settings for the person (the /config menu writes it there).
-
-import { isOrgId } from './identity.ts'
+// This guards against settings only. Another plugin the person has installed runs beside this one and can read or rewrite its
+// requests (`http.fetch` hooks see every plugin's) and the settings it reads; nothing a plugin does can keep its key from those.
 
 /** A settings layer as `$.settings.read` answers it, or `unreadable` when the read failed. */
 export type Layer = Readonly<Record<string, unknown>> | 'unreadable'
 
-/** The plugin's ids in `pluginConfigs`: bare (a `--plugin-dir` load), or installed from this repository's marketplace or by org sync. */
-export const PLUGIN_ID = /^mainwave(@(mainwave|inline|synced))?$/
+/**
+ * The plugin's ids in `pluginConfigs`: bare (a `--plugin-dir` load), or `mainwave@<marketplace>` from any marketplace (this
+ * repository's, org sync, `inline`, or one that does not exist yet). Wide on purpose: an id this misses is one a repository could use.
+ */
+export const PLUGIN_ID = /^mainwave(@[^@\s]+)?$/
 
-/** The option that holds the switch. */
-export const OPTION = 'reporting'
+/** The option that holds the dev ingest key. */
+export const KEY_OPTION = 'devIngestKey'
 
-export type Vote = { kind: 'set'; on: boolean } | { kind: 'absent' } | { kind: 'invalid' }
-export type Source = 'policy' | 'user' | 'default' | 'error'
-export type Switch = { on: boolean; source: Source }
-
-const ABSENT: Vote = { kind: 'absent' }
-const INVALID: Vote = { kind: 'invalid' }
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v)
 const has = (o: Record<string, unknown>, k: string) => Object.prototype.hasOwnProperty.call(o, k)
 
-/**
- * One layer's vote on an option, across every id of the plugin in its `pluginConfigs`. An off under any id wins over an on under
- * another, so two installs of the plugin can never outvote an off. With no off, a malformed entry or value makes the vote invalid.
- */
-export function layerVote(layer: Layer, option: string = OPTION): Vote {
-  if (layer === 'unreadable') return INVALID
-  if (!has(layer, 'pluginConfigs')) return ABSENT
+/** Whether a layer names the option under any of the plugin's ids, to any value. A layer that cannot be read does. */
+export function namesOption(layer: Layer, option: string = KEY_OPTION): boolean {
+  if (layer === 'unreadable') return true
+  if (!has(layer, 'pluginConfigs')) return false
   const configs = layer['pluginConfigs']
-  if (!isObject(configs)) return INVALID
-  let vote: Vote = ABSENT
-  let bad = false
+  if (!isObject(configs)) return false
   for (const [id, entry] of Object.entries(configs)) {
-    if (!PLUGIN_ID.test(id)) continue
-    if (!isObject(entry)) { bad = true; continue }
-    if (!has(entry, 'options')) continue
+    if (!PLUGIN_ID.test(id) || !isObject(entry)) continue
     const options = entry['options']
-    if (!isObject(options)) { bad = true; continue }
-    if (!has(options, option)) continue
-    const value = options[option]
-    if (typeof value !== 'boolean') { bad = true; continue }
-    if (!value) return { kind: 'set', on: false }
-    vote = { kind: 'set', on: true }
+    if (isObject(options) && has(options, option)) return true
   }
-  return bad ? INVALID : vote
+  return false
 }
 
-/** The person's vote: `--settings` first, then their user settings. The first that says anything answers. */
-export function personVote(layers: { flag: Layer; user: Layer }, option: string = OPTION): Vote {
-  const flag = layerVote(layers.flag, option)
-  return flag.kind === 'absent' ? layerVote(layers.user, option) : flag
-}
+// Printable ASCII, no spaces: what a header value can carry as it is.
+const KEY_SHAPE = /^[\x21-\x7e]{8,512}$/
 
-/** The switch from the organization's vote, the person's vote and the row's organization, in that order. */
-export function resolveSwitch(policy: Vote, person: Vote, orgId: unknown, defaultOn = true): Switch {
-  for (const [vote, source] of [[policy, 'policy'], [person, 'user']] as const) {
-    if (vote.kind === 'set') return { on: vote.on, source }
-    if (vote.kind === 'invalid') return { on: false, source: 'error' }
-  }
-  return { on: defaultOn && isOrgId(orgId), source: 'default' }
-}
-
-/** The reporting switch for one row, from the three layers it reads. */
-export function reportingSwitch(layers: { policy: Layer; flag: Layer; user: Layer }, orgId: unknown): Switch {
-  return resolveSwitch(layerVote(layers.policy), personVote(layers), orgId)
+/** The key as the option holds it, with a leading `Bearer ` taken off; `null` when unset or of the wrong shape. */
+export function ingestKeyOf(raw: unknown): string | null {
+  if (typeof raw !== 'string') return null
+  const key = raw.trim().replace(/^bearer\s+/i, '')
+  return KEY_SHAPE.test(key) ? key : null
 }

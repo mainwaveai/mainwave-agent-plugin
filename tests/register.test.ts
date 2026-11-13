@@ -4,19 +4,19 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import { rowCatch } from '../hooks/register.ts'
 import { VERSION } from '../hooks/version.ts'
-import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, log, option, ORG, ownedKeys, STAMPED, watchIdentity } from './rig.ts'
+import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, log, ORG, ownedKeys, STAMPED, watchIdentity } from './rig.ts'
 
 const inOrg = { 'organization.id': ORG, 'session.id': 's-1' }
 
 describe('stamping', () => {
-  test('a row that names an organization carries the plugin name, version, entry point and source', async ($, on) => {
+  test("a row that names an organization carries the plugin's name, version, entry point and route", async ($, on) => {
     const rig = boot(on, { entrypoint: 'cli' })
     const a = await log(rig, $, inOrg)
     expect(ownedKeys(a)).toEqual(STAMPED)
     expect(a['mainwave.mod.name']).toBe('mainwave')
     expect(a['mainwave.mod.version']).toBe(VERSION)
     expect(a['mainwave.mod.entrypoint']).toBe('cli')
-    expect(a['mainwave.telemetry.source']).toBe('default')
+    expect(a['mainwave.telemetry.route']).toBe('exporter')
     expect(contractViolations(a)).toEqual([])
   })
 
@@ -33,7 +33,7 @@ describe('stamping', () => {
     expect((await log(rig, $, inOrg))['mainwave.mod.entrypoint']).toBe('other')
   })
 
-  test('a row with no organization carries no stamp (the default is off until the organization is known)', async ($, on) => {
+  test('a row with no organization carries no stamp', async ($, on) => {
     const rig = boot(on)
     expect(ownedKeys(await log(rig, $, { 'session.id': 's-1' }))).toEqual([])
     expect(ownedKeys(await log(rig, $, { 'organization.id': '' }))).toEqual([])
@@ -41,15 +41,16 @@ describe('stamping', () => {
 
   test('forged keys under the owned prefixes are removed and replaced by the real ones', async ($, on) => {
     const rig = boot(on, { entrypoint: 'cli' })
-    const a = await log(rig, $, { ...inOrg, 'mainwave.mod.name': 'evil', 'mainwave.mod.extra': 'x', 'mainwave.telemetry.state': 'on' })
+    const a = await log(rig, $, { ...inOrg, 'mainwave.mod.name': 'evil', 'mainwave.mod.extra': 'x', 'mainwave.telemetry.route': 'plugin' })
     expect(ownedKeys(a)).toEqual(STAMPED)
     expect(a['mainwave.mod.name']).toBe('mainwave')
+    expect(a['mainwave.telemetry.route']).toBe('exporter')
     expect(contractViolations(a)).toEqual([])
   })
 
-  test('forged keys are removed even where reporting is off', async ($, on) => {
-    const rig = boot(on, { layers: { policy: option(false) } })
-    const a = await log(rig, $, { ...inOrg, 'mainwave.mod.name': 'evil', 'mainwave.telemetry.source': 'policy' })
+  test('forged keys are removed from a row with no organization too', async ($, on) => {
+    const rig = boot(on)
+    const a = await log(rig, $, { 'session.id': 's-1', 'mainwave.mod.name': 'evil', 'mainwave.telemetry.source': 'policy' })
     expect(ownedKeys(a)).toEqual([])
     expect(a['session.id']).toBe('s-1')
   })
@@ -60,61 +61,11 @@ describe('stamping', () => {
     expect(a['mainwave.attr.project']).toBe('p1')
     expect(a['mainwave.modx']).toBe('kept')
   })
-})
 
-describe('the reporting switch: organization, then person, then default', () => {
-  test("the organization's off wins over the person's on", async ($, on) => {
-    const rig = boot(on, { layers: { policy: option(false), user: option(true) } })
-    expect(ownedKeys(await log(rig, $, inOrg))).toEqual([])
-  })
-
-  test("the organization's on wins over the person's off, and says so", async ($, on) => {
-    const rig = boot(on, { layers: { policy: option(true, 'mainwave@synced'), user: option(false) } })
-    expect((await log(rig, $, inOrg))['mainwave.telemetry.source']).toBe('policy')
-  })
-
-  test("the person's off counts where the organization says nothing", async ($, on) => {
-    const rig = boot(on, { layers: { user: option(false) } })
-    expect(ownedKeys(await log(rig, $, inOrg))).toEqual([])
-  })
-
-  test("--settings counts before the person's user settings", async ($, on) => {
-    const rig = boot(on, { layers: { flag: option(true), user: option(false) } })
-    expect((await log(rig, $, inOrg))['mainwave.telemetry.source']).toBe('user')
-  })
-
-  test("a repository's settings change nothing", async ($, on) => {
-    const rig = boot(on, { layers: { project: option(false), local: option(false) } })
-    expect((await log(rig, $, inOrg))['mainwave.telemetry.source']).toBe('default')
-    expect(rig.reads).not.toContain('project')
-    expect(rig.reads).not.toContain('local')
-  })
-
-  test("another plugin's options change nothing", async ($, on) => {
-    const rig = boot(on, { layers: { policy: option(false, 'mainwave@someone-else'), user: option(false, 'mainwave-extra') } })
-    expect((await log(rig, $, inOrg))['mainwave.telemetry.source']).toBe('default')
-  })
-
-  for (const source of ['policy', 'flag', 'user'] as const) {
-    test(`an unreadable ${source} layer turns reporting off, and the row is still delivered`, async ($, on) => {
-      const rig = boot(on, { layers: { [source]: 'reject' } })
-      const a = await log(rig, $, inOrg)
-      expect(ownedKeys(a)).toEqual([])
-      expect(a['session.id']).toBe('s-1')
-    })
-  }
-
-  test('a malformed value turns reporting off', async ($, on) => {
-    const rig = boot(on, { layers: { policy: option('false') } })
-    expect(ownedKeys(await log(rig, $, inOrg))).toEqual([])
-  })
-
-  test('the switch is read on every row: an organization that turns reporting off stops it at the next row', async ($, on) => {
-    const layers: { policy: Record<string, unknown> } = { policy: {} }
-    const rig = boot(on, { layers })
+  test('no settings layer is read for a row, and no option turns stamping off', async ($, on) => {
+    const rig = boot(on, { layers: { policy: { pluginConfigs: { 'mainwave@synced': { options: { reporting: false } } } } } })
     expect(ownedKeys(await log(rig, $, inOrg))).toEqual(STAMPED)
-    layers.policy = option(false)
-    expect(ownedKeys(await log(rig, $, inOrg))).toEqual([])
+    expect(rig.reads).toEqual([])
   })
 })
 
@@ -145,10 +96,10 @@ describe('identity from rows', () => {
     expect(writes).toEqual([{ organizationId: ORG }])
   })
 
-  test('nothing is kept while reporting is off', async ($, on) => {
-    const rig = boot(on, { layers: { policy: option(false) } })
+  test('nothing is kept from a row with no organization', async ($, on) => {
+    const rig = boot(on)
     const writes = watchIdentity(on)
-    await log(rig, $, { ...inOrg, 'user.email': EMAIL })
+    await log(rig, $, { 'user.email': EMAIL })
     expect(writes).toEqual([])
   })
 
