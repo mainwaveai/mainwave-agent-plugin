@@ -1,9 +1,11 @@
-// The plugin's own path to Mainwave: a copy of each Claude Code log row, sent to Mainwave's dev collector while Claude Code's exporter
-// goes on sending the original wherever the organization pointed it. The two land in different places, so nothing is counted twice,
-// and the copy can be compared with the original row for row.
+// The plugin's own path to Mainwave: a copy of each Claude Code log row, and the spans and metrics the plugin rebuilds beside them
+// (spans.ts, metrics.ts), sent to Mainwave's dev collector while Claude Code's exporter goes on sending the originals wherever the
+// organization pointed it. The two land in different places, so nothing is counted twice, and the copy can be compared with the
+// original record for record.
 //
-// The row's hook only queues (`enqueue`): it never waits on the network. A timer sends the queue in batches every few seconds, and
-// `session.end` sends one more within its short bound. A batch that fails for a reason that can pass (no network, a timeout, the
+// The hooks only queue (`enqueue`): they never wait on the network. One queue holds all three signals, each entry tagged with its own,
+// so they share the caps, the outbox and the end of the session. A timer sends the queue in batches every few seconds, each batch one
+// signal to that signal's path, and `session.end` sends one more batch of each signal at once within its short bound. A batch that fails for a reason that can pass (no network, a timeout, the
 // collector busy) goes back to the head of the queue and the timer waits longer before the next try. A batch the collector refuses
 // as malformed is dropped. A refused key stops sending until the plugin loads again, keeping the queue.
 //
@@ -15,19 +17,27 @@
 import type { EngineInterface, PluginOptions, Timer } from 'claude-code'
 
 import { fetchWithin, type FetchOutcome } from './http.ts'
-import { logsBody, resourceOf, type CopiedRow } from './otlp.ts'
+import { logsBody, metricsBody, resourceOf, tracesBody, type BuiltSpan, type CopiedRow, type MetricPoint } from './otlp.ts'
 import { ingestKeyOf, KEY_OPTION, namesOption, type Layer } from './settings.ts'
 
-/** The one place the copy goes. Nothing reads another URL from settings or the environment. */
-export const DEV_LOGS_URL = 'https://collector.dev.mainwave.com/v1/logs'
+/** The one place the copy goes, a path per signal. Nothing reads another URL from settings or the environment. */
+export const DEV_COLLECTOR = 'https://collector.dev.mainwave.com'
+export type Signal = 'logs' | 'traces' | 'metrics'
+export const SIGNALS: readonly Signal[] = ['logs', 'traces', 'metrics']
+export const DEV_URLS: Readonly<Record<Signal, string>> = {
+  logs: `${DEV_COLLECTOR}/v1/logs`,
+  traces: `${DEV_COLLECTOR}/v1/traces`,
+  metrics: `${DEV_COLLECTOR}/v1/metrics`,
+}
+export const DEV_LOGS_URL = DEV_URLS.logs
 
 export const FLUSH_MS = 5_000
 export const SEND_TIMEOUT_MS = 10_000
 export const BACKOFF_MAX_MS = 60_000
-/** A batch: at most this many rows and about this many bytes of JSON. */
+/** A batch: at most this many records of one signal and about this many bytes of JSON. */
 export const BATCH_ROWS = 200
 export const BATCH_BYTES = 1_000_000
-/** The queue: at most this many rows and characters of JSON; past either, the oldest go. Three loads' outboxes fit `$.store`'s 4 MiB. */
+/** The queue, all signals together: at most this many records and characters of JSON; past either, the oldest go. Three loads' outboxes fit `$.store`'s 4 MiB. */
 export const QUEUE_ROWS = 5_000
 export const QUEUE_BYTES = 1_000_000
 /** New rows are saved at most this often (session end and taking over an outbox save at once): a crash loses at most this much. */
@@ -37,8 +47,8 @@ export const BATCHES_PER_TICK = 5
 /** An outbox untouched this long belongs to a load that has gone, and may be taken over. */
 export const STALE_MS = 60_000
 /**
- * `session.end`'s whole chain shares one short bound (1.5 s by default). The queue is saved first, then one batch is sent with what is
- * left, less a margin for the save after it. Under `END_MIN_MS` there is no point starting a request.
+ * `session.end`'s whole chain shares one short bound (1.5 s by default). The queue is saved first, then one batch of each signal is sent
+ * at once with what is left, less a margin for the save after it. Under `END_MIN_MS` there is no point starting a request.
  */
 export const END_MARGIN_MS = 150
 export const END_MIN_MS = 250
@@ -46,9 +56,12 @@ export const END_TIMEOUT_MS = 3_000
 
 export const OUTBOX_PREFIX = 'outbox:'
 
-type Queued = CopiedRow & { resource: string; size: number }
-/** What the store keeps: each row's resource as an index into `resources`. */
-type Outbox = { v: 1; updatedAt: number; resources: string[]; rows: (CopiedRow & { r: number })[] }
+/** One record to send: a log row's copy, a rebuilt span, or a metric data point, tagged with its signal. */
+export type Item = { s: 'logs'; d: CopiedRow } | { s: 'traces'; d: BuiltSpan } | { s: 'metrics'; d: MetricPoint }
+type Queued = Item & { resource: string; size: number }
+/** What the store keeps: each record's resource as an index into `resources`. Version 1 held log rows alone, as `rows`. */
+export const OUTBOX_VERSION = 2
+type Outbox = { v: 2; updatedAt: number; resources: string[]; items: { s: Signal; r: number; d: unknown }[] }
 
 export type Verdict = 'sent' | 'retry' | 'drop' | 'stop'
 
@@ -147,19 +160,19 @@ function dropOldest(): void {
 }
 
 /**
- * Queues the copy of one row. Called from the row's hook: it waits on nothing but the resource, read once per load, and starts the
- * timer if none runs (after a /clear the session goes on without a `session.start`).
+ * Queues one record. Called from the hooks: it waits on nothing but the resource, read once per load, and starts the timer if none
+ * runs (after a /clear the session goes on without a `session.start`).
  */
-export async function enqueue($: EngineInterface, row: CopiedRow): Promise<void> {
+export async function enqueue($: EngineInterface, item: Item): Promise<void> {
   if (!isCopying()) return
   resource ??= readResource($)
   const res = await resource
-  const size = JSON.stringify(row).length
+  const size = JSON.stringify(item.d).length
   if (size > BATCH_BYTES) {
     counts.dropped += 1
     return
   }
-  queue.push({ ...row, resource: res, size })
+  queue.push({ ...item, resource: res, size } as Queued)
   queuedBytes += size
   dirty = true
   dropOldest()
@@ -176,16 +189,22 @@ export function ensureTimer($: EngineInterface): void {
   }
 }
 
-function takeBatch(): Queued[] {
+/** The oldest records of one signal (the oldest record's, unless named), in order; the rest of the queue keeps its order. */
+function takeBatch(signal: Signal | undefined = queue[0]?.s): Queued[] {
   const batch: Queued[] = []
+  const rest: Queued[] = []
   let bytes = 0
-  while (queue.length > 0 && batch.length < BATCH_ROWS) {
-    const head = queue[0]!
-    if (batch.length > 0 && bytes + head.size > BATCH_BYTES) break
-    batch.push(head)
-    bytes += head.size
-    queue.shift()
+  let full = false
+  for (const item of queue) {
+    if (full || item.s !== signal || batch.length >= BATCH_ROWS || (batch.length > 0 && bytes + item.size > BATCH_BYTES)) {
+      if (item.s === signal) full = true
+      rest.push(item)
+      continue
+    }
+    batch.push(item)
+    bytes += item.size
   }
+  queue = rest
   queuedBytes -= bytes
   return batch
 }
@@ -196,14 +215,22 @@ function putBack(batch: Queued[]): void {
   dropOldest()
 }
 
-function groups(batch: readonly Queued[]) {
-  const out: { resource: string; rows: CopiedRow[] }[] = []
-  for (const { resource: res, size: _size, ...row } of batch) {
+function groups<T>(batch: readonly Queued[]): { resource: string; items: T[] }[] {
+  const out: { resource: string; items: T[] }[] = []
+  for (const { resource: res, d } of batch) {
     const last = out[out.length - 1]
-    if (last !== undefined && last.resource === res) last.rows.push(row)
-    else out.push({ resource: res, rows: [row] })
+    if (last !== undefined && last.resource === res) last.items.push(d as T)
+    else out.push({ resource: res, items: [d as T] })
   }
   return out
+}
+
+/** A batch of one signal as that signal's request body. */
+function bodyOf(batch: readonly Queued[], nowMs: number): string {
+  const signal = batch[0]?.s ?? 'logs'
+  if (signal === 'traces') return tracesBody(groups<BuiltSpan>(batch))
+  if (signal === 'metrics') return metricsBody(groups<MetricPoint>(batch), scopeVersion)
+  return logsBody(groups<CopiedRow>(batch).map(g => ({ resource: g.resource, rows: g.items })), scopeVersion, nowMs)
 }
 
 async function readLayer($: EngineInterface, source: 'project' | 'local'): Promise<Layer> {
@@ -227,55 +254,79 @@ async function repositoryNamesKey($: EngineInterface): Promise<boolean> {
   return true
 }
 
+/** Sends one batch to its signal's path within `limit`. Never throws: a fault is an outcome. */
+async function send($: EngineInterface, batch: readonly Queued[], limit: number, now: number): Promise<FetchOutcome> {
+  try {
+    return await fetchWithin($, DEV_URLS[batch[0]!.s], {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+      body: bodyOf(batch, now),
+      timeoutMs: limit,
+    })
+  } catch {
+    return { ok: false, reason: 'failed' }
+  }
+}
+
+/** Settles one batch's outcome: counted, dropped, or put back with the wait before the next try. False when sending should stop now. */
+function settle(batch: Queued[], outcome: FetchOutcome, now: number): boolean {
+  dirty = true
+  const verdict = verdictOf(outcome)
+  if (verdict === 'sent') {
+    counts.sent += batch.length
+    backoffMs = 0
+    nextTryAt = 0
+    return true
+  }
+  if (verdict === 'drop') {
+    counts.dropped += batch.length
+    return true
+  }
+  putBack(batch)
+  // A request cut off by the session's end says nothing about the collector: the next session tries again at once.
+  if (verdict === 'stop') stopped = true
+  else if (outcome.ok || outcome.reason !== 'stopped') {
+    backoffMs = Math.min(Math.max(backoffMs * 2, FLUSH_MS), BACKOFF_MAX_MS)
+    nextTryAt = now + backoffMs
+  }
+  return false
+}
+
 /**
- * Sends up to `maxBatches` batches, each within `timeoutMs`, read again before each request (at session end it is what the bound has
- * left); a limit under `END_MIN_MS` sends nothing more. Never throws; never runs twice at once.
+ * Sends up to `maxBatches` batches, one after another, each within `timeoutMs`, read again before each request (at session end it is
+ * what the bound has left); a limit under `END_MIN_MS` sends nothing more. With `together`, sends one batch of each signal at once
+ * instead. Never throws; never runs twice at once.
  */
-export async function flush($: EngineInterface, opts: { timeoutMs: number | (() => number); maxBatches: number }): Promise<void> {
+export async function flush($: EngineInterface, opts: { timeoutMs: number | (() => number); maxBatches: number; together?: boolean }): Promise<void> {
   if (sending || !isCopying() || stopped || queue.length === 0) return
   sending = true
   try {
     if (await repositoryNamesKey($)) return
+    const limitNow = () => (typeof opts.timeoutMs === 'function' ? opts.timeoutMs() : opts.timeoutMs)
+    if (opts.together) {
+      const now = await $.clock.now()
+      const limit = limitNow()
+      if (now < nextTryAt || !(limit >= END_MIN_MS)) return
+      const batches = SIGNALS.map(sig => takeBatch(sig)).filter(b => b.length > 0)
+      inflight = batches.flat()
+      const outcomes = await Promise.all(batches.map(b => send($, b, limit, now)))
+      inflight = []
+      batches.forEach((b, i) => settle(b, outcomes[i]!, now))
+      return
+    }
     for (let i = 0; i < opts.maxBatches && queue.length > 0 && !stopped; i++) {
       const now = await $.clock.now()
       if (now < nextTryAt) break
-      const limit = typeof opts.timeoutMs === 'function' ? opts.timeoutMs() : opts.timeoutMs
+      const limit = limitNow()
       if (!(limit >= END_MIN_MS)) break
       const batch = takeBatch()
       inflight = batch
-      let outcome: FetchOutcome
-      try {
-        outcome = await fetchWithin($, DEV_LOGS_URL, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
-          body: logsBody(groups(batch), scopeVersion, now),
-          timeoutMs: limit,
-        })
-      } catch {
-        outcome = { ok: false, reason: 'failed' }
-      }
+      const outcome = await send($, batch, limit, now)
       inflight = []
-      dirty = true
-      const verdict = verdictOf(outcome)
-      if (verdict === 'sent') {
-        counts.sent += batch.length
-        backoffMs = 0
-        nextTryAt = 0
-      } else if (verdict === 'drop') {
-        counts.dropped += batch.length
-      } else {
-        putBack(batch)
-        // A request cut off by the session's end says nothing about the collector: the next session tries again at once.
-        if (verdict === 'stop') stopped = true
-        else if (outcome.ok || outcome.reason !== 'stopped') {
-          backoffMs = Math.min(Math.max(backoffMs * 2, FLUSH_MS), BACKOFF_MAX_MS)
-          nextTryAt = now + backoffMs
-        }
-        break
-      }
+      if (!settle(batch, outcome, now)) break
     }
   } catch {
-    // A fault in sending never reaches the caller: the rows stay queued.
+    // A fault in sending never reaches the caller: the records stay queued.
   } finally {
     if (inflight.length > 0) putBack(inflight)
     inflight = []
@@ -283,48 +334,64 @@ export async function flush($: EngineInterface, opts: { timeoutMs: number | (() 
   }
 }
 
-const isRow = (v: unknown): v is CopiedRow & { r: number } => {
-  if (v === null || typeof v !== 'object') return false
-  const o = v as Record<string, unknown>
-  return typeof o['event'] === 'string' && typeof o['loggedAt'] === 'string' && typeof o['r'] === 'number'
-    && o['attributes'] !== null && typeof o['attributes'] === 'object' && !Array.isArray(o['attributes'])
-}
+const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v)
+const isAttrs = (v: unknown) => isObject(v)
+const isNum = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v)
 
-/** An outbox as the store holds it, or `null` when it does not have the shape. */
-export function readOutbox(v: unknown): { updatedAt: number; rows: Queued[] } | null {
-  if (v === null || typeof v !== 'object') return null
-  const o = v as Partial<Outbox>
-  if (o.v !== 1 || typeof o.updatedAt !== 'number' || !Array.isArray(o.resources) || !Array.isArray(o.rows)) return null
-  const resources = o.resources.filter((r): r is string => typeof r === 'string')
-  if (resources.length !== o.resources.length) return null
-  const rows: Queued[] = []
-  for (const raw of o.rows) {
-    if (!isRow(raw)) continue
-    const res = resources[raw.r]
-    if (res === undefined) continue
-    const { r: _r, ...row } = raw
-    rows.push({ ...row, resource: res, size: JSON.stringify(row).length })
+/** Whether a stored record has the shape its signal sends. */
+function fits(s: unknown, d: unknown): s is Signal {
+  if (!isObject(d)) return false
+  if (s === 'logs') return typeof d['event'] === 'string' && typeof d['loggedAt'] === 'string' && isAttrs(d['attributes'])
+  if (s === 'traces') {
+    return typeof d['traceId'] === 'string' && typeof d['spanId'] === 'string' && typeof d['name'] === 'string' && isNum(d['startMs']) && isNum(d['endMs'])
+      && isAttrs(d['attributes']) && (d['events'] === undefined || Array.isArray(d['events']))
   }
-  return { updatedAt: o.updatedAt, rows }
+  if (s === 'metrics') return typeof d['name'] === 'string' && isNum(d['startMs']) && isNum(d['timeMs']) && isNum(d['value']) && isAttrs(d['attributes'])
+  return false
 }
 
-/** The rows as the store keeps them, each resource once. */
-export function writeOutbox(rows: readonly Queued[], updatedAt: number): Outbox {
+/** An outbox as the store holds it (this version's, or a version 1 one of log rows alone), or `null` when it does not have the shape. */
+export function readOutbox(v: unknown): { updatedAt: number; items: Queued[] } | null {
+  if (!isObject(v) || typeof v['updatedAt'] !== 'number' || !Array.isArray(v['resources'])) return null
+  const raws = v['v'] === 1 ? v['rows'] : v['v'] === OUTBOX_VERSION ? v['items'] : undefined
+  if (!Array.isArray(raws)) return null
+  const resources = (v['resources'] as unknown[]).filter((r): r is string => typeof r === 'string')
+  if (resources.length !== (v['resources'] as unknown[]).length) return null
+  const items: Queued[] = []
+  for (const raw of raws as unknown[]) {
+    if (!isObject(raw) || typeof raw['r'] !== 'number') continue
+    const res = resources[raw['r']]
+    if (res === undefined) continue
+    let s: unknown = raw['s']
+    let d: unknown = raw['d']
+    if (v['v'] === 1) {
+      const { r: _r, ...row } = raw
+      s = 'logs'
+      d = row
+    }
+    if (!fits(s, d)) continue
+    items.push({ s, d, resource: res, size: JSON.stringify(d).length } as Queued)
+  }
+  return { updatedAt: v['updatedAt'] as number, items }
+}
+
+/** The records as the store keeps them, each resource once. */
+export function writeOutbox(items: readonly Queued[], updatedAt: number): Outbox {
   const resources: string[] = []
   const index = new Map<string, number>()
-  const out: Outbox['rows'] = []
-  for (const { resource: res, size: _size, ...row } of rows) {
+  const out: Outbox['items'] = []
+  for (const { s, d, resource: res } of items) {
     let r = index.get(res)
     if (r === undefined) {
       r = resources.push(res) - 1
       index.set(res, r)
     }
-    out.push({ ...row, r })
+    out.push({ s, r, d })
   }
-  return { v: 1, updatedAt, resources, rows: out }
+  return { v: OUTBOX_VERSION, updatedAt, resources, items: out }
 }
 
-/** Writes this load's outbox: the batch in flight and the queue, or removes it when both are empty. */
+/** Writes this load's outbox: the batches in flight and the queue, or removes it when both are empty. */
 export async function persist($: EngineInterface, force = false): Promise<void> {
   try {
     const now = await $.clock.now()
@@ -358,13 +425,13 @@ export async function adopt($: EngineInterface): Promise<void> {
       if (!k.startsWith(OUTBOX_PREFIX) || k === outboxKey) continue
       const raw = await $.store.get(k)
       // An outbox a later version wrote is left for that version to send.
-      if (raw !== null && typeof raw === 'object' && typeof (raw as { v?: unknown }).v === 'number' && (raw as { v: number }).v > 1) continue
+      if (isObject(raw) && typeof raw['v'] === 'number' && raw['v'] > OUTBOX_VERSION) continue
       const box = readOutbox(raw)
       if (box !== null && now - box.updatedAt < STALE_MS) continue
       await $.store.delete(k)
-      if (box === null || box.rows.length === 0) continue
-      queue = [...box.rows, ...queue]
-      queuedBytes += box.rows.reduce((n, r) => n + r.size, 0)
+      if (box === null || box.items.length === 0) continue
+      queue = [...box.items, ...queue]
+      queuedBytes += box.items.reduce((n, r) => n + r.size, 0)
       dirty = true
       dropOldest()
     }
@@ -392,13 +459,13 @@ export async function tick($: EngineInterface): Promise<void> {
 }
 
 /**
- * At `session.end`: keep the queue, then send one batch if the bound leaves room, sized by what is left just before the request, and
- * keep what is left. The timer goes on: after a /clear or a resume the process goes on, and so does sending.
+ * At `session.end`: keep the queue, then send one batch of each signal at once if the bound leaves room, sized by what is left just
+ * before the requests, and keep what is left. The timer goes on: after a /clear or a resume the process goes on, and so does sending.
  */
 export async function finish($: EngineInterface, budget: { readonly remainingMs: number }): Promise<void> {
   if (!isCopying()) return
   await persist($, true)
   if (sending) return
-  await flush($, { timeoutMs: () => Math.min(budget.remainingMs - END_MARGIN_MS, END_TIMEOUT_MS), maxBatches: 1 })
+  await flush($, { timeoutMs: () => Math.min(budget.remainingMs - END_MARGIN_MS, END_TIMEOUT_MS), maxBatches: 1, together: true })
   await persist($, true)
 }

@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from 'claude-code/testing'
 
-import { anyValue, logRecord, logsBody, parseResourceAttributes, resourceOf, unixNanos } from '../hooks/otlp.ts'
+import { anyValue, logRecord, logsBody, metricsBody, msToNanos, parseResourceAttributes, resourceOf, spanJson, tracesBody, unixNanos } from '../hooks/otlp.ts'
 
 describe('parseResourceAttributes', () => {
   test('pairs split by commas, trimmed, values percent-decoded', () => {
@@ -75,5 +75,52 @@ describe('logsBody', () => {
     expect(body.resourceLogs.length).toBe(2)
     expect(body.resourceLogs[0].scopeLogs[0].scope).toEqual({ name: 'com.anthropic.claude_code.events', version: '2.1.322' })
     expect(body.resourceLogs[0].resource.attributes).toEqual([{ key: 'service.name', value: { stringValue: 'claude-code' } }])
+  })
+})
+
+describe('msToNanos', () => {
+  test('whole and fractional milliseconds, to the nanosecond', () => {
+    expect(msToNanos(1_794_606_872_847)).toBe('1794606872847000000')
+    expect(msToNanos(1_794_606_872_847.5)).toBe('1794606872847500000')
+    expect(msToNanos(1.9999999)).toBe('2000000')
+  })
+})
+
+describe('spans', () => {
+  const span = { traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), name: 'claude_code.tool', startMs: 1, endMs: 2, attributes: { tool_name: 'Bash', duration_ms: 1 } }
+  test('as the exporter writes one: kind INTERNAL, flags 257, every count and list present, no parent key on a root', () => {
+    expect(spanJson(span)).toEqual({
+      traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), name: 'claude_code.tool', kind: 1, startTimeUnixNano: '1000000', endTimeUnixNano: '2000000',
+      attributes: [{ key: 'tool_name', value: { stringValue: 'Bash' } }, { key: 'duration_ms', value: { intValue: 1 } }],
+      droppedAttributesCount: 0, events: [], droppedEventsCount: 0, status: { code: 0 }, links: [], droppedLinksCount: 0, flags: 257,
+    })
+    expect(Object.keys(spanJson({ ...span, parentSpanId: 'c'.repeat(16) })).slice(0, 4)).toEqual(['traceId', 'spanId', 'parentSpanId', 'name'])
+  })
+  test('an error carries its message; events carry their attributes and time', () => {
+    const j = spanJson({ ...span, status: { code: 2, message: 'boom' }, events: [{ name: 'gen_ai.request.attempt', timeMs: 1, attributes: { attempt: 1 } }] })
+    expect(j.status).toEqual({ code: 2, message: 'boom' })
+    expect(j.events).toEqual([{ attributes: [{ key: 'attempt', value: { intValue: 1 } }], name: 'gen_ai.request.attempt', timeUnixNano: '1000000', droppedAttributesCount: 0 }])
+  })
+  test('grouped by resource under the tracer\'s scope', () => {
+    const body = JSON.parse(tracesBody([{ resource: JSON.stringify({ 'service.name': 'claude-code' }), items: [span] }]))
+    expect(body.resourceSpans[0].scopeSpans[0].scope).toEqual({ name: 'com.anthropic.claude_code.tracing', version: '1.0.0' })
+    expect(body.resourceSpans[0].scopeSpans[0].spans.length).toBe(1)
+  })
+})
+
+describe('metricsBody', () => {
+  test('one metric per name in the order Claude Code defines them, each a monotonic delta sum of doubles', () => {
+    const point = (name: string, value: number) => ({ name, startMs: 1, timeMs: 2, value, attributes: { model: 'm' } })
+    const body = JSON.parse(metricsBody([{ resource: JSON.stringify({ 'service.name': 'claude-code' }), items: [point('claude_code.token.usage', 5), point('claude_code.cost.usage', 0.5), point('claude_code.token.usage', 7)] }], '2.1.322'))
+    const scope = body.resourceMetrics[0].scopeMetrics[0]
+    expect(scope.scope).toEqual({ name: 'com.anthropic.claude_code', version: '2.1.322' })
+    expect(scope.metrics.map((m: { name: string }) => m.name)).toEqual(['claude_code.cost.usage', 'claude_code.token.usage'])
+    expect(scope.metrics[0]).toEqual({
+      name: 'claude_code.cost.usage', description: 'Cost of the Claude Code session', unit: 'USD',
+      sum: { aggregationTemporality: 1, isMonotonic: true, dataPoints: [{ attributes: [{ key: 'model', value: { stringValue: 'm' } }], startTimeUnixNano: '1000000', timeUnixNano: '2000000', asDouble: 0.5 }] },
+    })
+    expect(scope.metrics[1].sum.dataPoints.map((p: { asDouble: number }) => p.asDouble)).toEqual([5, 7])
+    // A whole number goes as a double all the same, as Claude Code's counters send it.
+    expect(JSON.stringify(scope.metrics[1].sum.dataPoints[0])).toContain('"asDouble":5')
   })
 })

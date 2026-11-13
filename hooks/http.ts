@@ -4,9 +4,9 @@
 // raced against the engine's clock and against the end of its session; whichever comes first answers. The request itself may still
 // finish on the host, but nothing waits for it and its answer is dropped. It never throws: every outcome is a value.
 //
-// Nothing calls it yet. It is here for the plugin's own requests to Mainwave, which come in a later version. The wait is billed to the
-// calling hook's own time budget (`$.clock.sleep` counts there), so a caller makes its requests from `session.start` or a timer, not
-// from a row's hook, and names a limit that fits.
+// The sender (sender.ts) makes every request through it. The wait is billed to the calling hook's own time budget (`$.clock.sleep`
+// counts there), so a caller makes its requests from `session.start`, `session.end` or a timer, not from a row's hook, and names a
+// limit that fits.
 
 import type { EngineInterface, HttpInit } from 'claude-code'
 

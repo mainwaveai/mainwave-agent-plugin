@@ -16,6 +16,8 @@ declare module 'claude-code' {
   interface PluginState {
     mainwave: {
       identity: RowIdentity
+      /** Whether this process has counted its session in `claude_code.session.count`: once, whatever reloads the plugin. */
+      sessionCounted: boolean
     }
   }
 }
