@@ -34,8 +34,12 @@ export const QUEUE_BYTES = 1_500_000
 export const BATCHES_PER_TICK = 5
 /** An outbox untouched this long belongs to a load that has gone, and may be taken over. */
 export const STALE_MS = 60_000
-/** How long `session.end` leaves itself after its last send. */
-export const END_MARGIN_MS = 500
+/**
+ * `session.end`'s whole chain shares one short bound (1.5 s by default). The queue is saved first, then one batch is sent with what is
+ * left, less a margin for the save after it. Under `END_MIN_MS` there is no point starting a request.
+ */
+export const END_MARGIN_MS = 150
+export const END_MIN_MS = 250
 export const END_TIMEOUT_MS = 3_000
 
 export const OUTBOX_PREFIX = 'outbox:'
@@ -377,7 +381,7 @@ export async function finish($: EngineInterface, remainingMs: number): Promise<v
   if (!isCopying()) return
   await persist($, true)
   const room = remainingMs - END_MARGIN_MS
-  if (room >= 1_000 && !sending) {
+  if (room >= END_MIN_MS && !sending) {
     await flush($, { timeoutMs: Math.min(room, END_TIMEOUT_MS), maxBatches: 1 })
     await persist($, true)
   }
