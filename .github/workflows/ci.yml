@@ -21,8 +21,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # What people run: Claude Code updates itself, so a break from a new release is a real signal.
-  CLAUDE_CODE_VERSION: latest
   DISABLE_AUTOUPDATER: '1'
 
 jobs:
@@ -37,7 +35,16 @@ jobs:
         with:
           node-version: 22
       - name: Install Claude Code
-        run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && claude --version
+        # The version is pinned in .github/claude-code/package.json, where Dependabot proposes each new release: a release that
+        # breaks the comparison shows as that pull request failing, not as every other one.
+        run: |
+          version=$(node -p "require('./.github/claude-code/package.json').devDependencies['@anthropic-ai/claude-code']")
+          # An exact version only: a range would float, and a missing entry reads as "undefined".
+          echo "$version" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' || { echo "no exact Claude Code version pinned: $version" >&2; exit 1; }
+          npm install -g "@anthropic-ai/claude-code@${version}"
+          installed=$(claude --version | awk '{print $1}')
+          [ "$installed" = "$version" ] || { echo "installed Claude Code $installed, pinned $version" >&2; exit 1; }
+          echo "Claude Code $installed"
       - name: Versions match
         run: scripts/check-version.sh
       - name: One plugin, at the root (org sync refuses a manifest anywhere else)

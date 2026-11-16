@@ -1,0 +1,8 @@
+{
+  "name": "mainwave-agent-plugin-ci-claude-code",
+  "private": true,
+  "description": "The Claude Code version CI tests against. Dependabot opens a pull request for each new release.",
+  "devDependencies": {
+    "@anthropic-ai/claude-code": "2.1.325"
+  }
+}
