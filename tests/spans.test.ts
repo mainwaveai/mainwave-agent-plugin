@@ -202,8 +202,8 @@ describe('a slash command that fails', () => {
   })
 })
 
-describe('without a key', () => {
-  test('nothing is rebuilt or sent, and every event goes on as it was', async ($, on) => {
+describe('without a key, from a session whose rows name no email (an API key)', () => {
+  test('nothing is sent, and every event goes on as it was', async ($, on) => {
     const { clock, posts, rig } = world(on)
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
     const { step, tool } = await turn($)

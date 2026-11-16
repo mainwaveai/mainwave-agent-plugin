@@ -21,7 +21,7 @@ Mainwave can then tell which sessions run the plugin, which version, and where.
 
 It also reads who the session is from those rows: the organization (`organization.id`), the account (`user.account_uuid`), the email (`user.email`) and the device (`user.id`, an ID Claude Code keeps per installation). It keeps them in memory for the session and sends them nowhere new. Later versions use them to ask Mainwave for the session's settings.
 
-**It sends its own copy, to Mainwave's dev collector.** This is the first step toward the plugin delivering a session's telemetry by itself. Where a person has set a dev ingest key, or turned on sending without one (see Settings), the plugin sends a copy of a session's log rows, spans and metrics to `https://collector.dev.mainwave.com` (`/v1/logs`, `/v1/traces` and `/v1/metrics`), and nowhere else. Where the organization's `env` block is in place, Claude Code's exporter goes on sending the originals wherever the organization pointed it, so nothing is counted twice, and the two can be compared record for record. Without it, the plugin's copy is all that is sent.
+**It sends its own copy, to Mainwave's dev collector.** This is the first step toward the plugin delivering a session's telemetry by itself. The plugin sends a copy of a session's log rows, spans and metrics to `https://collector.dev.mainwave.com` (`/v1/logs`, `/v1/traces` and `/v1/metrics`), and nowhere else: without a key by default, routed by the Claude organization and email on each record (see Keyless, below), or with a dev ingest key where the person set one (see Settings). Where the organization's `env` block is in place, Claude Code's exporter goes on sending the originals wherever the organization pointed it, so nothing is counted twice, and the two can be compared record for record. Without it, the plugin's copy is all that is sent.
 
 - **Log rows** are copies: the exporter's row as Claude Code raised it, with the same attributes (identity, `event.name`, `event.sequence`, `event.timestamp`), the same time and the same trace and span IDs. Where Claude Code's row names no span but the plugin builds the trace (below), the copy carries the IDs of the span it ran in, as Claude Code's rows do when it traces.
 - **Spans and metrics are rebuilt.** They never pass through a plugin: the one hook Claude Code gives plugins for its telemetry carries log rows alone. So the plugin puts them back together from what it does see: the rows, and Claude Code's own events for turns, model requests, tool calls and subagents. What it sends has the exporter's names, attributes, attribute order and value types, and the exporter's trace IDs; the table below says where each comes from.
@@ -88,13 +88,13 @@ Rules it keeps:
 - **Its key goes to one place.** The plugin sends the dev ingest key only to the dev collector, as a bearer token, and never writes it to a row, a file or a log. Keyless, it sends no key at all. The plugin never reads the organization's collector URL or key. This holds against settings, not against other plugins: any plugin the person installs can see and rewrite every plugin's requests, this one's included, so a dev key is only as safe as the person's other plugins.
 - **It adds nothing else.** No prompts, tool arguments, results or file contents beyond what Claude Code's own rows and spans carry, under the same settings (`OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_TOOL_DETAILS`); no commands, panes or tools.
 
-With no collector configured, no dev key and keyless sending off, the plugin has no rows to stamp and sends nothing.
+With no collector configured, the plugin has no rows to stamp, but it still sends its keyless copy. A session whose rows name no organization and email (an API key, a cloud provider) sends nothing.
 
 ## What is coming
 
 In rough order, each in a later version:
 
-1. **Its own telemetry, without the env block, by default.** The plugin can already send a session's rows, spans and metrics without the env block or a key, to the dev collector, where a person turns it on. Next it does so to Mainwave's production collector, without anyone turning it on, so an organization needs nothing but the plugin.
+1. **Its own telemetry, to production.** The plugin already sends a session's rows, spans and metrics without the env block or a key, to the dev collector. Next it sends them to Mainwave's production collector, so an organization needs nothing but the plugin.
 2. **Settings from Mainwave.** At session start the plugin asks Mainwave for the organization's settings and the session's state, by the organization, account, email and device it read.
 3. **Attributes.** The organization's attribute list in the session: Claude or the person sets a value (such as the project) with `/mainwave:attribute`, or proposes a new one for an admin to accept.
 4. **Anthropic's plugin directory.** A public listing, so updates reach every organization that sets the plugin to Required, and personal Pro and Max accounts can install it.
@@ -127,10 +127,7 @@ Answer `y` to add the marketplace, then pick a scope. From a shell: `claude plug
 
 ## Settings
 
-The plugin has two options, both for Mainwave's dev collector. With neither set (the default), the plugin sends nothing of its own. There is no switch to turn stamping off; to stop the plugin, remove it.
-
-- `devIngestKey`: an ingest key for the dev collector. Set, the copy goes with it as a bearer token.
-- `devKeyless`: `true` sends the copy without a key, routed by the Claude organization and email on each record (see Keyless, above). It needs the collector to route the organization to a Mainwave workspace. A key, where one is set too, wins.
+The plugin has one option, `devIngestKey`: an ingest key for Mainwave's dev collector. Unset (the default), the plugin sends its copy without a key, routed by the Claude organization and email on each record (see Keyless, above); the collector takes it only where it routes that organization and email domain to a Mainwave workspace, and refuses the rest. Set, the copy goes with the key as a bearer token instead. A key of the wrong shape sends nothing. There is no switch to turn stamping or the copy off; to stop the plugin, remove it.
 
 Set the key from a shell, so it is kept in secure storage. It is read from standard input, so it stays out of the command line and shell history:
 
@@ -148,19 +145,9 @@ Your own settings (`~/.claude/settings.json`, or `--settings`) also work, with t
 }
 ```
 
-Keyless sending is a plain switch, in your own settings:
-
-```json
-{
-  "pluginConfigs": {
-    "mainwave@synced": { "options": { "devKeyless": true } }
-  }
-}
-```
-
 The name to use is the plugin's ID: `mainwave@synced` for org sync, `mainwave@mainwave` for an install from this repository, or `mainwave` (or `mainwave@inline`) for a `--plugin-dir` load.
 
-Only the person's own settings count. If a repository's settings (`.claude/settings.json` or `.claude/settings.local.json`) name `devIngestKey` or `devKeyless` under any of the plugin's IDs, to any value, or cannot be read, the plugin sends nothing and drops what it had queued.
+Only the person's own settings count. If a repository's settings (`.claude/settings.json` or `.claude/settings.local.json`) name `devIngestKey` under any of the plugin's IDs, to any value, or cannot be read, the plugin sends nothing and drops what it had queued.
 
 ## Developing
 
@@ -186,7 +173,7 @@ A release bumps the version in both `.claude-plugin/plugin.json` and `hooks/vers
 | --- | --- |
 | `hooks/register.ts` | the hooks: the collector row hook and its fail-open handler, the turn, model request, tool call, command and spawn hooks, `session.start` and `session.end` |
 | `hooks/stamps.ts` | the keys the plugin owns, their shape rules, and the strip of forged keys |
-| `hooks/settings.ts` | where the dev ingest key and the keyless switch may come from, and their shapes |
+| `hooks/settings.ts` | where the dev ingest key may come from, and its shape |
 | `hooks/identity.ts` | the organization, account, email and device read from a row, and the pair a record is routed by without a key |
 | `hooks/rebuild.ts` | Claude Code's spans, and the measures behind its metrics, rebuilt from rows and events; without the env block, the trace built by the plugin |
 | `hooks/derive.ts` | the rules Claude Code fills attributes by: tool names, query sources, Bash commands, line counts, languages |

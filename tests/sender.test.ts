@@ -57,8 +57,8 @@ const outboxSequences = (box: unknown) => {
 
 const sentSequences = (posts: readonly Post[]) => posts.flatMap(p => (p.url === DEV_URL ? records(p).map(r => r.attributes['event.sequence']) : []))
 
-describe('without a key', () => {
-  test('the plugin sends nothing and writes nothing', async ($, on) => {
+describe('without a key, rows that name no email', () => {
+  test('are held back: the plugin sends nothing and writes nothing', async ($, on) => {
     const { clock, posts, rig, sets } = world(on)
     await logRow($, rig, row(1))
     await clock.advance(10 * TICK)

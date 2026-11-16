@@ -13,7 +13,7 @@
 // difference fails.
 //
 // A third pass runs the same session without Mainwave's env block: no telemetry settings at all, so Claude Code's exporter sends
-// nothing and no row names a span, and the plugin sends keyless (`devKeyless`, no key). There is nothing to compare with, so the
+// nothing and no row names a span, and the plugin sends keyless (no key set, its default). There is nothing to compare with, so the
 // receiver plays keyless ingest instead: it refuses a request with an Authorization header (401), or one whose records, spans or data
 // points do not each carry one `organization.id` and one `user.email`, the same pair across the request (400). The pass fails on any
 // refusal, and checks that the spans make one trace per interaction: the interaction a root, the main loop's requests and calls its
@@ -230,7 +230,8 @@ async function session(details, envBlock) {
   const git = (...a) => execFileSync('git', a, { cwd: work, env: { PATH: process.env.PATH, HOME: work, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' } })
   git('init', '-q', '-b', 'main')
   git('-c', 'user.name=e2e', '-c', 'user.email=e2e@example.com', 'commit', '-q', '--allow-empty', '-m', 'init')
-  const options = envBlock ? { devIngestKey: PLUGIN_KEY } : { devKeyless: true }
+  // Without the env block, the plugin's defaults: no key, so keyless.
+  const options = envBlock ? { devIngestKey: PLUGIN_KEY } : {}
   const settings = JSON.stringify({ pluginConfigs: { 'mainwave@inline': { options }, mainwave: { options } } })
 
   const env = {
