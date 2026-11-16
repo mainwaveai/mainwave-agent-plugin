@@ -5,7 +5,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import type { BuiltSpan } from '../hooks/otlp.ts'
 import {
-  agentSpawned, commonOf, newRebuild, observeRow, parseTraceparent, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart,
+  agentSpawned, commandEnd, commandStart, commonOf, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, takeReady, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart,
   type Emit, type Rebuild, type RowIn, type Settings,
 } from '../hooks/rebuild.ts'
 import { ORG } from './rig.ts'
@@ -54,7 +54,7 @@ describe('one turn', () => {
   /** A main-loop turn with one Bash call, as Claude Code raises its events and rows. */
   function turn(r: Rebuild) {
     const out: Emit[] = []
-    turnStart(r, { turnId: 't1', text: 'run it' })
+    turnStart(r, { turnId: 't1', text: 'run it' }, 0)
     out.push(observeRow(r, row('user_prompt', 100, { prompt: 'run it', prompt_length: '6' }, INTERACTION)))
     stepStart(r, undefined, 'claude-haiku-5-5')
     toolStart(r, { tool: 'Bash', tool_use_id: 'toolu_1', command: 'echo e2e', description: 'x' }, 130)
@@ -137,7 +137,7 @@ describe('one turn', () => {
     const r = rebuild()
     turn(r)
     observeRow(r, row('user_prompt', 300, { prompt: 'next', prompt_length: '4' }, 'f00df00df00df00d'))
-    turnStart(r, { turnId: 't2', text: 'next' })
+    turnStart(r, { turnId: 't2', text: 'next' }, 0)
     const { spans } = turnComplete(r, { turnId: 't2', durationMs: 10 }, 320)
     expect(spans[0]).toEqual(expect.objectContaining({ spanId: 'f00df00df00df00d' }))
     expect(spans[0]!.attributes['interaction.sequence']).toBe(2)
@@ -146,7 +146,7 @@ describe('one turn', () => {
   test("a prompt row that started no turn is not taken by the next turn", () => {
     const r = rebuild()
     observeRow(r, row('user_prompt', 10, { prompt: 'blocked by a hook', prompt_length: '17' }, 'f00df00df00df00d'))
-    turnStart(r, { turnId: 't9', text: 'go' })
+    turnStart(r, { turnId: 't9', text: 'go' }, 0)
     observeRow(r, row('user_prompt', 20, { prompt: 'go', prompt_length: '2' }, INTERACTION))
     const { spans } = turnComplete(r, { turnId: 't9', durationMs: 5 }, 30)
     expect(spans[0]!.spanId).toBe(INTERACTION)
@@ -155,7 +155,7 @@ describe('one turn', () => {
 
   test("a prompt row whose text the turn's does not match is still the turn's when its requests name the same span", () => {
     const r = rebuild()
-    turnStart(r, { turnId: 't8', text: 'see [Pasted text #1]' })
+    turnStart(r, { turnId: 't8', text: 'see [Pasted text #1]' }, 0)
     observeRow(r, row('user_prompt', 10, { prompt: 'see a long pasted text', prompt_length: '22' }, INTERACTION))
     observeRow(r, request(20, 1201))
     const { spans } = turnComplete(r, { turnId: 't8', durationMs: 5 }, 30)
@@ -236,7 +236,7 @@ describe('tools', () => {
   test('a call whose result row never comes goes after a short wait; a run that failed is an error', () => {
     const r = rebuild()
     observeRow(r, row('user_prompt', 0, {}, INTERACTION))
-    turnStart(r, { turnId: 't', text: '' })
+    turnStart(r, { turnId: 't', text: '' }, 0)
     toolStart(r, { tool: 'Read', tool_use_id: 'toolu_4', file_path: '/w/a.ts' }, 10)
     observeRow(r, row('tool_decision', 11, { decision: 'accept', source: 'config', tool_name: 'Read', tool_use_id: 'toolu_4' }, BLOCKED))
     expect(toolEnd(r, 'toolu_4', { isError: true, result: 'gone' }, 20).spans).toEqual([])
@@ -296,6 +296,185 @@ describe('tools', () => {
   })
 })
 
+describe('slash commands', () => {
+  test('a command that asks no model is an interaction of its own, with its prompt row\'s ids, whichever comes first', () => {
+    for (const rowFirst of [true, false]) {
+      const r = rebuild()
+      commandStart(r, 100)
+      let out: Emit = { spans: [], measures: [] }
+      if (rowFirst) observeRow(r, row('user_prompt', 105, { prompt: '/context', prompt_length: '8' }, INTERACTION))
+      out = commandEnd(r, 113)
+      if (!rowFirst) out = all(out, observeRow(r, row('user_prompt', 120, { prompt: '/cost', prompt_length: '5' }, INTERACTION)))
+      expect(all(out, sweep(r, 1_000, false)).spans).toEqual([])
+      out = sweep(r, 2_200, false)
+      const [i] = named(out.spans, 'interaction')
+      expect(i).toEqual(expect.objectContaining({ traceId: TRACE, spanId: INTERACTION, startMs: 100, endMs: rowFirst ? 113 : 120 }))
+      expect(i!.attributes).toEqual(expect.objectContaining({ user_prompt: rowFirst ? '/context' : '/cost', 'interaction.sequence': 1, 'interaction.duration_ms': rowFirst ? 13 : 20 }))
+      expect(out.measures).toEqual([expect.objectContaining({ name: 'claude_code.active_time.total', value: rowFirst ? 0.013 : 0.02 })])
+    }
+  })
+
+  test('a command that goes on to ask the model is one interaction with its turn', () => {
+    const r = rebuild()
+    commandStart(r, 100)
+    observeRow(r, row('user_prompt', 101, { prompt: '/review', prompt_length: '7' }, INTERACTION))
+    expect(commandEnd(r, 110).spans).toEqual([])
+    promptSubmitted(r, { command: { name: 'review', args: '' } }, 111)
+    turnStart(r, { turnId: 't1', text: 'Review this change' }, 112)
+    expect(sweep(r, 5_000, false).spans).toEqual([])
+    const { spans } = turnComplete(r, { turnId: 't1', durationMs: 50 }, 200)
+    expect(spans.map(s => [s.name, s.spanId, s.attributes['user_prompt'], s.attributes['interaction.sequence']])).toEqual([['claude_code.interaction', INTERACTION, '/review', 1]])
+    turnStart(r, { turnId: 't2', text: 'next' }, 0)
+    expect(r.interaction!.sequence).toBe(2)
+  })
+
+  test('two commands back to back are two interactions, numbered in turn', () => {
+    const r = rebuild()
+    commandStart(r, 100)
+    observeRow(r, row('user_prompt', 101, { prompt: '/cost', prompt_length: '5' }, INTERACTION))
+    commandEnd(r, 110)
+    commandStart(r, 120)
+    const flushed = takeReady(r)
+    observeRow(r, row('user_prompt', 121, { prompt: '/context', prompt_length: '8' }, 'f00df00df00df00d'))
+    commandEnd(r, 130)
+    const later = sweep(r, 2_200, false)
+    expect([...flushed.spans, ...later.spans].map(s => [s.spanId, s.attributes['user_prompt'], s.attributes['interaction.sequence']])).toEqual([
+      [INTERACTION, '/cost', 1], ['f00df00df00df00d', '/context', 2],
+    ])
+  })
+
+  test('a plain prompt right after a command is a turn of its own, and the command goes first', () => {
+    const r = rebuild()
+    commandStart(r, 100)
+    observeRow(r, row('user_prompt', 101, { prompt: '/cost', prompt_length: '5' }, INTERACTION))
+    commandEnd(r, 110)
+    const sent = promptSubmitted(r, {}, 300)
+    expect(sent.spans.map(s => [s.spanId, s.attributes['interaction.sequence']])).toEqual([[INTERACTION, 1]])
+    turnStart(r, { turnId: 't', text: 'hello' }, 0)
+    observeRow(r, row('user_prompt', 301, { prompt: 'hello', prompt_length: '5' }, 'f00df00df00df00d'))
+    const { spans } = turnComplete(r, { turnId: 't', durationMs: 50 }, 400)
+    expect(spans.map(s => [s.spanId, s.attributes['user_prompt'], s.attributes['interaction.sequence']])).toEqual([['f00df00df00df00d', 'hello', 2]])
+  })
+
+  test('a turn no submission handed a command to does not take it over', () => {
+    const r = rebuild()
+    commandStart(r, 100)
+    observeRow(r, row('user_prompt', 101, { prompt: '/cost', prompt_length: '5' }, INTERACTION))
+    commandEnd(r, 110)
+    const sent = turnStart(r, { turnId: 't', text: 'hello' }, 150)
+    expect(sent.spans.map(s => [s.spanId, s.attributes['interaction.sequence']])).toEqual([[INTERACTION, 1]])
+    expect(r.interaction!.sequence).toBe(2)
+  })
+
+  test('a submission that runs a command keeps the command for its turn', () => {
+    const r = rebuild()
+    commandStart(r, 100)
+    observeRow(r, row('user_prompt', 101, { prompt: '/review', prompt_length: '7' }, INTERACTION))
+    commandEnd(r, 110)
+    expect(promptSubmitted(r, { command: { name: 'review', args: '' } }, 111).spans).toEqual([])
+    expect(turnStart(r, { turnId: 't', text: 'Review this change' }, 112).spans).toEqual([])
+    expect(turnComplete(r, { turnId: 't', durationMs: 50 }, 200).spans.map(s => s.spanId)).toEqual([INTERACTION])
+  })
+
+  test("a slash command's prompt row seen just before the command is the command's; another prompt's is not", () => {
+    const r = rebuild()
+    observeRow(r, row('user_prompt', 99, { prompt: '/cost', prompt_length: '5' }, INTERACTION))
+    commandStart(r, 100)
+    commandEnd(r, 110)
+    expect(sweep(r, 2_200, false).spans.map(s => s.spanId)).toEqual([INTERACTION])
+    const r2 = rebuild()
+    commandStart(r2, 100)
+    observeRow(r2, row('user_prompt', 101, { prompt: 'hello', prompt_length: '5' }, INTERACTION))
+    commandEnd(r2, 110)
+    expect(sweep(r2, 2_200, false).spans[0]!.spanId).not.toBe(INTERACTION)
+  })
+
+  test("a prompt row that started nothing a while ago is not the next command's", () => {
+    const r = rebuild()
+    observeRow(r, row('user_prompt', 10, { prompt: '<REDACTED>', prompt_length: '17' }, '1111111111111111'))
+    commandStart(r, 5_000)
+    observeRow(r, row('user_prompt', 5_001, { prompt: '<REDACTED>', prompt_length: '5' }, INTERACTION))
+    commandEnd(r, 5_010)
+    const [i] = sweep(r, 8_000, false).spans
+    expect([i!.spanId, i!.attributes['user_prompt_length']]).toEqual([INTERACTION, 5])
+  })
+
+  test('/cost then /exit at once: both are sent, the first even though the session ends inside the second', () => {
+    const r = rebuild()
+    commandStart(r, 100)
+    observeRow(r, row('user_prompt', 101, { prompt: '/cost', prompt_length: '5' }, INTERACTION))
+    commandEnd(r, 110)
+    commandStart(r, 120)
+    observeRow(r, row('user_prompt', 121, { prompt: '/exit', prompt_length: '5' }, 'f00df00df00df00d'))
+    expect(sweep(r, 125, true).spans.map(s => [s.attributes['user_prompt'], s.attributes['interaction.sequence']])).toEqual([['/cost', 1], ['/exit', 2]])
+  })
+
+  test('a command handed to a turn waits for that turn past the usual wait; one whose prompt is dropped goes alone', () => {
+    const r = rebuild()
+    commandStart(r, 100)
+    observeRow(r, row('user_prompt', 101, { prompt: '/review', prompt_length: '7' }, INTERACTION))
+    commandEnd(r, 110)
+    promptSubmitted(r, { command: { name: 'review', args: '' } }, 111)
+    expect(sweep(r, 5_000, false).spans).toEqual([])
+    expect(turnStart(r, { turnId: 't', text: 'Review this change' }, 5_001).spans).toEqual([])
+    expect(r.interaction!.sequence).toBe(1)
+    const r2 = rebuild()
+    commandStart(r2, 100)
+    commandEnd(r2, 110)
+    promptSubmitted(r2, { command: { name: 'review', args: '' } }, 111)
+    expect(promptDropped(r2, 112).spans.length).toBe(1)
+    const r3 = rebuild()
+    commandStart(r3, 100)
+    commandEnd(r3, 110)
+    promptSubmitted(r3, { command: { name: 'review', args: '' } }, 111)
+    expect(sweep(r3, 30_200, false).spans.length).toBe(1)
+  })
+
+  test('a command still open when the session ends (/exit) ends with it', () => {
+    const r = rebuild()
+    commandStart(r, 100)
+    observeRow(r, row('user_prompt', 101, { prompt: '/exit', prompt_length: '5' }, INTERACTION))
+    const [i] = sweep(r, 115, true).spans
+    expect(i).toEqual(expect.objectContaining({ name: 'claude_code.interaction', spanId: INTERACTION, startMs: 100, endMs: 115 }))
+  })
+})
+
+describe('the request context', () => {
+  test('a request whose row names no span, in a turn whose rows do, ran outside the interaction', () => {
+    const r = rebuild()
+    turnStart(r, { turnId: 't', text: 'go' }, 0)
+    observeRow(r, row('user_prompt', 1, { prompt: 'go', prompt_length: '2' }, INTERACTION))
+    const [aux] = observeRow(r, request(10, 77, { query_source: 'generate_session_title' }, '')).spans
+    expect(aux!.attributes['llm_request.context']).toBe('standalone')
+  })
+})
+
+describe('hosts that carry no trace on their rows (the SDK), and those that do', () => {
+  test('once a prompt row has named its span, a spanless request before the next prompt row is standalone', () => {
+    const r = rebuild()
+    turnStart(r, { turnId: 't1', text: 'go' }, 0)
+    observeRow(r, row('user_prompt', 1, { prompt: 'go', prompt_length: '2' }, INTERACTION))
+    turnComplete(r, { turnId: 't1', durationMs: 5 }, 10)
+    turnStart(r, { turnId: 't2', text: 'next' }, 20)
+    const [aux] = observeRow(r, request(21, 88, { query_source: 'generate_session_title' }, '')).spans
+    expect(aux!.attributes['llm_request.context']).toBe('standalone')
+  })
+})
+
+describe('hosts that carry no trace on their rows (the SDK)', () => {
+  test("a main-loop request with no span on its row runs in the open interaction; a subagent's in its tool", () => {
+    const r = rebuild()
+    turnStart(r, { turnId: 't', text: 'go' }, 0)
+    const [main] = observeRow(r, request(10, 1201, { query_source: 'generate_session_title' }, '')).spans
+    expect(main!.attributes['llm_request.context']).toBe('interaction')
+    const [sub] = observeRow(r, request(20, 1202, { query_source: 'generate_session_title', agent_id: 'a1' }, '')).spans
+    expect(sub!.attributes['llm_request.context']).toBe('tool')
+    turnComplete(r, { turnId: 't', durationMs: 30 }, 40)
+    const [after] = observeRow(r, request(50, 1203, { query_source: 'generate_session_title' }, '')).spans
+    expect(after!.attributes['llm_request.context']).toBe('standalone')
+  })
+})
+
 describe('the session', () => {
   test('its count waits for a row to name it, and is timed when it started', () => {
     const r = rebuild()
@@ -306,7 +485,7 @@ describe('the session', () => {
 
   test('at the end, what has ended goes; what has not never does', () => {
     const r = rebuild()
-    turnStart(r, { turnId: 'open', text: 'x' })
+    turnStart(r, { turnId: 'open', text: 'x' }, 0)
     toolStart(r, { tool: 'Bash', tool_use_id: 'toolu_10', command: 'sleep 100' }, 10)
     observeRow(r, row('tool_decision', 11, { decision: 'accept', source: 'config', tool_name: 'Bash', tool_use_id: 'toolu_10' }, BLOCKED))
     observeRow(r, request(20, 1500))

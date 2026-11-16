@@ -4,8 +4,9 @@
 //
 // What Claude Code's exporter sends, and where each part comes from here (Claude Code 2.1.322, with CLAUDE_CODE_ENHANCED_TELEMETRY_BETA):
 //
-//   claude_code.interaction               one per main-loop turn. Its trace and span ids are the `user_prompt` row's; its end is the
-//                                         turn's `turn.complete`, its start that less the turn's duration.
+//   claude_code.interaction               one per main-loop turn, and one per slash command that asks no model. Its trace and span
+//                                         ids are the `user_prompt` row's; a turn's end is its `turn.complete`, its start that less
+//                                         the turn's duration; a command's spans its `command.run`.
 //   ├─ claude_code.llm_request            one per model request: the `api_request` (or `api_error`) row, paired with its `turn.step`
 //   │                                     for the stop reason and the start. Its parent is the row's span; its own id no row carries,
 //   │                                     so it is new.
@@ -45,8 +46,13 @@ export type Settings = {
 /** What one event produced: finished spans, and additions to counters. */
 export type Emit = { spans: BuiltSpan[]; measures: Measure[] }
 
-type Prompt = { ctx?: Ctx; text: TelemetryAttribute; length: number }
+type Prompt = { ctx?: Ctx; text: TelemetryAttribute; length: number; atMs: number }
 type Interaction = { turnId: string; sequence: number; prompt?: Prompt; ctx?: Ctx; text: string }
+/** A slash command that runs without a model turn (`/plugins`, `/cost`): an interaction of its own, as Claude Code counts it. */
+type Command = { sequence: number; startMs: number; endMs?: number; prompt?: Prompt; promptAtMs?: number; toTurn?: true }
+
+/** A prompt row of a slash command: its text starts with `/`, or is redacted, so nothing says it is not. */
+const slashPrompt = (p: Prompt) => typeof p.text !== 'string' || p.text === '<REDACTED>' || p.text.startsWith('/')
 type Step = { loop: string; startMs: number; endMs: number; stopReason: string | null; usage: StepUsage | null }
 type StepUsage = { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }
 type Waiting = { row: RowIn; heldAtMs: number }
@@ -75,6 +81,12 @@ export type Rebuild = {
   common: Attrs
   sequence: number
   interaction?: Interaction
+  /** The slash command running or just run, until its interaction is sent or a model turn takes it over. */
+  command?: Command
+  /** Spans ready to go that no hook has sent yet: the next hook or sweep sends them. */
+  ready: Emit
+  /** Whether a prompt row has named its interaction's span: once one has, the host carries the trace onto its rows. */
+  sawPromptSpan: boolean
   /** A `user_prompt` row seen before its turn began. */
   heldPrompt?: Prompt
   interactionIds: Set<string>
@@ -97,6 +109,10 @@ export type Rebuild = {
 
 /** How long a record waits for its pair before it is sent with what it has. */
 export const PAIR_WAIT_MS = 2_000
+/** How recent a prompt row must be for the slash command that starts next to take it. */
+export const HELD_PROMPT_MS = 1_000
+/** How long a command handed to a model turn waits for that turn before it goes as an interaction of its own. */
+export const TURN_WAIT_MS = 30_000
 /** How long a request's step result waits for its row before it is forgotten. */
 export const STEP_KEEP_MS = 30_000
 /** A tool call that never ended is forgotten after this long. */
@@ -116,7 +132,7 @@ export function randomHex(hexLength: 16 | 32): string {
 export function newRebuild(settings: Settings, mint: Rebuild['mint'] = randomHex): Rebuild {
   return {
     settings, common: {}, sequence: 0, interactionIds: new Set(), knownIds: new Set(), loopModel: new Map(),
-    steps: [], waiting: [], tools: new Map(), agentTool: new Map(), parentAgent: new Map(), execOfAgent: new Map(), mint,
+    steps: [], waiting: [], tools: new Map(), ready: { spans: [], measures: [] }, sawPromptSpan: false, agentTool: new Map(), parentAgent: new Map(), execOfAgent: new Map(), mint,
   }
 }
 
@@ -219,14 +235,18 @@ function readRowEvent(r: Rebuild, row: RowIn): Emit {
   }
   switch (row.event) {
     case 'user_prompt': {
-      const prompt: Prompt = { ctx, text: a['prompt'] ?? '<REDACTED>', length: num(a['prompt_length']) ?? 0 }
+      const prompt: Prompt = { ctx, text: a['prompt'] ?? '<REDACTED>', length: num(a['prompt_length']) ?? 0, atMs: row.atMs }
       if (ctx) {
         r.interactionIds.add(ctx.spanId)
         r.knownIds.add(ctx.spanId)
+        r.sawPromptSpan = true
       }
       const it = r.interaction
       if (it && !it.prompt && (promptFits(prompt, it.text) || (ctx !== undefined && it.ctx?.spanId === ctx.spanId))) it.prompt = prompt
-      else r.heldPrompt = prompt
+      else if (!it && r.command && !r.command.prompt && slashPrompt(prompt)) {
+        r.command.prompt = prompt
+        r.command.promptAtMs = row.atMs
+      } else r.heldPrompt = prompt
       return none()
     }
     case 'tool_decision': {
@@ -363,7 +383,13 @@ function llmSpan(r: Rebuild, row: RowIn, step: Step | undefined): BuiltSpan {
   const startMs = Math.min(step?.startMs ?? endMs - (num(a['duration_ms']) ?? 0), endMs)
   const model = str(a['model'])
   const agentId = str(a['agent_id'])
-  const context = parent === undefined ? 'standalone' : r.interactionIds.has(parent.spanId) ? 'interaction' : 'tool'
+  // Claude Code names the context the request ran in: a tool's (a subagent's requests run inside its Agent call), the open
+  // interaction's, or none. A row with no span ran outside both, unless the host carries no trace onto its rows at all (one that
+  // drives Claude Code through its SDK): there the open interaction has no span of its own either, and the plugin's state says which.
+  const traceless = !r.sawPromptSpan && r.interaction !== undefined && r.interaction.prompt?.ctx === undefined && r.interaction.ctx === undefined
+  const context = parent !== undefined
+    ? (r.interactionIds.has(parent.spanId) ? 'interaction' : 'tool')
+    : traceless ? (agentId !== undefined ? 'tool' : 'interaction') : 'standalone'
   const status = num(a['status_code'])
   const error = str(a['error'])
   const attempt = num(a['attempt']) ?? 1
@@ -417,12 +443,83 @@ function llmSpan(r: Rebuild, row: RowIn, step: Step | undefined): BuiltSpan {
 const promptFits = (prompt: Prompt, text: string) => prompt.length === text.length
 
 /** A main-loop turn began: an interaction opens, with the prompt row that came before it, if one did. */
-export function turnStart(r: Rebuild, e: { turnId: string; text: string; agentId?: string }): void {
-  if (e.agentId !== undefined) return
-  r.sequence += 1
-  const held = r.heldPrompt && promptFits(r.heldPrompt, e.text) ? r.heldPrompt : undefined
-  r.interaction = { turnId: e.turnId, sequence: r.sequence, text: e.text, ...(held ? { prompt: held } : {}) }
+export function turnStart(r: Rebuild, e: { turnId: string; text: string; agentId?: string }, nowMs: number): Emit {
+  if (e.agentId !== undefined) return none()
+  // A command that goes on to ask the model (a skill, a prompt command) is one interaction with its turn, as in Claude Code: the
+  // submission that ran it says so. Any other command still waiting is sent first, and the turn is an interaction of its own.
+  const flushed = r.command?.toTurn ? none() : endCommand(r, nowMs)
+  const command = r.command
+  r.command = undefined
+  if (command === undefined) r.sequence += 1
+  const held = command?.prompt ?? (r.heldPrompt && promptFits(r.heldPrompt, e.text) ? r.heldPrompt : undefined)
+  r.interaction = { turnId: e.turnId, sequence: command?.sequence ?? r.sequence, text: e.text, ...(held ? { prompt: held } : {}) }
   r.heldPrompt = undefined
+  return flushed
+}
+
+/**
+ * A slash command began: an interaction opens, unless a model turn takes it over. One still waiting to be sent goes first; a prompt
+ * row of a slash command seen just before is this command's.
+ */
+export function commandStart(r: Rebuild, nowMs: number): void {
+  if (r.interaction !== undefined) return
+  // Kept for the next hook or sweep, not handed back: a command like `/exit` may end the session before its own hook returns.
+  r.ready = merge(r.ready, endCommand(r, nowMs))
+  r.sequence += 1
+  r.command = { sequence: r.sequence, startMs: nowMs }
+  const held = r.heldPrompt
+  if (held && slashPrompt(held) && nowMs - held.atMs <= HELD_PROMPT_MS) {
+    r.command.prompt = held
+    r.command.promptAtMs = held.atMs
+    r.heldPrompt = undefined
+  }
+}
+
+/** The spans ready to go, taken. */
+export function takeReady(r: Rebuild): Emit {
+  const out = r.ready
+  r.ready = none()
+  return out
+}
+
+/**
+ * A prompt was submitted. One that runs no slash command is the start of a turn of its own: a command still waiting is sent first,
+ * so the turn does not take it over. One that runs a command (a skill, a prompt command) may be that command's turn.
+ */
+export function promptSubmitted(r: Rebuild, e: { command?: unknown }, nowMs: number): Emit {
+  if (e.command === undefined) return endCommand(r, nowMs)
+  if (r.command !== undefined) r.command.toTurn = true
+  return none()
+}
+
+/** A submitted prompt that ran a command was dropped (by a hook): no turn follows, so the command goes as an interaction of its own. */
+export function promptDropped(r: Rebuild, nowMs: number): Emit {
+  return r.command?.toTurn ? endCommand(r, nowMs) : none()
+}
+
+/** Sends the command waiting, if any, ending it now if it has not ended. */
+function endCommand(r: Rebuild, nowMs: number): Emit {
+  if (r.command === undefined) return none()
+  r.command.endMs ??= nowMs
+  return sendCommand(r)
+}
+
+/**
+ * A slash command ended. Its interaction goes after a short wait (`sweep`), never at once: a command that asks the model (a skill, a
+ * prompt command) starts its turn right after, and the turn takes the interaction over.
+ */
+export function commandEnd(r: Rebuild, nowMs: number): Emit {
+  if (r.command !== undefined) r.command.endMs = nowMs
+  return none()
+}
+
+/** One slash command's interaction, from the command's start to its end or its prompt row, whichever is later. */
+function sendCommand(r: Rebuild): Emit {
+  const c = r.command
+  if (c === undefined || c.endMs === undefined) return none()
+  r.command = undefined
+  const endMs = Math.max(c.endMs, c.promptAtMs ?? c.endMs)
+  return interactionSpan(r, { ctx: c.prompt?.ctx, prompt: c.prompt, text: '', sequence: c.sequence, startMs: c.startMs, endMs, durationMs: endMs - c.startMs })
 }
 
 /** A turn ended: a main-loop turn's interaction is sent, and its time counts as active; a subagent's frees its Agent call. */
@@ -435,30 +532,37 @@ export function turnComplete(r: Rebuild, e: { turnId: string; durationMs: number
   const it = r.interaction
   if (!it || it.turnId !== e.turnId) return none()
   r.interaction = undefined
+  // A prompt row nothing claimed by the turn's end belongs to no later interaction.
+  r.heldPrompt = undefined
   const durationMs = Math.max(0, Math.round(e.durationMs))
-  const startMs = nowMs - durationMs
-  const ctx = it.prompt?.ctx ?? it.ctx ?? { traceId: r.mint(32), spanId: r.mint(16) }
+  return interactionSpan(r, { ctx: it.prompt?.ctx ?? it.ctx, prompt: it.prompt, text: it.text, sequence: it.sequence, startMs: nowMs - durationMs, endMs: nowMs, durationMs })
+}
+
+/** One `claude_code.interaction`, a turn's or a slash command's, and its time as active time. */
+function interactionSpan(r: Rebuild, i: { ctx?: Ctx; prompt?: Prompt; text: string; sequence: number; startMs: number; endMs: number; durationMs: number }): Emit {
+  const ctx = i.ctx ?? { traceId: r.mint(32), spanId: r.mint(16) }
   const parent = r.settings.traceparent?.traceId === ctx.traceId ? r.settings.traceparent : undefined
+  const durationMs = Math.max(0, Math.round(i.durationMs))
   const span: BuiltSpan = {
     traceId: ctx.traceId,
     spanId: ctx.spanId,
     ...(parent ? { parentSpanId: parent.spanId } : {}),
     name: 'claude_code.interaction',
-    startMs,
-    endMs: nowMs,
+    startMs: i.startMs,
+    endMs: i.endMs,
     attributes: attrs(r, [
       ...head(r, 'interaction'),
       ['gen_ai.operation.name', 'invoke_agent'],
       ['gen_ai.conversation.id', conversationOf(r, undefined)],
-      ['user_prompt', it.prompt?.text ?? '<REDACTED>'],
-      ['user_prompt_length', it.prompt ? it.prompt.length : it.text.length],
-      ['interaction.sequence', it.sequence],
+      ['user_prompt', i.prompt?.text ?? '<REDACTED>'],
+      ['user_prompt_length', i.prompt ? i.prompt.length : i.text.length],
+      ['interaction.sequence', i.sequence],
       ['parent.source', parent ? 'env' : 'none'],
       ['queued_sends', 0],
       ['interaction.duration_ms', durationMs],
     ]),
   }
-  const active: Measure = { name: 'claude_code.active_time.total', value: durationMs / 1000, attributes: attrs(r, [...Object.entries(r.common), ['type', 'cli']]), atMs: nowMs }
+  const active: Measure = { name: 'claude_code.active_time.total', value: durationMs / 1000, attributes: attrs(r, [...Object.entries(r.common), ['type', 'cli']]), atMs: i.endMs }
   return { spans: [span], measures: [active] }
 }
 
@@ -648,6 +752,12 @@ export function sweep(r: Rebuild, nowMs: number, final: boolean): Emit {
   }
   r.waiting = keep
   r.steps = r.steps.filter(s => nowMs - s.endMs < STEP_KEEP_MS)
+  // A command whose prompt row has not come goes with what it has; at the end of the session (`/exit`), one still running ends now.
+  // A command handed to a model turn waits for that turn (it takes the command over), or goes alone if none comes.
+  out = merge(out, takeReady(r))
+  const c = r.command
+  if (c !== undefined && final && c.endMs === undefined) c.endMs = nowMs
+  if (c !== undefined && c.endMs !== undefined && (final || nowMs - c.endMs >= (c.toTurn ? TURN_WAIT_MS : PAIR_WAIT_MS))) out = merge(out, sendCommand(r))
   for (const tool of [...r.tools.values()]) {
     if (tool.endedAtMs === undefined) {
       if (nowMs - tool.startMs >= TOOL_KEEP_MS) r.tools.delete(tool.id)
@@ -661,7 +771,7 @@ export function sweep(r: Rebuild, nowMs: number, final: boolean): Emit {
 }
 
 /** Whether anything waits for a sweep: a request, a step result or a tool call. */
-export const waits = (r: Rebuild) => r.waiting.length > 0 || r.steps.length > 0 || r.tools.size > 0
+export const waits = (r: Rebuild) => r.waiting.length > 0 || r.steps.length > 0 || r.tools.size > 0 || r.command !== undefined || r.ready.spans.length > 0
 
 /** Sends any Agent call's execution its subagent has just named. */
 export function namedExecutions(r: Rebuild): Emit {

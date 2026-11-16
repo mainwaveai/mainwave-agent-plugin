@@ -5,8 +5,8 @@
 //
 // The exporter's row always goes on: the copy is queued beside it, never in its place. Fail open: a hook that throws never holds up a
 // row, a turn, a tool call or the session. A row whose stamping failed goes on without any key the plugin owns, as Claude Code wrote
-// it otherwise. The hooks that watch turns, model requests and tool calls only observe: each passes its event on unchanged, and its
-// result back unchanged.
+// it otherwise. The hooks that watch turns, model requests, tool calls, slash commands and spawns only observe: each passes its event on
+// unchanged, and its result back unchanged.
 
 import { atom, update } from 'claude-code'
 import type { CatchHandler, EngineInterface, Frozen, Hook, Next, Register, StreamHook, TelemetryAttribute, TelemetryLogResult, TelemetryRecordEntry, Timer } from 'claude-code'
@@ -17,7 +17,7 @@ import { identityOf, isOrgId, mergeIdentity } from './identity.ts'
 import { add, collect, newMeter, type Meter } from './meter.ts'
 import type { CopiedRow } from './otlp.ts'
 import {
-  agentSpawned, newRebuild, observeRow, parseTraceparent, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
+  agentSpawned, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
 } from './rebuild.ts'
 import { adopt, configure, enqueue, ensureTimer, finish, isCopying, snapshot } from './sender.ts'
 import { applyStamps, entrypointOf, filterStamps, PLUGIN_NAME, stripOwned } from './stamps.ts'
@@ -37,6 +37,10 @@ type TurnCompleteParams = Parameters<Hook<'turn.complete'>>
 type StepParams = Parameters<StreamHook<'turn.step'>>
 type ToolCallParams = Parameters<Hook<'tool.call'>>
 type ToolCatchParams = Parameters<CatchHandler<Hook<'tool.call'>>>
+type PromptParams = Parameters<Hook<'prompt.submit'>>
+type PromptCatchParams = Parameters<CatchHandler<Hook<'prompt.submit'>>>
+type CommandParams = Parameters<Hook<'command.run'>>
+type CommandCatchParams = Parameters<CatchHandler<Hook<'command.run'>>>
 type SpawnParams = Parameters<Hook<'agent.spawn'>>
 type SpawnCatchParams = Parameters<CatchHandler<Hook<'agent.spawn'>>>
 
@@ -249,24 +253,31 @@ export async function sessionStart($: SessionStartParams[0], e: SessionStartPara
 
 /** A main-loop turn began: an interaction opens. */
 export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1], next: TurnStartParams[2]) {
+  let out: Emit | null = null
   try {
     const r = await rebuildOf($)
-    if (r !== null) turnStart(r, e)
+    if (r !== null) out = turnStart(r, e, await $.clock.now())
   } catch {
     // The turn's interaction is not rebuilt.
   }
-  return next(e)
+  const result = await next(e)
+  // Queued after the turn has gone on: the send queue never holds it.
+  if (out !== null) await emit($, out).catch(() => undefined)
+  return result
 }
 
 /** A turn ended: a main-loop interaction is sent. */
 export async function turnCompleteHook($: TurnCompleteParams[0], e: TurnCompleteParams[1], next: TurnCompleteParams[2]) {
+  let out: Emit | null = null
   try {
     const r = await rebuildOf($)
-    if (r !== null) await emit($, turnComplete(r, e, await $.clock.now()))
+    if (r !== null) out = turnComplete(r, e, await $.clock.now())
   } catch {
     // The turn's interaction is not rebuilt.
   }
-  return next(e)
+  const result = await next(e)
+  if (out !== null) await emit($, out).catch(() => undefined)
+  return result
 }
 
 /** One model request: its start, and its stop reason and usage once it is whole. The stream passes through untouched. */
@@ -312,6 +323,64 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
     }
   }
   return result
+}
+
+/**
+ * A slash command: when it ran, so one that asks no model (`/plugins`, `/cost`, `/exit`) is an interaction of its own, as Claude Code
+ * counts it. The command and its result pass through untouched.
+ */
+export async function commandHook($: CommandParams[0], e: CommandParams[1], next: CommandParams[2]) {
+  let r: Rebuild | null = null
+  try {
+    r = await rebuildOf($)
+    if (r !== null) commandStart(r, await $.clock.now())
+  } catch {
+    r = null
+  }
+  try {
+    return await next(e)
+  } finally {
+    // Ended however the command ends, a refused or failed one too, so it never waits on to be taken by a later turn.
+    if (r !== null) {
+      try {
+        commandEnd(r, await $.clock.now())
+        await emit($, takeReady(r))
+      } catch {
+        // The command's interaction goes with what the rows say, on the next sweep.
+      }
+    }
+  }
+}
+
+/** A prompt submitted: one that runs no slash command sends the command waiting first. The prompt goes on untouched. */
+export async function promptHook($: PromptParams[0], e: PromptParams[1], next: PromptParams[2]) {
+  let r: Rebuild | null = null
+  let out: Emit | null = null
+  try {
+    r = await rebuildOf($)
+    if (r !== null) out = promptSubmitted(r, e, await $.clock.now())
+  } catch {
+    r = null
+  }
+  const result = await next(e)
+  // Queued after the prompt has gone on: the send queue never holds it. A dropped prompt starts no turn to take its command over.
+  try {
+    if (r !== null && result.drop !== undefined) out = { spans: [...(out?.spans ?? []), ...promptDropped(r, await $.clock.now()).spans], measures: [...(out?.measures ?? [])] }
+    if (out !== null) await emit($, out)
+  } catch {
+    // The command waiting goes on the next sweep.
+  }
+  return result
+}
+
+/** A prompt goes on whatever the hook did; once it has gone on, its result stands. */
+export function promptCatch($: PromptCatchParams[0], e: PromptCatchParams[1], next: PromptCatchParams[2]) {
+  return next(e)
+}
+
+/** A command goes on whatever the hook did; once it has gone on, its result stands. */
+export function commandCatch($: CommandCatchParams[0], e: CommandCatchParams[1], next: CommandCatchParams[2]) {
+  return next(e)
 }
 
 /** A tool call goes on whatever the hook did; once it has gone on, its result stands. */
@@ -378,6 +447,8 @@ export const register: Register = (on, options) => {
   on('turn.step', stepHook)
   on('turn.complete', turnCompleteHook)
   on('tool.call', toolCallHook).catch(toolCatch)
+  on('command.run', commandHook).catch(commandCatch)
+  on('prompt.submit', promptHook).catch(promptCatch)
   on('agent.spawn', spawnHook).catch(spawnCatch)
 
   on('session.end', sessionEnd)

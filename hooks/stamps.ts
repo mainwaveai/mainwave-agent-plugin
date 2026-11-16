@@ -19,7 +19,7 @@ export const ENTRYPOINTS: readonly string[] = [
   'cli', 'sdk-cli', 'sdk-ts', 'sdk-py', 'mcp', 'claude-vscode', 'claude-desktop', 'claude-desktop-3p', 'local-agent', 'remote',
   'remote_baku', 'remote_cowork', 'remote_cowork_trigger', 'remote_trigger', 'remote_desktop', 'remote_mobile', 'remote_projects',
   'ssh-remote', 'claude-in-slack', 'claude_in_slack', 'claude-in-teams', 'claude-coworker', 'claude-coworker-terminal',
-  'claude-code-github-action', 'claude-security', 'other',
+  'claude-code-github-action', 'claude-security', 't3-code', 'other',
 ]
 
 /** Which path a row took to Mainwave: Claude Code's own exporter, or the plugin's copy (sender.ts). */

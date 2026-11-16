@@ -9,7 +9,7 @@ claude plugin validate .        # manifest, marketplace and hooks module, read t
 claude plugin test .            # tests/*.test.ts against the engine
 scripts/check-version.sh        # plugin.json and hooks/version.ts agree
 scripts/check-layout.sh         # one plugin, at the root: org sync refuses a .claude-plugin/ or plugin.json anywhere else
-scripts/check-hooks.sh          # the row, tool call and spawn hooks keep their fail-open .catch; the turn hooks and session.end are hooked
+scripts/check-hooks.sh          # the row, tool call, command and spawn hooks keep their fail-open .catch; the turn hooks and session.end are hooked
 node tests/e2e/compare.mjs      # one real session, model mocked: the plugin's copy against the exporter's logs, spans and metrics
 ```
 

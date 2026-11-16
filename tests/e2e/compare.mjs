@@ -44,8 +44,13 @@ const ROUTE = 'mainwave.telemetry.route'
 const STARTUP = new Set(['managed_settings_resolved', 'plugin_loaded'])
 /** An example organization, put on every record through the resource so the plugin's stamping path runs as in a real organization. */
 const ORG = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
-/** How far a rebuilt span's start or end may be from the exporter's: the plugin times spans from the hooks around them. */
-const TIME_TOLERANCE_MS = 50
+/**
+ * How far a rebuilt span's start or end may be from the exporter's: the plugin times spans from the hooks around them, and on a cold,
+ * slow machine the session's first model request can start a hundred milliseconds before Claude Code's span does (its setup runs
+ * between the two). The mock's delays differ by 200 ms or more from one request to the next, so a request timed from the wrong step
+ * still lands outside it.
+ */
+const TIME_TOLERANCE_MS = 150
 /** How far a metric point's start or end may be: the plugin's collections run on its own clock, from when it loads. */
 const METRIC_TIME_TOLERANCE_MS = 250
 /** How far the session count's start may be: Claude Code counts the session before any plugin loads, the plugin once it has. */
