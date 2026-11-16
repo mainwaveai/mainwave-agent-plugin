@@ -5,7 +5,8 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { boot, EMAIL, itemAttributes, KEY, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, type KeylessAnswer, type Layers, type Post, type Reply } from './rig.ts'
+import { whoHash } from '../hooks/sender.ts'
+import { boot, EMAIL, IDEMPOTENCY_KEY, itemAttributes, KEY, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, type KeylessAnswer, type Layers, type Post, type Reply } from './rig.ts'
 
 /** No options: the plugin's defaults, so no key, so keyless. */
 const keyless = { options: {} }
@@ -79,6 +80,7 @@ const keptRow = (org: string, email: string, seq: number) => ({ s: 'logs', r: 0,
 /** An outbox an earlier session left a minute and more ago, so this session takes it over. */
 const leftBehind = (items: unknown[]) => ({ v: 2, updatedAt: START - 120_000, resources: [JSON.stringify({ 'service.name': 'claude-code' })], items })
 
+const sequencesOf = (post: Post) => itemAttributes(post).map(a => Number(Object.values(a.find(kv => kv.key === 'event.sequence')?.value ?? {})[0]))
 const emailsOf = (post: Post) => [...new Set(itemAttributes(post).map(a => a.find(kv => kv.key === 'user.email')?.value['stringValue']))]
 const lastOutbox = (sets: { key: string; value: unknown }[]) => sets.filter(s => s.key.startsWith('outbox:')).at(-1)?.value as { items: { d: { attributes: Record<string, unknown> } }[] } | undefined
 
@@ -90,7 +92,7 @@ describe('a session without the env block, sending keyless', () => {
     await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
     expect(new Set(seen.map(s => PATH(s.post.url)))).toEqual(new Set(['/v1/logs', '/v1/traces', '/v1/metrics']))
     for (const { post, answer } of seen) {
-      expect(Object.keys(post.headers).map(h => h.toLowerCase())).toEqual(['content-type'])
+      expect(Object.keys(post.headers).map(h => h.toLowerCase())).toEqual(['content-type', 'idempotency-key'])
       expect(answer).toEqual(expect.objectContaining({ status: 200, identity: `${ORG} ${EMAIL}` }))
     }
   })
@@ -213,6 +215,99 @@ describe('a session without the env block, sending keyless', () => {
   })
 })
 
+describe('the idempotency key, keyless', () => {
+  const keyOf = (p: Post) => p.headers['idempotency-key']!
+  const HASH = whoHash(`${ORG} ${EMAIL}`)
+
+  test('the hash is 64-bit FNV-1a, in 16 hex digits', () => {
+    expect(whoHash('')).toBe('cbf29ce484222325')
+    expect(whoHash('a')).toBe('af63dc4c8601ec8c')
+    expect(whoHash(`${ORG} ${EMAIL}`)).toMatch(/^[0-9a-f]{16}$/)
+  })
+
+  test("is the batch's stored key, its organization and email's hash in it, the same on a retry", keyless, async ($, on) => {
+    const { clock, seen, store } = world(on, { answer: (_a, post) => (seen.length === 1 && PATH(post.url) === '/v1/logs' ? { status: 503 } : undefined) })
+    await row($, 'user_prompt', { prompt: 'go', prompt_length: '2' })
+    await clock.advance(TICK)
+    const box = store.sets.filter(s => s.key.startsWith('outbox:')).at(-1)!.value as { batches: string[] }
+    await clock.advance(TICK)
+    const logs = seen.filter(s => PATH(s.post.url) === '/v1/logs').map(s => s.post)
+    expect(logs.length).toBe(2)
+    expect(box.batches.length).toBe(1)
+    expect(box.batches[0]!.endsWith(`.${HASH}`)).toBe(true)
+    expect(keyOf(logs[0]!)).toBe(box.batches[0])
+    expect(keyOf(logs[0]!)).toMatch(IDEMPOTENCY_KEY)
+    expect(keyOf(logs[1]!)).toBe(keyOf(logs[0]!))
+  })
+
+  test('a batch formed keyless and taken over keyless goes under its stored key, with no second hash', keyless, async ($, on) => {
+    const k = `5f0c3f8e-2b7a-4d2c-9a51-1d7c4b2e8f01.${HASH}`
+    const box = { ...leftBehind([keptRow(ORG, EMAIL, 1), keptRow(ORG, EMAIL, 2)].map(i => ({ ...i, b: 0 }))), v: 3, batches: [k] }
+    const { clock, seen } = world(on, { store: { 'outbox:old': box } })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await clock.advance(TICK)
+    const logs = seen.filter(s => PATH(s.post.url) === '/v1/logs')
+    expect(logs.map(s => [keyOf(s.post), s.answer.status])).toEqual([[k, 200]])
+  })
+
+  test('a batch formed with a key over two people goes keyless as one batch each, each under a key of its own', keyless, async ($, on) => {
+    const k = '5f0c3f8e-2b7a-4d2c-9a51-1d7c4b2e8f01'
+    const box = { ...leftBehind([keptRow(ORG_B, EMAIL_B, 1), keptRow(ORG, EMAIL, 2), keptRow(ORG_B, EMAIL_B, 3)].map(i => ({ ...i, b: 0 }))), v: 3, batches: [k] }
+    const { clock, seen } = world(on, { store: { 'outbox:old': box } })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await clock.advance(TICK)
+    const logs = seen.filter(s => PATH(s.post.url) === '/v1/logs')
+    expect(logs.map(s => s.answer.status)).toEqual([200, 200])
+    expect(logs.map(s => emailsOf(s.post))).toEqual([[EMAIL_B], [EMAIL]])
+    expect(logs.map(s => itemAttributes(s.post).length)).toEqual([2, 1])
+    const [a, b] = logs.map(s => keyOf(s.post))
+    expect(a).toBe(`${k}.${whoHash(`${ORG_B} ${EMAIL_B}`)}`)
+    expect(b).toBe(`${k}.${HASH}`)
+    for (const key of [a, b]) expect(key).toMatch(IDEMPOTENCY_KEY)
+  })
+
+  test('a stored key of 111 characters goes keyless with its hash at exactly 128; one of 112 is let go and its record goes under a new key', keyless, async ($, on) => {
+    const k111 = 'a'.repeat(111)
+    // Not a hex digit, so no fresh key can start with it.
+    const k112 = 'g'.repeat(112)
+    const box = { ...leftBehind([{ ...keptRow(ORG, EMAIL, 1), b: 0 }, { ...keptRow(ORG, EMAIL, 2), b: 1 }]), v: 3, batches: [k111, k112] }
+    const { clock, seen } = world(on, { store: { 'outbox:old': box } })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await clock.advance(TICK)
+    const logs = seen.filter(s => PATH(s.post.url) === '/v1/logs')
+    expect(logs.map(s => s.answer.status)).toEqual([200, 200])
+    expect(logs.map(s => sequencesOf(s.post))).toEqual([[1], [2]])
+    const [a, b] = logs.map(s => keyOf(s.post))
+    expect(a).toBe(`${k111}.${HASH}`)
+    expect(a!.length).toBe(128)
+    expect(b).toMatch(IDEMPOTENCY_KEY)
+    expect(b).not.toContain(k112.slice(0, 8))
+    expect(b!.endsWith(`.${HASH}`)).toBe(true)
+  })
+
+  test('past the queue caps, a batch formed with a key over two people loses only the oldest record; the rest go under new keys', keyless, async ($, on) => {
+    const k = '5f0c3f8e-2b7a-4d2c-9a51-1d7c4b2e8f01'
+    const pad = 'x'.repeat(400_000)
+    const big = (org: string, email: string, seq: number) => {
+      const r = keptRow(org, email, seq)
+      return { ...r, b: 0, d: { ...r.d, attributes: { ...r.d.attributes, pad } } }
+    }
+    const box = { ...leftBehind([big(ORG_B, EMAIL_B, 1), big(ORG, EMAIL, 2), big(ORG_B, EMAIL_B, 3)]), v: 3, batches: [k] }
+    const { clock, seen } = world(on, { store: { 'outbox:old': box } })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await clock.advance(TICK)
+    const logs = seen.filter(s => PATH(s.post.url) === '/v1/logs')
+    expect(logs.map(s => s.answer.status)).toEqual([200, 200])
+    expect(logs.map(s => emailsOf(s.post))).toEqual([[EMAIL], [EMAIL_B]])
+    expect(logs.map(s => itemAttributes(s.post).length)).toEqual([1, 1])
+    const [a, b] = logs.map(s => keyOf(s.post))
+    expect(a!.startsWith(k)).toBe(false)
+    expect(b!.startsWith(k)).toBe(false)
+    expect(a!.endsWith(`.${HASH}`)).toBe(true)
+    expect(b!.endsWith(`.${whoHash(`${ORG_B} ${EMAIL_B}`)}`)).toBe(true)
+  })
+})
+
 describe('the key option', () => {
   test('unset, the copy goes keyless with no option at all', async ($, on) => {
     const { seen } = world(on)
@@ -220,7 +315,7 @@ describe('the key option', () => {
     await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
     expect(seen.length).toBeGreaterThan(0)
     for (const { post, answer } of seen) {
-      expect(Object.keys(post.headers).map(h => h.toLowerCase())).toEqual(['content-type'])
+      expect(Object.keys(post.headers).map(h => h.toLowerCase())).toEqual(['content-type', 'idempotency-key'])
       expect(answer.status).toBe(200)
     }
   })
