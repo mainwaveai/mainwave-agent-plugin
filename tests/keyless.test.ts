@@ -163,15 +163,22 @@ describe('a session without the env block, sending keyless', () => {
     expect(lastOutbox(store.sets)!.items.map(i => i.d.attributes['user.email'])).toEqual([EMAIL_B])
   })
 
-  test("the session's own refusal (403 email_domain) stops its sending and keeps its records", keyless, async ($, on) => {
-    const { clock, posts, store } = world(on, { refused: { [ORG]: 'email_domain' } })
+  test("the session's own refusal (403 email_domain) stops its sending, keeps what was queued, and queues no more", keyless, async ($, on) => {
+    const { clock, posts, store, logs } = world(on, { refused: { [ORG]: 'email_domain' } })
     await row($, 'user_prompt', { prompt: 'one', prompt_length: '3' })
     await clock.advance(TICK)
-    await row($, 'user_prompt', { prompt: 'two', prompt_length: '3' })
+    for (let i = 0; i < 20; i++) await row($, 'user_prompt', { prompt: 'two', prompt_length: '3' })
     await clock.advance(5 * TICK)
     await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
     expect(posts.length).toBe(1)
-    expect(lastOutbox(store.sets)!.items.length).toBe(2)
+    expect(lastOutbox(store.sets)!.items.map(i => i.d.attributes['prompt'])).toEqual(['one'])
+    expect(logs.join('')).toContain('20 held back')
+  })
+
+  test('a session with no outbox to take over reads no settings for it', keyless, async ($, on) => {
+    const { rig } = world(on)
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    expect(rig.reads).toEqual([])
   })
 
   test('with every record refused, a tick makes no request and reads no settings', keyless, async ($, on) => {
@@ -218,11 +225,14 @@ describe('the key option', () => {
     }
   })
 
-  test('a key of the wrong shape sends nothing, keyless or not', { options: { devIngestKey: 'has a space' } }, async ($, on) => {
-    const { clock, posts } = world(on)
+  test('a key of the wrong shape sends nothing, keyless or not, and the debug log says why without the value', { options: { devIngestKey: 'has a space' } }, async ($, on) => {
+    const { clock, posts, logs } = world(on)
     await turn($)
     await clock.advance(3 * TICK)
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
     expect(posts).toEqual([])
+    expect(logs.join('')).toContain('copy off: the devIngestKey option holds a key of the wrong shape')
+    expect(logs.join('')).not.toContain('has a space')
   })
 
   test('set, the key is used instead: a bearer token, and records with no email go as well', { options: { devIngestKey: KEY } }, async ($, on) => {

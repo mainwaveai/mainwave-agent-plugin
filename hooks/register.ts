@@ -19,7 +19,7 @@ import type { CopiedRow } from './otlp.ts'
 import {
   agentSpawned, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
 } from './rebuild.ts'
-import { adopt, configure, enqueue, ensureTimer, finish, isCopying, snapshot } from './sender.ts'
+import { adopt, configure, enqueue, ensureTimer, finish, isCopying, keyMalformed, snapshot } from './sender.ts'
 import { applyStamps, entrypointOf, filterStamps, PLUGIN_NAME, stripOwned } from './stamps.ts'
 import { VERSION } from './version.ts'
 
@@ -451,6 +451,8 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
       if (e.reason !== 'clear' && e.reason !== 'resume') await collectNow($)
     }
     await finish($, next.budget)
+    // Never the value: only that it does not fit.
+    if (keyMalformed()) $.ui.log('mainwave: copy off: the devIngestKey option holds a key of the wrong shape', { to: 'debug' })
     if (isCopying()) {
       const s = snapshot()
       const withheld = s.keyless ? `, ${s.withheld} held back (no organization and email)` : ''

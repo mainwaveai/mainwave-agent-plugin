@@ -171,6 +171,9 @@ export function configure(options: PluginOptions | undefined): void {
   counts = { sent: 0, dropped: 0, withheld: 0 }
 }
 
+/** Whether the key option holds a key of the wrong shape, which turns the copy off. */
+export const keyMalformed = (): boolean => mode === 'off'
+
 /** Whether rows are copied at all: unless a key of the wrong shape is set, or a repository named the key option. */
 export const isCopying = (): boolean => mode !== 'off' && !refused
 
@@ -224,6 +227,12 @@ export async function enqueue($: EngineInterface, item: Item): Promise<void> {
   // Without a key, a record that names no organization and email has nowhere to go: it is held back, never queued.
   const who = mode === 'keyless' ? whoOf(item.d) : undefined
   if (mode === 'keyless' && who === undefined) {
+    counts.withheld += 1
+    return
+  }
+  // An organization and email keyless ingest refused this load: what is queued for it is kept, but nothing more is added, so a
+  // session whose organization nobody has claimed does not grow and rewrite its outbox for nothing. A later load tries again.
+  if (who !== undefined && refusedWho.has(who)) {
     counts.withheld += 1
     return
   }
@@ -519,12 +528,14 @@ export async function persist($: EngineInterface, force = false): Promise<void> 
 export async function adopt($: EngineInterface): Promise<void> {
   if (!isCopying()) return
   try {
-    // A load a repository refuses takes over nothing: other sessions' rows stay where they are for a load that may send them.
-    if (await repositoryNamesKey($)) return
     const now = await $.clock.now()
     adoptedAt = now
-    for (const k of await $.store.keys()) {
-      if (!k.startsWith(OUTBOX_PREFIX) || k === outboxKey) continue
+    const keys = (await $.store.keys()).filter(k => k.startsWith(OUTBOX_PREFIX) && k !== outboxKey)
+    // Nothing to take over: no settings read.
+    if (keys.length === 0) return
+    // A load a repository refuses takes over nothing: other sessions' rows stay where they are for a load that may send them.
+    if (await repositoryNamesKey($)) return
+    for (const k of keys) {
       const raw = await $.store.get(k)
       // An outbox a later version wrote is left for that version to send.
       if (isObject(raw) && typeof raw['v'] === 'number' && raw['v'] > OUTBOX_VERSION) continue

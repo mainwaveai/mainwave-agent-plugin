@@ -18,7 +18,7 @@ const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 
 
 function world(on: On, opts: { reply?: (n: number, post: Post) => Reply; store?: Record<string, unknown> } = {}) {
   const clock = mock.clock(on, { now: START })
-  memoryStore(on, opts.store)
+  const store = memoryStore(on, opts.store)
   const posts = network(on, opts.reply)
   // The org-wide env block's beta: Claude Code traces, and its rows name their spans.
   const rig = boot(on, { entrypoint: 'cli', env: { OTEL_LOG_TOOL_DETAILS: '1', OTEL_RESOURCE_ATTRIBUTES: 'mainwave.source=coding_agent.claude_code', CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: '1' } })
@@ -37,7 +37,7 @@ function world(on: On, opts: { reply?: (n: number, post: Post) => Reply; store?:
     if ((e as { command: string }).command === 'broken') throw new Error('the command failed in test')
     return { text: 'Total cost: $0.00' } as never
   })
-  return { clock, posts, rig }
+  return { clock, posts, rig, store }
 }
 
 /** Logs one collector row, as Claude Code raises it. */
@@ -202,14 +202,15 @@ describe('a slash command that fails', () => {
   })
 })
 
-describe('without a key, from a session whose rows name no email (an API key)', () => {
-  test('nothing is sent, and every event goes on as it was', async ($, on) => {
-    const { clock, posts, rig } = world(on)
+describe('without a key, from a session whose rows name no email', () => {
+  test('nothing is sent or kept, and every event goes on as it was', async ($, on) => {
+    const { clock, posts, rig, store } = world(on)
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
     const { step, tool } = await turn($)
     await clock.advance(70_000)
     await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
     expect(posts).toEqual([])
+    expect(store.sets).toEqual([])
     expect(step).toEqual(expect.objectContaining({ stopReason: 'tool_use' }))
     expect((tool as { result: { stdout: string } }).result.stdout).toBe('hi')
     expect(rig.rows.length).toBe(4)
