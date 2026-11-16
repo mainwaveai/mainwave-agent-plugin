@@ -248,6 +248,22 @@ describe('tools', () => {
     expect(spans[2]!.status).toEqual({ code: 2 })
   })
 
+  test("a failed run carries its error's class; its error is the row's where details are logged, else the class", () => {
+    for (const [details, error] of [[true, 'Exit code 7'], [false, 'ShellError']] as const) {
+      const r = rebuild()
+      observeRow(r, row('user_prompt', 0, {}, INTERACTION))
+      turnStart(r, { turnId: 't', text: '' }, 0)
+      toolStart(r, { tool: 'Bash', tool_use_id: 'toolu_f', command: 'false' }, 10)
+      observeRow(r, row('tool_decision', 11, { decision: 'accept', source: 'config', tool_name: 'Bash', tool_use_id: 'toolu_f' }, BLOCKED))
+      toolEnd(r, 'toolu_f', { isError: true, result: 'Exit code 7' }, 20)
+      const result = { tool_name: 'Bash', tool_use_id: 'toolu_f', success: 'false', duration_ms: '9', error_type: 'ShellError', ...(details ? { error: 'Exit code 7' } : {}) }
+      const run = observeRow(r, row('tool_result', 21, result, INTERACTION)).spans.find(s => s.name === 'claude_code.tool.execution')!
+      expect(Object.keys(run.attributes).slice(-5)).toEqual(['duration_ms', 'success', 'error.type', 'error', 'error_class'])
+      expect(run.attributes).toEqual(expect.objectContaining({ success: false, 'error.type': 'tool_error', error, error_class: 'ShellError' }))
+      expect(run.status).toEqual({ code: 2, message: error })
+    }
+  })
+
   test("an Agent call's run takes the id its subagent's rows name, and the subagent's requests sit under it", () => {
     const r = rebuild()
     toolStart(r, { tool: 'Agent', tool_use_id: 'toolu_5', description: 'd', prompt: 'p', subagent_type: 'general-purpose' }, 10)

@@ -35,7 +35,7 @@
 
 import type { TelemetryAttribute } from 'claude-code'
 
-import { bashClass, CODE_EDIT_TOOLS, genAiProvider, gitCounts, languageOf, linesChanged, mcpCreatesPr, mcpParts, metricQuerySource, querySourceSafe, toolNameSafe } from './derive.ts'
+import { bashClass, CODE_EDIT_TOOLS, errorClassOf, genAiProvider, gitCounts, languageOf, linesChanged, mcpCreatesPr, mcpParts, metricQuerySource, querySourceSafe, toolNameSafe } from './derive.ts'
 import type { Measure } from './meter.ts'
 import type { BuiltSpan } from './otlp.ts'
 import { stripOwned } from './stamps.ts'
@@ -94,7 +94,8 @@ type Tool = {
   isError?: boolean
   /** The permission decision; `own`, the span id the plugin gives it where its row names none and the plugin builds the trace. */
   decision?: { ctx?: Ctx; own?: string; decision: string; source?: string; atMs: number }
-  result?: { ctx?: Ctx; success?: boolean; error?: TelemetryAttribute; atMs: number }
+  /** The call's `tool_result` row: its outcome, its error where tool details are logged, and the error's class (`error_type`). */
+  result?: { ctx?: Ctx; success?: boolean; error?: TelemetryAttribute; errorType?: string; atMs: number }
   spawned?: string
   /** Started in a rebuilt turn: the trace Claude Code started for it is moved onto the interaction's. */
   rebuilt?: true
@@ -397,7 +398,7 @@ function readRowEvent(r: Rebuild, row: RowIn): Emit {
     case 'tool_result': {
       const id = str(a['tool_use_id'])
       const tool = id ? r.tools.get(id) : undefined
-      if (tool) tool.result = { ctx, success: a['success'] === undefined ? undefined : truthy(a['success']), error: a['error'], atMs: row.atMs }
+      if (tool) tool.result = { ctx, success: a['success'] === undefined ? undefined : truthy(a['success']), error: a['error'], errorType: str(a['error_type']), atMs: row.atMs }
       return tool ? finishTool(r, tool, false) : none()
     }
     case 'api_request':
@@ -909,7 +910,8 @@ function sendExecution(r: Rebuild, tool: Tool): Emit {
   const startMs = Math.min(Math.max(tool.decision?.atMs ?? tool.startMs, tool.startMs), tool.endMs)
   const endMs = tool.endMs
   const success = tool.result?.success ?? !tool.isError
-  const error = tool.result?.error
+  // Claude Code's `error` is the row's, where tool details are logged, and the error's class where they are not.
+  const error = tool.result?.error ?? tool.result?.errorType
   const spanId = (tool.spawned && r.execOfAgent.get(tool.spawned)) || r.mint(16)
   const traceId = retrace(r, tool.decision?.ctx?.traceId ?? tool.result?.ctx?.traceId ?? homeOfTool(r, tool)?.traceId ?? r.mint(32))
   return {
@@ -929,6 +931,7 @@ function sendExecution(r: Rebuild, tool: Tool): Emit {
         ['success', success],
         ['error.type', success ? undefined : 'tool_error'],
         ['error', success ? undefined : error],
+        ['error_class', success ? undefined : errorClassOf(tool.result?.errorType)],
       ]),
       ...(success ? {} : { status: { code: 2 as const, ...(typeof error === 'string' && error ? { message: error } : {}) } }),
     }],

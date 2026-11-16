@@ -114,6 +114,8 @@ function modelReply(req) {
       call('Write', { file_path: join(work, 'a.txt'), content: 'one\ntwo\n' }),
       call('Edit', { file_path: join(work, 'a.txt'), old_string: 'two', new_string: 'three' }),
       call('Bash', { command: 'git -c user.name=e2e -c user.email=e2e@example.com commit -q --allow-empty -m e2e', description: 'Commit' }),
+      // Allowed, and fails: a run that ends in an error.
+      call('Bash', { command: 'ls e2e-missing-file', description: 'Fails' }),
       // No rule allows it, and unlike a file command in the working folder, auto mode doesn't let it through without asking: its
       // classifier judges it.
       call('Bash', { command: REFUSED, description: 'Not allowed' }),
@@ -303,7 +305,7 @@ async function session(details, envBlock, auto) {
     '--plugin-dir', root,
     '--plugin-dir', redirect,
     '--settings', settings,
-    '--allowedTools', 'Bash(echo e2e),Bash(echo sub),Bash(git -c user.name=e2e -c user.email=e2e@example.com commit:*),Write,Edit,Agent',
+    '--allowedTools', 'Bash(echo e2e),Bash(echo sub),Bash(git -c user.name=e2e -c user.email=e2e@example.com commit:*),Bash(ls e2e-missing-file),Write,Edit,Agent',
     '--model', 'claude-haiku-5-5',
     ...(auto ? ['--permission-mode', 'auto'] : []),
     '--debug-file', join(config, 'debug.log'),
@@ -530,6 +532,8 @@ function compare(pass, details, auto, { captured, run }) {
   if (details && !commands.some(s => s.attrs.full_command)) problems.push('with tool details logged, no exporter Bash span carries its command')
   if (!details && commands.some(s => s.attrs.full_command)) problems.push('with tool details not logged, an exporter Bash span carries its command')
   if (!details && prompts.some(p => p !== '<REDACTED>')) problems.push('with prompts not logged, an exporter interaction carries its prompt')
+  // The failed run is in the session: the exporter's span says so.
+  if (!exporterSpans.some(s => s.name === 'claude_code.tool.execution' && s.attrs.success?.v === false)) problems.push('no failed tool run in the session')
   // The retried request is in the session: the exporter's span says so, by its attempt.
   if (!exporterSpans.some(s => s.name === 'claude_code.llm_request' && Number(s.attrs.attempt?.v) > 1)) problems.push('no retried request in the session')
   const worstTime = { span: 0, metric: 0 }

@@ -27,6 +27,19 @@ export function genAiProvider(provider: unknown): string | undefined {
   }
 }
 
+/** What Claude Code accepts as a failed tool run's `error_class`: a name of at most 48 letters, digits and `_`. */
+const ERROR_CLASS = /^[A-Za-z][A-Za-z0-9_]{0,47}$/
+
+/**
+ * A failed tool run's `error_class`, from the error's class as the call's `tool_result` row names it (`error_type`): each character
+ * other than a letter, a digit or `_` made `_`, and left off unless it then fits.
+ */
+export function errorClassOf(errorType: unknown): string | undefined {
+  if (typeof errorType !== 'string') return undefined
+  const cleaned = errorType.replace(/[^A-Za-z0-9_]/g, '_')
+  return ERROR_CLASS.test(cleaned) ? cleaned : undefined
+}
+
 /** A request's query source as metrics count it: the main loop, a subagent's, or anything else. */
 export function metricQuerySource(querySource: unknown): 'main' | 'subagent' | 'auxiliary' | undefined {
   if (typeof querySource !== 'string') return undefined
