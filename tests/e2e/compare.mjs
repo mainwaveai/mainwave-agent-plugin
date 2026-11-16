@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // End to end: one real `claude -p` session with the plugin loaded, its model answered by a local mock of the Anthropic API, and both
 // paths of its telemetry received locally: Claude Code's own OTLP exporter (logs, traces and metrics), and the plugin's copy (sent to
-// Mainwave's dev collector, which tests/e2e/redirect sends here instead). Nothing leaves the machine.
+// Mainwave's dev collector, which the test-only hooks in tests/e2e/redirect.ts send here instead). Nothing leaves the machine.
 //
 //   logs     every record is paired with its twin by session, event name and sequence, and compared field by field.
 //   traces   every span is paired with its twin by what identifies it (an interaction or permission span by its id, a request by
@@ -24,7 +24,7 @@
 // organization's settings reach it.
 
 import { execFileSync, spawn } from 'node:child_process'
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -113,6 +113,28 @@ function readBody(req) {
 }
 
 let overloaded = false
+/**
+ * The test-only plugin that sends the plugin's dev-collector requests to the receiver, built in a temporary folder: its manifest lives
+ * only there, as this repository holds one plugin (scripts/check-layout.sh).
+ */
+function redirectPlugin() {
+  const dir = mkdtempSync(join(tmpdir(), 'mainwave-e2e-redirect-'))
+  mkdirSync(join(dir, '.claude-plugin'))
+  mkdirSync(join(dir, 'hooks'))
+  writeFileSync(join(dir, '.claude-plugin', 'plugin.json'), JSON.stringify({
+    name: 'mainwave-e2e-redirect',
+    version: '0.0.0',
+    description: "Test only: sends the mainwave plugin's dev-collector requests to the local receiver the end-to-end comparison runs.",
+  }))
+  writeFileSync(join(dir, 'hooks', 'hooks.json'), JSON.stringify({ modules: ['./register.ts'] }))
+  copyFileSync(join(here, 'redirect.ts'), join(dir, 'hooks', 'register.ts'))
+  return dir
+}
+const redirect = redirectPlugin()
+// Removed however the run ends: a session that throws, or an interrupt, leaves nothing behind.
+process.on('exit', () => rmSync(redirect, { recursive: true, force: true }))
+process.on('SIGINT', () => process.exit(130))
+
 const server = createServer(async (req, res) => {
   const body = await readBody(req)
   const path = (req.url ?? '').split('?')[0]
@@ -189,7 +211,7 @@ async function session(details) {
   const args = [
     '-p', 'E2E_MAINTASK: run the steps, then say ok.',
     '--plugin-dir', root,
-    '--plugin-dir', join(here, 'redirect'),
+    '--plugin-dir', redirect,
     '--settings', settings,
     '--allowedTools', 'Bash(echo e2e),Bash(echo sub),Bash(git -c user.name=e2e -c user.email=e2e@example.com commit:*),Write,Edit,Agent',
     '--model', 'claude-haiku-5-5',
