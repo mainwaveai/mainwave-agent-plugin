@@ -1,6 +1,6 @@
 #!/bin/sh
-# What the engine will load, as `claude plugin validate --json` reports it: the collector row hook, the tool call, command and spawn
-# hooks each with its fail-open `.catch`; the turn hooks the rebuilt spans need; and session.end. A hook dropped, or a `.catch`
+# What the engine will load, as `claude plugin validate --json` reports it: the collector row hook, and the tool call, command, prompt
+# and spawn hooks, each with its fail-open `.catch`; the turn hooks the rebuilt spans need; and session.end. A hook dropped, or a `.catch`
 # removed, fails here: the unit tests call the hook bodies, not the registrations.
 set -eu
 cd "$(dirname "$0")/.."
@@ -16,10 +16,10 @@ process.stdin.on("data", d => (s += d)).on("end", () => {
   for (const h of ["session.end", "turn.start", "turn.step", "turn.complete"]) {
     if (!notes.some(n => new RegExp(`hooks: .*\\b${h.replace(".", "\\.")}\\b`).test(n))) fail.push(`no ${h} hook`)
   }
-  for (const h of ["telemetry.log{to=collector}", "tool.call", "command.run", "agent.spawn"]) {
+  for (const h of ["telemetry.log{to=collector}", "tool.call", "command.run", "prompt.submit", "agent.spawn"]) {
     const g = gating.find(x => x.hook === h)
     if (g === undefined || g.hasCatch !== true) fail.push(`the ${h} hook has no .catch`)
   }
   if (fail.length) { console.error("check-hooks: " + fail.join("; ")); process.exit(1) }
-  console.log("hooks: telemetry.log{to=collector}, tool.call, command.run and agent.spawn with .catch; turn.start, turn.step, turn.complete, session.end")
+  console.log("hooks: telemetry.log{to=collector}, tool.call, command.run, prompt.submit and agent.spawn with .catch; turn.start, turn.step, turn.complete, session.end")
 })'

@@ -32,7 +32,10 @@ function world(on: On, opts: { reply?: (n: number, post: Post) => Reply; store?:
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use', usage: { ...USAGE, model: 'claude-haiku-5-5' } } as never
   })
   on('tool.call', () => ({ result: { stdout: 'hi', stderr: '', interrupted: false, isImage: false, noOutputExpected: false } }) as never)
-  on('command.run', () => ({ text: 'Total cost: $0.00' }) as never)
+  on('command.run', (_$, e) => {
+    if ((e as { command: string }).command === 'broken') throw new Error('the command failed in test')
+    return { text: 'Total cost: $0.00' } as never
+  })
   return { clock, posts, rig }
 }
 
@@ -183,6 +186,18 @@ describe('a slash command', () => {
     const [i] = spans(posts).filter(s => s.name === 'claude_code.interaction')
     expect(i).toEqual(expect.objectContaining({ traceId: TRACE, spanId: INTERACTION }))
     expect(i!.attrs['user_prompt']).toBe('/cost')
+  })
+})
+
+describe('a slash command that fails', () => {
+  test('fails as it would without the plugin, and is not taken by the next turn', withKey, async ($, on) => {
+    const { clock, posts } = world(on)
+    await expect($.command.run({ command: 'broken', args: '' } as never)).rejects.toThrow()
+    await row($, 'user_prompt', { prompt: '/broken', prompt_length: '7' }, 'f00df00df00df00d')
+    await turn($)
+    await clock.advance(5_000)
+    const interactions = spans(posts).filter(s => s.name === 'claude_code.interaction').map(s => [s.spanId, s.attrs['user_prompt'], s.attrs['interaction.sequence']])
+    expect(interactions).toEqual([['f00df00df00df00d', '/broken', 1], [INTERACTION, 'go', 2]])
   })
 })
 

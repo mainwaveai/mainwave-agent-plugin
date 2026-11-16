@@ -17,7 +17,7 @@ import { identityOf, isOrgId, mergeIdentity } from './identity.ts'
 import { add, collect, newMeter, type Meter } from './meter.ts'
 import type { CopiedRow } from './otlp.ts'
 import {
-  agentSpawned, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
+  agentSpawned, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptSubmitted, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
 } from './rebuild.ts'
 import { adopt, configure, enqueue, ensureTimer, finish, isCopying, snapshot } from './sender.ts'
 import { applyStamps, entrypointOf, filterStamps, PLUGIN_NAME, stripOwned } from './stamps.ts'
@@ -37,6 +37,8 @@ type TurnCompleteParams = Parameters<Hook<'turn.complete'>>
 type StepParams = Parameters<StreamHook<'turn.step'>>
 type ToolCallParams = Parameters<Hook<'tool.call'>>
 type ToolCatchParams = Parameters<CatchHandler<Hook<'tool.call'>>>
+type PromptParams = Parameters<Hook<'prompt.submit'>>
+type PromptCatchParams = Parameters<CatchHandler<Hook<'prompt.submit'>>>
 type CommandParams = Parameters<Hook<'command.run'>>
 type CommandCatchParams = Parameters<CatchHandler<Hook<'command.run'>>>
 type SpawnParams = Parameters<Hook<'agent.spawn'>>
@@ -253,7 +255,7 @@ export async function sessionStart($: SessionStartParams[0], e: SessionStartPara
 export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1], next: TurnStartParams[2]) {
   try {
     const r = await rebuildOf($)
-    if (r !== null) turnStart(r, e)
+    if (r !== null) await emit($, turnStart(r, e, await $.clock.now()))
   } catch {
     // The turn's interaction is not rebuilt.
   }
@@ -322,21 +324,42 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
  */
 export async function commandHook($: CommandParams[0], e: CommandParams[1], next: CommandParams[2]) {
   let r: Rebuild | null = null
+  let flushed: Emit | null = null
   try {
     r = await rebuildOf($)
-    if (r !== null) commandStart(r, await $.clock.now())
+    if (r !== null) flushed = commandStart(r, await $.clock.now())
   } catch {
     r = null
   }
-  const result = await next(e)
-  if (r !== null) {
-    try {
-      await emit($, commandEnd(r, await $.clock.now()))
-    } catch {
-      // The command's interaction goes with what the rows say.
+  try {
+    return await next(e)
+  } finally {
+    // Ended however the command ends, a refused or failed one too, so it never waits on to be taken by a later turn.
+    if (r !== null) {
+      try {
+        commandEnd(r, await $.clock.now())
+        if (flushed !== null) await emit($, flushed)
+      } catch {
+        // The command's interaction goes with what the rows say.
+      }
     }
   }
-  return result
+}
+
+/** A prompt submitted: one that runs no slash command sends the command waiting first. The prompt goes on untouched. */
+export async function promptHook($: PromptParams[0], e: PromptParams[1], next: PromptParams[2]) {
+  try {
+    const r = await rebuildOf($)
+    if (r !== null) await emit($, promptSubmitted(r, e, await $.clock.now()))
+  } catch {
+    // The command waiting goes on the next sweep.
+  }
+  return next(e)
+}
+
+/** A prompt goes on whatever the hook did; once it has gone on, its result stands. */
+export function promptCatch($: PromptCatchParams[0], e: PromptCatchParams[1], next: PromptCatchParams[2]) {
+  return next(e)
 }
 
 /** A command goes on whatever the hook did; once it has gone on, its result stands. */
@@ -409,6 +432,7 @@ export const register: Register = (on, options) => {
   on('turn.complete', turnCompleteHook)
   on('tool.call', toolCallHook).catch(toolCatch)
   on('command.run', commandHook).catch(commandCatch)
+  on('prompt.submit', promptHook).catch(promptCatch)
   on('agent.spawn', spawnHook).catch(spawnCatch)
 
   on('session.end', sessionEnd)

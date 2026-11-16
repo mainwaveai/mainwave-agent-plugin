@@ -49,7 +49,10 @@ export type Emit = { spans: BuiltSpan[]; measures: Measure[] }
 type Prompt = { ctx?: Ctx; text: TelemetryAttribute; length: number }
 type Interaction = { turnId: string; sequence: number; prompt?: Prompt; ctx?: Ctx; text: string }
 /** A slash command that runs without a model turn (`/plugins`, `/cost`): an interaction of its own, as Claude Code counts it. */
-type Command = { sequence: number; startMs: number; endMs?: number; prompt?: Prompt; promptAtMs?: number }
+type Command = { sequence: number; startMs: number; endMs?: number; prompt?: Prompt; promptAtMs?: number; toTurn?: true }
+
+/** A prompt row of a slash command: its text starts with `/`, or is redacted, so nothing says it is not. */
+const slashPrompt = (p: Prompt) => typeof p.text !== 'string' || p.text === '<REDACTED>' || p.text.startsWith('/')
 type Step = { loop: string; startMs: number; endMs: number; stopReason: string | null; usage: StepUsage | null }
 type StepUsage = { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }
 type Waiting = { row: RowIn; heldAtMs: number }
@@ -231,7 +234,7 @@ function readRowEvent(r: Rebuild, row: RowIn): Emit {
       }
       const it = r.interaction
       if (it && !it.prompt && (promptFits(prompt, it.text) || (ctx !== undefined && it.ctx?.spanId === ctx.spanId))) it.prompt = prompt
-      else if (!it && r.command && !r.command.prompt) {
+      else if (!it && r.command && !r.command.prompt && slashPrompt(prompt)) {
         r.command.prompt = prompt
         r.command.promptAtMs = row.atMs
       } else r.heldPrompt = prompt
@@ -372,10 +375,12 @@ function llmSpan(r: Rebuild, row: RowIn, step: Step | undefined): BuiltSpan {
   const model = str(a['model'])
   const agentId = str(a['agent_id'])
   // Claude Code names the context the request ran in: a tool's (a subagent's requests run inside its Agent call), the open
-  // interaction's, or none. Where a host does not carry the trace onto the row (the SDK), the plugin's own state says which.
+  // interaction's, or none. A row with no span ran outside both, unless the host carries no trace onto its rows at all (one that
+  // drives Claude Code through its SDK): there the open interaction has no span of its own either, and the plugin's state says which.
+  const traceless = r.interaction !== undefined && r.interaction.prompt?.ctx === undefined && r.interaction.ctx === undefined
   const context = parent !== undefined
     ? (r.interactionIds.has(parent.spanId) ? 'interaction' : 'tool')
-    : agentId !== undefined ? 'tool' : r.interaction !== undefined ? 'interaction' : 'standalone'
+    : traceless ? (agentId !== undefined ? 'tool' : 'interaction') : 'standalone'
   const status = num(a['status_code'])
   const error = str(a['error'])
   const attempt = num(a['attempt']) ?? 1
@@ -429,22 +434,51 @@ function llmSpan(r: Rebuild, row: RowIn, step: Step | undefined): BuiltSpan {
 const promptFits = (prompt: Prompt, text: string) => prompt.length === text.length
 
 /** A main-loop turn began: an interaction opens, with the prompt row that came before it, if one did. */
-export function turnStart(r: Rebuild, e: { turnId: string; text: string; agentId?: string }): void {
-  if (e.agentId !== undefined) return
-  // A command that goes on to ask the model (a skill, a prompt command) is one interaction with its turn, as in Claude Code.
+export function turnStart(r: Rebuild, e: { turnId: string; text: string; agentId?: string }, nowMs: number): Emit {
+  if (e.agentId !== undefined) return none()
+  // A command that goes on to ask the model (a skill, a prompt command) is one interaction with its turn, as in Claude Code: the
+  // submission that ran it says so. Any other command still waiting is sent first, and the turn is an interaction of its own.
+  const flushed = r.command?.toTurn ? none() : endCommand(r, nowMs)
   const command = r.command
   r.command = undefined
   if (command === undefined) r.sequence += 1
   const held = command?.prompt ?? (r.heldPrompt && promptFits(r.heldPrompt, e.text) ? r.heldPrompt : undefined)
   r.interaction = { turnId: e.turnId, sequence: command?.sequence ?? r.sequence, text: e.text, ...(held ? { prompt: held } : {}) }
   r.heldPrompt = undefined
+  return flushed
 }
 
-/** A slash command began: an interaction opens, unless a model turn takes it over. */
-export function commandStart(r: Rebuild, nowMs: number): void {
-  if (r.interaction !== undefined) return
+/**
+ * A slash command began: an interaction opens, unless a model turn takes it over. One still waiting to be sent goes first; a prompt
+ * row of a slash command seen just before is this command's.
+ */
+export function commandStart(r: Rebuild, nowMs: number): Emit {
+  if (r.interaction !== undefined) return none()
+  const flushed = endCommand(r, nowMs)
   r.sequence += 1
   r.command = { sequence: r.sequence, startMs: nowMs }
+  if (r.heldPrompt && slashPrompt(r.heldPrompt)) {
+    r.command.prompt = r.heldPrompt
+    r.heldPrompt = undefined
+  }
+  return flushed
+}
+
+/**
+ * A prompt was submitted. One that runs no slash command is the start of a turn of its own: a command still waiting is sent first,
+ * so the turn does not take it over. One that runs a command (a skill, a prompt command) may be that command's turn.
+ */
+export function promptSubmitted(r: Rebuild, e: { command?: unknown }, nowMs: number): Emit {
+  if (e.command === undefined) return endCommand(r, nowMs)
+  if (r.command !== undefined) r.command.toTurn = true
+  return none()
+}
+
+/** Sends the command waiting, if any, ending it now if it has not ended. */
+function endCommand(r: Rebuild, nowMs: number): Emit {
+  if (r.command === undefined) return none()
+  r.command.endMs ??= nowMs
+  return sendCommand(r)
 }
 
 /**
