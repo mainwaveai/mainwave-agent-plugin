@@ -21,8 +21,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # What people run: Claude Code updates itself, so a break from a new release is a real signal.
-  CLAUDE_CODE_VERSION: latest
+  # Normally `latest`, what people run: Claude Code updates itself, so a break from a new release is a real signal. Pinned for
+  # now: under 2.1.326 the auto-mode comparison sees cost and token series with `query_source` `auxiliary` that the plugin's copy lacks,
+  # and a `plugin_loaded` row that differs. Back to `latest` once the comparison knows them.
+  CLAUDE_CODE_VERSION: 2.1.325
   DISABLE_AUTOUPDATER: '1'
 
 jobs:
