@@ -249,19 +249,33 @@ describe('tools', () => {
   })
 
   test("a failed run carries its error's class; its error is the row's where details are logged, else the class", () => {
-    for (const [details, error] of [[true, 'Exit code 7'], [false, 'ShellError']] as const) {
+    // Without details, `error` is the class as the row names it; `error_class` is the class made a name.
+    for (const [details, errorType, error, errorClass] of [[true, 'ShellError', 'Exit code 7', 'ShellError'], [false, 'Error:ENOENT', 'Error:ENOENT', 'Error_ENOENT']] as const) {
       const r = rebuild()
       observeRow(r, row('user_prompt', 0, {}, INTERACTION))
       turnStart(r, { turnId: 't', text: '' }, 0)
       toolStart(r, { tool: 'Bash', tool_use_id: 'toolu_f', command: 'false' }, 10)
       observeRow(r, row('tool_decision', 11, { decision: 'accept', source: 'config', tool_name: 'Bash', tool_use_id: 'toolu_f' }, BLOCKED))
       toolEnd(r, 'toolu_f', { isError: true, result: 'Exit code 7' }, 20)
-      const result = { tool_name: 'Bash', tool_use_id: 'toolu_f', success: 'false', duration_ms: '9', error_type: 'ShellError', ...(details ? { error: 'Exit code 7' } : {}) }
+      const result = { tool_name: 'Bash', tool_use_id: 'toolu_f', success: 'false', duration_ms: '9', error_type: errorType, ...(details ? { error: 'Exit code 7' } : {}) }
       const run = observeRow(r, row('tool_result', 21, result, INTERACTION)).spans.find(s => s.name === 'claude_code.tool.execution')!
       expect(Object.keys(run.attributes).slice(-5)).toEqual(['duration_ms', 'success', 'error.type', 'error', 'error_class'])
-      expect(run.attributes).toEqual(expect.objectContaining({ success: false, 'error.type': 'tool_error', error, error_class: 'ShellError' }))
+      expect(run.attributes).toEqual(expect.objectContaining({ success: false, 'error.type': 'tool_error', error, error_class: errorClass }))
       expect(run.status).toEqual({ code: 2, message: error })
     }
+  })
+
+  test('a failed run whose row names no class has no error class, and no error without details', () => {
+    const r = rebuild()
+    observeRow(r, row('user_prompt', 0, {}, INTERACTION))
+    turnStart(r, { turnId: 't', text: '' }, 0)
+    toolStart(r, { tool: 'Bash', tool_use_id: 'toolu_g', command: 'false' }, 10)
+    observeRow(r, row('tool_decision', 11, { decision: 'accept', source: 'config', tool_name: 'Bash', tool_use_id: 'toolu_g' }, BLOCKED))
+    toolEnd(r, 'toolu_g', { isError: true, result: 'x' }, 20)
+    const run = observeRow(r, row('tool_result', 21, { tool_name: 'Bash', tool_use_id: 'toolu_g', success: 'false' }, INTERACTION)).spans.find(s => s.name === 'claude_code.tool.execution')!
+    expect(run.attributes['error']).toBeUndefined()
+    expect(run.attributes['error_class']).toBeUndefined()
+    expect(run.status).toEqual({ code: 2 })
   })
 
   test("an Agent call's run takes the id its subagent's rows name, and the subagent's requests sit under it", () => {
