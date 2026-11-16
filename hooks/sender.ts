@@ -10,6 +10,13 @@
 // collector busy) goes back to the head of the queue and the timer waits longer before the next try. A batch the collector refuses
 // as malformed is dropped. A refused key stops sending until the plugin loads again, keeping the queue.
 //
+// Each batch carries an idempotency key (the `idempotency-key` header), made when the batch is first formed and kept, with the batch's
+// exact records, until the batch is settled: through every retry, in the outbox, and by a later load that takes the outbox over. The
+// collector stores a batch whose key it has already taken only once, so a batch that may have landed (a timeout, a request cut off at
+// session end) is sent again, metrics included. A key never covers a record it was not first sent with: the collector drops a retry
+// under a key it has already taken whole, and such a record with it. A retry may carry fewer (the oldest dropped past the caps), never
+// more.
+//
 // Two ways to send: keyless, with no `Authorization` header at all, or, where the person set a dev ingest key, with that key as a
 // bearer token. Keyless ingest routes each request by the `organization.id` and `user.email` on every record,
 // span and data point in it, and takes one pair per request. So without a key the plugin queues only records that carry both (a
@@ -19,7 +26,8 @@
 // sending that pair's records until the plugin loads again, and keeps them; other pairs go on.
 //
 // The queue is kept in `$.store` under this load's own key, so rows left at the end of a session, or by a process that died, are
-// sent by a later one: an outbox no load has touched for a minute is taken over by the next load that looks.
+// sent by a later one: an outbox no load has touched for a minute is taken over by the next load that looks. The outbox keeps each
+// batch's key, so the load that takes it over sends the same batches under the same keys.
 //
 // Fail open: nothing here holds a row, a tool call or the session. Every outcome is caught.
 
@@ -68,11 +76,52 @@ export const OUTBOX_PREFIX = 'outbox:'
 
 /** One record to send: a log row's copy, a rebuilt span, or a metric data point, tagged with its signal. */
 export type Item = { s: 'logs'; d: CopiedRow } | { s: 'traces'; d: BuiltSpan } | { s: 'metrics'; d: MetricPoint }
-/** A queued record: its resource as JSON, its size, and, without a key, who it is routed to (`routingIdentityOf`). */
-type Queued = Item & { resource: string; size: number; who?: string }
-/** What the store keeps: each record's resource as an index into `resources`. Version 1 held log rows alone, as `rows`. */
-export const OUTBOX_VERSION = 2
-type Outbox = { v: 2; updatedAt: number; resources: string[]; items: { s: Signal; r: number; d: unknown }[] }
+/**
+ * A queued record: its resource as JSON, its size, without a key who it is routed to (`routingIdentityOf`), and, once it has been in a
+ * batch, that batch's idempotency key (`batch`), kept until the batch is settled.
+ */
+type Queued = Item & { resource: string; size: number; who?: string; batch?: string }
+/**
+ * What the store keeps: each record's resource as an index into `resources`, and its batch's key, where it has one, as an index into
+ * `batches`, so each string is stored once. Version 1 held log rows alone, as `rows`; version 2 held no batch keys.
+ *
+ * Version 3, not an optional field on version 2: a load of an earlier version would take such an outbox over, re-form its batches and
+ * send them with no key, so a metric batch that had landed before would count twice. It leaves an outbox of a later version alone
+ * instead, for a load that knows the keys.
+ */
+export const OUTBOX_VERSION = 3
+type Outbox = { v: 3; updatedAt: number; resources: string[]; batches: string[]; items: { s: Signal; r: number; b?: number; d: unknown }[] }
+
+/** The collector's shape for an idempotency key: 1 to 128 of these characters. */
+export const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{1,128}$/
+/**
+ * A batch's own key, as made or as read back from the store: short enough that the keyless suffix (`.` and 8 hex digits) still fits
+ * the collector's 128. A stored key of any other shape is let go; its record is kept, and goes in a new batch under a new key.
+ */
+const BATCH_KEY = /^[A-Za-z0-9._:-]{1,119}$/
+
+/** 32-bit FNV-1a of a string's UTF-8 bytes, as 8 hex digits. */
+function fnv1a(text: string): string {
+  let h = 0x811c9dc5
+  for (const byte of new TextEncoder().encode(text)) {
+    h ^= byte
+    h = Math.imul(h, 0x01000193) >>> 0
+  }
+  return h.toString(16).padStart(8, '0')
+}
+
+/**
+ * The `idempotency-key` header of a batch: its key, and without a key its organization and email's hash after it. A batch formed with
+ * a dev ingest key may hold several people's records; sent keyless by a later load it goes as one batch per person, and each needs a
+ * key of its own, or the collector would store the first and drop the rest as repeats. Undefined if the value would not fit (no batch
+ * key is ever made that way): the batch then goes with no header, which risks a duplicate, never a loss.
+ */
+export function idempotencyKeyOf(batch: readonly { batch?: string; who?: string }[], keyless: boolean): string | undefined {
+  const head = batch[0]
+  if (head?.batch === undefined) return undefined
+  const value = keyless && head.who !== undefined ? `${head.batch}.${fnv1a(head.who)}` : head.batch
+  return IDEMPOTENCY_KEY.test(value) ? value : undefined
+}
 
 export type Verdict = 'sent' | 'retry' | 'drop' | 'stop' | 'off'
 
@@ -99,13 +148,6 @@ export function refusalOf(outcome: FetchOutcome): 'unclaimed' | 'email_domain' |
     return undefined
   }
 }
-
-/**
- * Whether a request may have reached the collector though no answer said so: it timed out, or the session ended while it waited. Log
- * rows and spans sent twice are one record to the collector (it keeps one per id); a metric's delta point sent twice would count twice,
- * so a metric batch with such an outcome is dropped, not tried again.
- */
-const mayHaveLanded = (outcome: FetchOutcome) => !outcome.ok && (outcome.reason === 'timeout' || outcome.reason === 'stopped')
 
 // Per load of the module; `configure` starts them over.
 let key: string | null = null
@@ -272,22 +314,33 @@ function nextSignal(now: number): Signal | undefined {
 }
 
 /**
- * The oldest records of one signal, in order; the rest of the queue keeps its order. Without a key, those of the oldest sendable
- * record's organization and email alone: keyless ingest takes one pair per request.
+ * The next batch of one signal, in order; the rest of the queue keeps its order. Without a key, of the oldest sendable record's
+ * organization and email alone: keyless ingest takes one pair per request.
+ *
+ * Where that record was already in a batch, the batch is that one again: the records queued under its key (without a key, those of
+ * that organization and email), nothing added, so its key covers only records it was first sent with. Otherwise a new batch is formed
+ * of the oldest records in no batch yet, and each is given the new batch's key.
  */
 function takeBatch(signal: Signal): Queued[] {
   const keyless = mode === 'keyless'
-  const who = keyless ? queue.find(item => item.s === signal && sendable(item))?.who : undefined
-  if (keyless && who === undefined) return []
+  const head = queue.find(item => item.s === signal && sendable(item))
+  if (head === undefined) return []
+  const who = keyless ? head.who : undefined
+  const key = head.batch
   const batch: Queued[] = []
   const rest: Queued[] = []
   let bytes = 0
   let full = false
   for (const item of queue) {
-    const mine = item.s === signal && (!keyless || item.who === who)
+    const mine = item.s === signal && item.batch === key && (!keyless || item.who === who)
     if (full || !mine || batch.length >= BATCH_ROWS || (batch.length > 0 && bytes + item.size > BATCH_BYTES)) {
       if (mine) full = true
-      rest.push(item)
+      // A batch already keyed is never over the caps as this sender forms it. Should a stored one be, what does not fit leaves the
+      // batch, and its key: it goes later, in a batch of its own.
+      if (mine && key !== undefined) {
+        const { batch: _gone, ...unkeyed } = item
+        rest.push(unkeyed as Queued)
+      } else rest.push(item)
       continue
     }
     batch.push(item)
@@ -295,9 +348,12 @@ function takeBatch(signal: Signal): Queued[] {
   }
   queue = rest
   queuedBytes -= bytes
-  return batch
+  if (key !== undefined) return batch
+  const fresh = newId()
+  return batch.map(item => ({ ...item, batch: fresh }))
 }
 
+/** Puts a batch back at the head of the queue, its records still under its key. */
 function putBack(batch: Queued[]): void {
   queue = [...batch, ...queue]
   queuedBytes += batch.reduce((n, r) => n + r.size, 0)
@@ -355,10 +411,14 @@ async function send($: EngineInterface, batch: readonly Queued[], limit: number,
     return 'unwritable'
   }
   try {
+    const keyless = mode === 'keyless'
+    // Without a key, no Authorization header at all: any one sends the request down the key path, where it is refused.
+    const headers: Record<string, string> = keyless ? { 'content-type': 'application/json' } : { 'content-type': 'application/json', authorization: `Bearer ${key}` }
+    const idempotencyKey = idempotencyKeyOf(batch, keyless)
+    if (idempotencyKey !== undefined) headers['idempotency-key'] = idempotencyKey
     return await fetchWithin($, DEV_URLS[batch[0]!.s], {
       method: 'POST',
-      // Without a key, no Authorization header at all: any one sends the request down the key path, where it is refused.
-      headers: mode === 'keyless' ? { 'content-type': 'application/json' } : { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+      headers,
       body,
       timeoutMs: limit,
     })
@@ -381,10 +441,12 @@ function settle(batch: Queued[], outcome: FetchOutcome | 'unwritable', now: numb
     waits[signal] = { backoffMs: 0, nextTryAt: 0 }
     return
   }
-  if (verdict === 'drop' || (signal === 'metrics' && verdict === 'retry' && mayHaveLanded(outcome))) {
+  if (verdict === 'drop') {
     counts.dropped += batch.length
     return
   }
+  // Under its own key: a batch that may have landed (a timeout, a request cut off by the session's end) is stored once however often it
+  // goes, so metrics are tried again like the rest.
   putBack(batch)
   // A keyless refusal of one organization and email holds back that pair's records alone; any other refusal stops the load.
   const who = batch[0]!.who
@@ -460,13 +522,21 @@ function fits(s: unknown, d: unknown): s is Signal {
   return false
 }
 
-/** An outbox as the store holds it (this version's, or a version 1 one of log rows alone), or `null` when it does not have the shape. */
+/**
+ * An outbox as the store holds it (this version's; a version 2 one, with no batch keys; or a version 1 one of log rows alone), or
+ * `null` when it does not have the shape. A batch key that does not fit `BATCH_KEY` is let go and its record kept.
+ */
 export function readOutbox(v: unknown): { updatedAt: number; items: Queued[] } | null {
   if (!isObject(v) || typeof v['updatedAt'] !== 'number' || !Array.isArray(v['resources'])) return null
-  const raws = v['v'] === 1 ? v['rows'] : v['v'] === OUTBOX_VERSION ? v['items'] : undefined
+  const raws = v['v'] === 1 ? v['rows'] : v['v'] === 2 || v['v'] === OUTBOX_VERSION ? v['items'] : undefined
   if (!Array.isArray(raws)) return null
   const resources = (v['resources'] as unknown[]).filter((r): r is string => typeof r === 'string')
   if (resources.length !== (v['resources'] as unknown[]).length) return null
+  const batches = v['v'] === OUTBOX_VERSION && Array.isArray(v['batches']) ? (v['batches'] as unknown[]) : []
+  const batchAt = (b: unknown): string | undefined => {
+    const k = typeof b === 'number' ? batches[b] : undefined
+    return typeof k === 'string' && BATCH_KEY.test(k) ? k : undefined
+  }
   const items: Queued[] = []
   for (const raw of raws as unknown[]) {
     if (!isObject(raw) || typeof raw['r'] !== 'number') continue
@@ -481,25 +551,37 @@ export function readOutbox(v: unknown): { updatedAt: number; items: Queued[] } |
     }
     if (!fits(s, d)) continue
     const who = whoOf(d)
-    items.push({ s, d, resource: res, size: JSON.stringify(d).length, ...(who !== undefined ? { who } : {}) } as Queued)
+    const batch = v['v'] === OUTBOX_VERSION ? batchAt(raw['b']) : undefined
+    items.push({ s, d, resource: res, size: JSON.stringify(d).length, ...(who !== undefined ? { who } : {}), ...(batch !== undefined ? { batch } : {}) } as Queued)
   }
   return { updatedAt: v['updatedAt'] as number, items }
 }
 
-/** The records as the store keeps them, each resource once. */
+/** The records as the store keeps them, each resource and each batch key once. */
 export function writeOutbox(items: readonly Queued[], updatedAt: number): Outbox {
   const resources: string[] = []
+  const batches: string[] = []
   const index = new Map<string, number>()
+  const batchIndex = new Map<string, number>()
   const out: Outbox['items'] = []
-  for (const { s, d, resource: res } of items) {
+  for (const { s, d, resource: res, batch } of items) {
     let r = index.get(res)
     if (r === undefined) {
       r = resources.push(res) - 1
       index.set(res, r)
     }
-    out.push({ s, r, d })
+    if (batch === undefined) {
+      out.push({ s, r, d })
+      continue
+    }
+    let b = batchIndex.get(batch)
+    if (b === undefined) {
+      b = batches.push(batch) - 1
+      batchIndex.set(batch, b)
+    }
+    out.push({ s, r, b, d })
   }
-  return { v: OUTBOX_VERSION, updatedAt, resources, items: out }
+  return { v: OUTBOX_VERSION, updatedAt, resources, batches, items: out }
 }
 
 /** Writes this load's outbox: the batches in flight and the queue, or removes it when both are empty. */

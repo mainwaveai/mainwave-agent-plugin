@@ -5,7 +5,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { boot, EMAIL, itemAttributes, KEY, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, type KeylessAnswer, type Layers, type Post, type Reply } from './rig.ts'
+import { boot, EMAIL, IDEMPOTENCY_KEY, itemAttributes, KEY, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, type KeylessAnswer, type Layers, type Post, type Reply } from './rig.ts'
 
 /** No options: the plugin's defaults, so no key, so keyless. */
 const keyless = { options: {} }
@@ -90,7 +90,7 @@ describe('a session without the env block, sending keyless', () => {
     await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
     expect(new Set(seen.map(s => PATH(s.post.url)))).toEqual(new Set(['/v1/logs', '/v1/traces', '/v1/metrics']))
     for (const { post, answer } of seen) {
-      expect(Object.keys(post.headers).map(h => h.toLowerCase())).toEqual(['content-type'])
+      expect(Object.keys(post.headers).map(h => h.toLowerCase())).toEqual(['content-type', 'idempotency-key'])
       expect(answer).toEqual(expect.objectContaining({ status: 200, identity: `${ORG} ${EMAIL}` }))
     }
   })
@@ -213,6 +213,39 @@ describe('a session without the env block, sending keyless', () => {
   })
 })
 
+describe('the idempotency key, keyless', () => {
+  const keyOf = (p: Post) => p.headers['idempotency-key']!
+  const SUFFIXED = /^[A-Za-z0-9._:-]+\.[0-9a-f]{8}$/
+
+  test("is the batch's key with its organization and email's hash after it, the same on a retry", keyless, async ($, on) => {
+    const { clock, seen } = world(on, { answer: (_a, post) => (seen.length === 1 && PATH(post.url) === '/v1/logs' ? { status: 503 } : undefined) })
+    await row($, 'user_prompt', { prompt: 'go', prompt_length: '2' })
+    await clock.advance(TICK)
+    await clock.advance(TICK)
+    const logs = seen.filter(s => PATH(s.post.url) === '/v1/logs').map(s => s.post)
+    expect(logs.length).toBe(2)
+    expect(keyOf(logs[0]!)).toMatch(SUFFIXED)
+    expect(keyOf(logs[0]!)).toMatch(IDEMPOTENCY_KEY)
+    expect(keyOf(logs[1]!)).toBe(keyOf(logs[0]!))
+  })
+
+  test('a batch formed with a key over two people goes keyless as one batch each, each under a key of its own', keyless, async ($, on) => {
+    const k = '5f0c3f8e-2b7a-4d2c-9a51-1d7c4b2e8f01'
+    const box = { ...leftBehind([keptRow(ORG_B, EMAIL_B, 1), keptRow(ORG, EMAIL, 2), keptRow(ORG_B, EMAIL_B, 3)].map(i => ({ ...i, b: 0 }))), v: 3, batches: [k] }
+    const { clock, seen } = world(on, { store: { 'outbox:old': box } })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await clock.advance(TICK)
+    const logs = seen.filter(s => PATH(s.post.url) === '/v1/logs')
+    expect(logs.map(s => s.answer.status)).toEqual([200, 200])
+    expect(logs.map(s => emailsOf(s.post))).toEqual([[EMAIL_B], [EMAIL]])
+    expect(logs.map(s => itemAttributes(s.post).length)).toEqual([2, 1])
+    const [a, b] = logs.map(s => keyOf(s.post))
+    expect(a!.startsWith(`${k}.`) && b!.startsWith(`${k}.`)).toBe(true)
+    expect(a).not.toBe(b)
+    for (const key of [a, b]) expect(key).toMatch(IDEMPOTENCY_KEY)
+  })
+})
+
 describe('the key option', () => {
   test('unset, the copy goes keyless with no option at all', async ($, on) => {
     const { seen } = world(on)
@@ -220,7 +253,7 @@ describe('the key option', () => {
     await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
     expect(seen.length).toBeGreaterThan(0)
     for (const { post, answer } of seen) {
-      expect(Object.keys(post.headers).map(h => h.toLowerCase())).toEqual(['content-type'])
+      expect(Object.keys(post.headers).map(h => h.toLowerCase())).toEqual(['content-type', 'idempotency-key'])
       expect(answer.status).toBe(200)
     }
   })

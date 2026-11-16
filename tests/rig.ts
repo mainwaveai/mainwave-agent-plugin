@@ -34,6 +34,8 @@ export const keyOption = (value: unknown, id = 'mainwave@mainwave'): Record<stri
 export const KEY = 'mw_dev_example_key_0001'
 /** Where the copy may go, and nowhere else. */
 export const DEV_URL = 'https://collector.dev.mainwave.com/v1/logs'
+/** The collector's shape for an `idempotency-key` header: 1 to 128 of these characters. */
+export const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{1,128}$/
 
 /** Hooks that stand for the engine: settings layers, the environment, and the collector, which records each row it receives. */
 export function boot(on: On, opts: { layers?: Layers; entrypoint?: string; env?: Record<string, string> } = {}): Rig & { envReads: string[] } {
@@ -219,12 +221,15 @@ const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12
 export type KeylessAnswer = { status: number; text: string; identity?: string }
 
 /**
- * Keyless ingest's answer: 401 for a request with any Authorization header (it takes the key path); 400 when an item lacks
+ * Keyless ingest's answer: 401 for a request with any Authorization header (it takes the key path); 400 for an `idempotency-key`
+ * header of the wrong shape (the collector also takes the value in double quotes; the plugin never sends it so); 400 when an item lacks
  * `organization.id` or `user.email`, carries either twice or carries `kiro.user.email`, when the items name more than one pair, or
  * when the pair has not the shape; 403 with the reason for an organization `refused` names; else 200.
  */
 export function keylessAnswer(post: Post, refused: Record<string, 'unclaimed' | 'email_domain'> = {}): KeylessAnswer {
   if (Object.keys(post.headers).some(h => h.toLowerCase() === 'authorization')) return { status: 401, text: '{"error":"unauthorized"}' }
+  const idempotencyKey = Object.entries(post.headers).find(([h]) => h.toLowerCase() === 'idempotency-key')?.[1]
+  if (idempotencyKey !== undefined && !IDEMPOTENCY_KEY.test(idempotencyKey)) return { status: 400, text: '{"error":"idempotency-key"}' }
   let seen: string | undefined
   for (const attrs of itemAttributes(post)) {
     if (attrs.some(a => a.key === 'kiro.user.email')) return { status: 400, text: '{"error":"kiro.user.email"}' }

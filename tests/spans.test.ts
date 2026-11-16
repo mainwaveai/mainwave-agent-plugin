@@ -4,7 +4,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { boot, KEY, LOGGED_AT, memoryStore, network, ORG, type Post, type Reply } from './rig.ts'
+import { boot, IDEMPOTENCY_KEY, KEY, LOGGED_AT, memoryStore, network, ORG, type Post, type Reply } from './rig.ts'
 
 const withKey = { options: { devIngestKey: KEY } }
 const TRACES_URL = 'https://collector.dev.mainwave.com/v1/traces'
@@ -240,14 +240,36 @@ describe('each signal on its own path', () => {
     })
   }
 
-  test('a metric batch whose request may have landed (it timed out) is dropped, never sent twice', withKey, async ($, on) => {
+  test('a metric batch whose request may have landed (it timed out) is sent again, the same points under the same key', withKey, async ($, on) => {
     const { clock, posts } = world(on, { reply: (_n, p) => (p.url === METRICS_URL && posts.filter(x => x.url === METRICS_URL).length === 1 ? 'hang' : { status: 200 }) })
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
     await turn($)
     await clock.advance(60_000)
     await clock.advance(15_000)
     await clock.advance(60_000)
-    expect(count(posts, METRICS_URL)).toBe(1)
+    const metrics = posts.filter(p => p.url === METRICS_URL)
+    expect(metrics.length).toBe(2)
+    expect(metrics[1]!.body).toBe(metrics[0]!.body)
+    expect(metrics[1]!.headers['idempotency-key']).toBe(metrics[0]!.headers['idempotency-key'])
+    expect(metrics[0]!.headers['idempotency-key']).toMatch(IDEMPOTENCY_KEY)
+  })
+
+  test('a metric batch cut off by the session end is kept with its key, and sent again under that key', withKey, async ($, on) => {
+    const { clock, posts, store } = world(on, { reply: (_n, p) => (p.url === METRICS_URL && posts.filter(x => x.url === METRICS_URL).length === 1 ? 'hang' : { status: 200 }) })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await turn($)
+    // The end's one request of each signal hangs: its time limit, within the end's bound, gives it up.
+    const ending = $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    await clock.advance(3_000)
+    await ending
+    const sentKey = posts.find(p => p.url === METRICS_URL)!.headers['idempotency-key']
+    const box = [...store.data.entries()].find(([k]) => k.startsWith('outbox:'))![1] as { v: number; batches: string[]; items: { s: string; b?: number }[] }
+    expect(box.v).toBe(3)
+    expect(box.items.filter(i => i.s === 'metrics').map(i => box.batches[i.b!])).toEqual(box.items.filter(i => i.s === 'metrics').map(() => sentKey))
+    await clock.advance(10_000)
+    const metrics = posts.filter(p => p.url === METRICS_URL)
+    expect(metrics.length).toBe(2)
+    expect(metrics[1]!.headers['idempotency-key']).toBe(sentKey)
   })
 
   test('a stored record that cannot be written as a request is dropped, and the rest go on', withKey, async ($, on) => {

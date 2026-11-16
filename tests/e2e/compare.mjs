@@ -155,12 +155,17 @@ function readBody(req) {
   })
 }
 
+/** The collector's shape for an `idempotency-key` header. The plugin sends one on every request. */
+const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{1,128}$/
+
 /**
- * Keyless ingest's answer to a request of the plugin's in the keyless pass: 401 for any Authorization header, 400 for an item without
+ * Keyless ingest's answer to a request of the plugin's in the keyless pass: 401 for any Authorization header, 400 for a missing or
+ * malformed `idempotency-key` header (the plugin always sends one; the collector itself accepts none), 400 for an item without
  * exactly one `organization.id` and one `user.email`, or for two pairs in one request, else 200.
  */
 function keylessAnswer(headers, body) {
   if (headers['authorization'] !== undefined) return { status: 401, error: 'an Authorization header' }
+  if (!IDEMPOTENCY_KEY.test(headers['idempotency-key'] ?? '')) return { status: 400, error: 'no idempotency-key header of the collector\'s shape' }
   const doc = JSON.parse(body)
   const items = [
     ...(doc.resourceLogs ?? []).flatMap(rl => rl.scopeLogs.flatMap(sl => sl.logRecords)),
@@ -225,7 +230,7 @@ const server = createServer(async (req, res) => {
   if (req.method === 'POST' && signal) {
     const who = path.startsWith('/plugin/') ? 'plugin' : 'exporter'
     const answer = who === 'plugin' && keylessRules ? keylessAnswer(req.headers, body) : { status: 200 }
-    captured[who][signal].push({ auth: req.headers['authorization'], type: req.headers['content-type'], body, status: answer.status, error: answer.error })
+    captured[who][signal].push({ auth: req.headers['authorization'], type: req.headers['content-type'], idempotencyKey: req.headers['idempotency-key'], body, status: answer.status, error: answer.error })
     if (answer.status !== 200) {
       res.writeHead(answer.status, { 'content-type': 'application/json' })
       return res.end(JSON.stringify({ error: answer.error }))
@@ -409,6 +414,7 @@ function compare(pass, details, auto, { captured, run }) {
     for (const p of captured.exporter[s]) if (p.auth !== `Bearer ${EXPORTER_KEY}`) problems.push(`an exporter ${s} request without the exporter key`)
     for (const p of captured.plugin[s]) {
       if (p.auth !== `Bearer ${PLUGIN_KEY}`) problems.push(`a plugin ${s} request without the person's dev key`)
+      if (!IDEMPOTENCY_KEY.test(p.idempotencyKey ?? '')) problems.push(`a plugin ${s} request without an idempotency key of the collector's shape`)
       if (p.body.includes(PLUGIN_KEY) || p.body.includes(EXPORTER_KEY)) problems.push(`a key inside a plugin ${s} request body`)
     }
     if (captured.exporter[s].length === 0) problems.push(`the exporter sent no ${s}`)
