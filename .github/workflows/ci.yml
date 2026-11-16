@@ -39,7 +39,12 @@ jobs:
         # breaks the comparison shows as that pull request failing, not as every other one.
         run: |
           version=$(node -p "require('./.github/claude-code/package.json').devDependencies['@anthropic-ai/claude-code']")
-          npm install -g "@anthropic-ai/claude-code@${version}" && claude --version
+          # An exact version only: a range would float, and a missing entry reads as "undefined".
+          echo "$version" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' || { echo "no exact Claude Code version pinned: $version" >&2; exit 1; }
+          npm install -g "@anthropic-ai/claude-code@${version}"
+          installed=$(claude --version | awk '{print $1}')
+          [ "$installed" = "$version" ] || { echo "installed Claude Code $installed, pinned $version" >&2; exit 1; }
+          echo "Claude Code $installed"
       - name: Versions match
         run: scripts/check-version.sh
       - name: One plugin, at the root (org sync refuses a manifest anywhere else)
