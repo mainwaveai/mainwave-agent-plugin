@@ -272,6 +272,21 @@ describe('each signal on its own path', () => {
     expect(metrics[1]!.headers['idempotency-key']).toBe(sentKey)
   })
 
+  test('a metric batch whose request the session end cut off (stopped, not timed out) is put back and sent again under its key', withKey, async ($, on) => {
+    const { clock, posts } = world(on, { reply: (_n, p) => (p.url === METRICS_URL && posts.filter(x => x.url === METRICS_URL).length === 1 ? 'hang' : { status: 200 }) })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await turn($)
+    await clock.advance(60_000)
+    expect(count(posts, METRICS_URL)).toBe(1)
+    // The timer's metric request still waits when the session ends (a /clear: the process goes on); the end answers it `stopped`.
+    await $.session.end({ reason: 'clear', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    await clock.advance(5_000)
+    const metrics = posts.filter(p => p.url === METRICS_URL)
+    expect(metrics.length).toBe(2)
+    expect(metrics[1]!.body).toBe(metrics[0]!.body)
+    expect(metrics[1]!.headers['idempotency-key']).toBe(metrics[0]!.headers['idempotency-key'])
+  })
+
   test('a stored record that cannot be written as a request is dropped, and the rest go on', withKey, async ($, on) => {
     const resources = [JSON.stringify({ 'service.name': 'claude-code' })]
     const bad = { traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), name: 'claude_code.tool', startMs: 1, endMs: 2, attributes: {}, events: [null] }

@@ -14,8 +14,13 @@
 // exact records, until the batch is settled: through every retry, in the outbox, and by a later load that takes the outbox over. The
 // collector stores a batch whose key it has already taken only once, so a batch that may have landed (a timeout, a request cut off at
 // session end) is sent again, metrics included. A key never covers a record it was not first sent with: the collector drops a retry
-// under a key it has already taken whole, and such a record with it. A retry may carry fewer (the oldest dropped past the caps), never
-// more.
+// under a key it has already taken whole, and such a record with it. Nor is part of a batch sent under its key: two loads that take
+// over the same outbox could each send the batch, and were the smaller copy stored first, the rest would be dropped with the other.
+// So a retry carries the same records, or none: past the caps, the whole batch goes.
+//
+// A batch formed keyless has its organization and email's hash in its key, so it goes under the same header whichever way a later
+// load sends it. A batch formed with a key goes keyless as one batch per person, each under its key with that person's hash after
+// it: a header the collector has not seen, so such a batch may be stored twice, never lost.
 //
 // Two ways to send: keyless, with no `Authorization` header at all, or, where the person set a dev ingest key, with that key as a
 // bearer token. Keyless ingest routes each request by the `organization.id` and `user.email` on every record,
@@ -94,32 +99,37 @@ type Outbox = { v: 3; updatedAt: number; resources: string[]; batches: string[];
 
 /** The collector's shape for an idempotency key: 1 to 128 of these characters. */
 export const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{1,128}$/
+/** The suffix a keyless batch's key ends with: `.` and its organization and email's hash (`whoHash`). */
+const WHO_SUFFIX = /\.[0-9a-f]{16}$/
 /**
- * A batch's own key, as made or as read back from the store: short enough that the keyless suffix (`.` and 8 hex digits) still fits
- * the collector's 128. A stored key of any other shape is let go; its record is kept, and goes in a new batch under a new key.
+ * A batch's own key, as made or as read back from the store: short enough that the keyless suffix (17 characters) still fits the
+ * collector's 128 after it, the longest header a stored key can become. A stored key of any other shape is let go; its record is kept,
+ * and goes in a new batch under a new key.
  */
-const BATCH_KEY = /^[A-Za-z0-9._:-]{1,119}$/
+const BATCH_KEY = /^[A-Za-z0-9._:-]{1,111}$/
 
-/** 32-bit FNV-1a of a string's UTF-8 bytes, as 8 hex digits. */
-function fnv1a(text: string): string {
-  let h = 0x811c9dc5
-  for (const byte of new TextEncoder().encode(text)) {
-    h ^= byte
-    h = Math.imul(h, 0x01000193) >>> 0
-  }
-  return h.toString(16).padStart(8, '0')
+const FNV64_OFFSET = 0xcbf29ce484222325n
+const FNV64_PRIME = 0x100000001b3n
+const U64 = (1n << 64n) - 1n
+
+/** 64-bit FNV-1a of an organization and email (`routingIdentityOf`), as UTF-8 bytes, in 16 hex digits: the keyless suffix's hash. */
+export function whoHash(who: string): string {
+  let h = FNV64_OFFSET
+  for (const byte of new TextEncoder().encode(who)) h = ((h ^ BigInt(byte)) * FNV64_PRIME) & U64
+  return h.toString(16).padStart(16, '0')
 }
 
 /**
- * The `idempotency-key` header of a batch: its key, and without a key its organization and email's hash after it. A batch formed with
- * a dev ingest key may hold several people's records; sent keyless by a later load it goes as one batch per person, and each needs a
- * key of its own, or the collector would store the first and drop the rest as repeats. Undefined if the value would not fit (no batch
- * key is ever made that way): the batch then goes with no header, which risks a duplicate, never a loss.
+ * The `idempotency-key` header of a batch. With a key, its key as stored. Without one, a key formed keyless as stored (it holds its
+ * hash already), and a key formed with a dev ingest key with the organization and email's hash after it: such a batch may hold several
+ * people's records, goes keyless as one batch per person, and each needs a key of its own, or the collector would store the first and
+ * drop the rest as repeats. Undefined if the value would not fit (no batch key is ever made that way): the batch then goes with no
+ * header, which risks a duplicate, never a loss.
  */
 export function idempotencyKeyOf(batch: readonly { batch?: string; who?: string }[], keyless: boolean): string | undefined {
   const head = batch[0]
   if (head?.batch === undefined) return undefined
-  const value = keyless && head.who !== undefined ? `${head.batch}.${fnv1a(head.who)}` : head.batch
+  const value = keyless && head.who !== undefined && !WHO_SUFFIX.test(head.batch) ? `${head.batch}.${whoHash(head.who)}` : head.batch
   return IDEMPOTENCY_KEY.test(value) ? value : undefined
 }
 
@@ -251,12 +261,26 @@ async function readResource($: EngineInterface): Promise<string> {
   return JSON.stringify(resourceOf({ resourceAttributes, serviceName, version }))
 }
 
+/**
+ * Drops the oldest records past the queue's caps. A record in a batch takes the whole batch with it: part of a batch is never sent
+ * under its key, as the collector would drop the full batch, sent by another load, as a repeat of it.
+ */
 function dropOldest(): void {
   while (queue.length > QUEUE_ROWS || queuedBytes > QUEUE_BYTES) {
     const gone = queue.shift()
     if (gone === undefined) break
     queuedBytes -= gone.size
     counts.dropped += 1
+    if (gone.batch === undefined) continue
+    const rest: Queued[] = []
+    for (const item of queue) {
+      if (item.batch !== gone.batch) rest.push(item)
+      else {
+        queuedBytes -= item.size
+        counts.dropped += 1
+      }
+    }
+    queue = rest
   }
 }
 
@@ -319,7 +343,8 @@ function nextSignal(now: number): Signal | undefined {
  *
  * Where that record was already in a batch, the batch is that one again: the records queued under its key (without a key, those of
  * that organization and email), nothing added, so its key covers only records it was first sent with. Otherwise a new batch is formed
- * of the oldest records in no batch yet, and each is given the new batch's key.
+ * of the oldest records in no batch yet, and each is given the new batch's key (without a key, with the organization and email's hash
+ * in it).
  */
 function takeBatch(signal: Signal): Queued[] {
   const keyless = mode === 'keyless'
@@ -349,11 +374,12 @@ function takeBatch(signal: Signal): Queued[] {
   queue = rest
   queuedBytes -= bytes
   if (key !== undefined) return batch
-  const fresh = newId()
+  // Formed keyless, the key holds its organization and email's hash, so the batch has the same header whichever way it is sent.
+  const fresh = who !== undefined ? `${newId()}.${whoHash(who)}` : newId()
   return batch.map(item => ({ ...item, batch: fresh }))
 }
 
-/** Puts a batch back at the head of the queue, its records still under its key. */
+/** Puts a batch back at the head of the queue, its records still under its key; past the caps, the whole batch goes. */
 function putBack(batch: Queued[]): void {
   queue = [...batch, ...queue]
   queuedBytes += batch.reduce((n, r) => n + r.size, 0)

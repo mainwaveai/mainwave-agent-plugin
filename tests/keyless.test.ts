@@ -5,6 +5,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
+import { whoHash } from '../hooks/sender.ts'
 import { boot, EMAIL, IDEMPOTENCY_KEY, itemAttributes, KEY, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, type KeylessAnswer, type Layers, type Post, type Reply } from './rig.ts'
 
 /** No options: the plugin's defaults, so no key, so keyless. */
@@ -215,18 +216,37 @@ describe('a session without the env block, sending keyless', () => {
 
 describe('the idempotency key, keyless', () => {
   const keyOf = (p: Post) => p.headers['idempotency-key']!
-  const SUFFIXED = /^[A-Za-z0-9._:-]+\.[0-9a-f]{8}$/
+  const HASH = whoHash(`${ORG} ${EMAIL}`)
 
-  test("is the batch's key with its organization and email's hash after it, the same on a retry", keyless, async ($, on) => {
-    const { clock, seen } = world(on, { answer: (_a, post) => (seen.length === 1 && PATH(post.url) === '/v1/logs' ? { status: 503 } : undefined) })
+  test('the hash is 64-bit FNV-1a, in 16 hex digits', () => {
+    expect(whoHash('')).toBe('cbf29ce484222325')
+    expect(whoHash('a')).toBe('af63dc4c8601ec8c')
+    expect(whoHash(`${ORG} ${EMAIL}`)).toMatch(/^[0-9a-f]{16}$/)
+  })
+
+  test("is the batch's stored key, its organization and email's hash in it, the same on a retry", keyless, async ($, on) => {
+    const { clock, seen, store } = world(on, { answer: (_a, post) => (seen.length === 1 && PATH(post.url) === '/v1/logs' ? { status: 503 } : undefined) })
     await row($, 'user_prompt', { prompt: 'go', prompt_length: '2' })
     await clock.advance(TICK)
+    const box = store.sets.filter(s => s.key.startsWith('outbox:')).at(-1)!.value as { batches: string[] }
     await clock.advance(TICK)
     const logs = seen.filter(s => PATH(s.post.url) === '/v1/logs').map(s => s.post)
     expect(logs.length).toBe(2)
-    expect(keyOf(logs[0]!)).toMatch(SUFFIXED)
+    expect(box.batches.length).toBe(1)
+    expect(box.batches[0]!.endsWith(`.${HASH}`)).toBe(true)
+    expect(keyOf(logs[0]!)).toBe(box.batches[0])
     expect(keyOf(logs[0]!)).toMatch(IDEMPOTENCY_KEY)
     expect(keyOf(logs[1]!)).toBe(keyOf(logs[0]!))
+  })
+
+  test('a batch formed keyless and taken over keyless goes under its stored key, with no second hash', keyless, async ($, on) => {
+    const k = `5f0c3f8e-2b7a-4d2c-9a51-1d7c4b2e8f01.${HASH}`
+    const box = { ...leftBehind([keptRow(ORG, EMAIL, 1), keptRow(ORG, EMAIL, 2)].map(i => ({ ...i, b: 0 }))), v: 3, batches: [k] }
+    const { clock, seen } = world(on, { store: { 'outbox:old': box } })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await clock.advance(TICK)
+    const logs = seen.filter(s => PATH(s.post.url) === '/v1/logs')
+    expect(logs.map(s => [keyOf(s.post), s.answer.status])).toEqual([[k, 200]])
   })
 
   test('a batch formed with a key over two people goes keyless as one batch each, each under a key of its own', keyless, async ($, on) => {
@@ -240,8 +260,8 @@ describe('the idempotency key, keyless', () => {
     expect(logs.map(s => emailsOf(s.post))).toEqual([[EMAIL_B], [EMAIL]])
     expect(logs.map(s => itemAttributes(s.post).length)).toEqual([2, 1])
     const [a, b] = logs.map(s => keyOf(s.post))
-    expect(a!.startsWith(`${k}.`) && b!.startsWith(`${k}.`)).toBe(true)
-    expect(a).not.toBe(b)
+    expect(a).toBe(`${k}.${whoHash(`${ORG_B} ${EMAIL_B}`)}`)
+    expect(b).toBe(`${k}.${HASH}`)
     for (const key of [a, b]) expect(key).toMatch(IDEMPOTENCY_KEY)
   })
 })

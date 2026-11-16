@@ -4,7 +4,8 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { boot, DEV_URL, IDEMPOTENCY_KEY, KEY, keyOption, log, LOGGED_AT, memoryStore, network, ORG, ownedKeys, records, STAMPED, type Layers, type Post, type Reply } from './rig.ts'
+import { idempotencyKeyOf, readOutbox, whoHash } from '../hooks/sender.ts'
+import { boot, DEV_URL, EMAIL, IDEMPOTENCY_KEY, KEY, keyOption, log, LOGGED_AT, memoryStore, network, ORG, ownedKeys, records, STAMPED, type Layers, type Post, type Reply } from './rig.ts'
 
 const withKey = { options: { devIngestKey: KEY } }
 const SPAN = { traceId: '7d2fa3029813d71c9ad4ef05815fa7d5', spanId: 'e4a76fb0fca33a96', traceFlags: 1 }
@@ -292,6 +293,76 @@ describe('the idempotency key', () => {
     expect(keyOf(posts[1]!)).toBe(keyOf(posts[0]!))
     // Taken over, it is this load's, written as this version's.
     expect((sets.find(s => s.key.startsWith('outbox:') && s.key !== 'outbox:gone')!.value as { v: number }).v).toBe(3)
+  })
+
+  test('a stored batch of 201 rows under one key goes as 200 under that key and 1 under a new key', withKey, async ($, on) => {
+    const k = '5f0c3f8e-2b7a-4d2c-9a51-1d7c4b2e8f01'
+    const items = Array.from({ length: 201 }, (_, i) => kept(i + 1, 0))
+    const box = { v: 3, updatedAt: START - 120_000, resources, batches: [k], items }
+    const { clock, posts } = world(on, { store: { 'outbox:gone': box } })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await clock.advance(TICK)
+    expect(posts.map(p => seqs(p).length)).toEqual([200, 1])
+    expect(keyOf(posts[0]!)).toBe(k)
+    expect(seqs(posts[1]!)).toEqual([201])
+    expect(keyOf(posts[1]!)).toMatch(IDEMPOTENCY_KEY)
+    expect(keyOf(posts[1]!)).not.toBe(k)
+  })
+
+  test('a batch put back past the queue caps is dropped whole, never resent in part under its key', withKey, async ($, on) => {
+    const pad = 'x'.repeat(300_000)
+    const { clock, posts, rig } = world(on, { reply: n => (n === 1 ? 'hang' : { status: 200 }) })
+    await logRow($, rig, row(1, { pad }))
+    await logRow($, rig, row(2, { pad }))
+    await clock.advance(TICK)
+    // While the batch of 1 and 2 hangs, the queue fills to just under its cap: with the batch put back, it is over.
+    await logRow($, rig, row(3, { pad }))
+    await logRow($, rig, row(4, { pad }))
+    await clock.advance(10_000)
+    await clock.advance(2 * TICK)
+    expect(posts.map(seqs)).toEqual([[1, 2], [3, 4]])
+    expect(keyOf(posts[1]!)).not.toBe(keyOf(posts[0]!))
+  })
+
+  test('a stored batch taken over past the queue caps is dropped whole; the next batch goes under its own key', withKey, async ($, on) => {
+    const pad = 'x'.repeat(400_000)
+    const k1 = '5f0c3f8e-2b7a-4d2c-9a51-1d7c4b2e8f01'
+    const k2 = 'a3b1c9d7-6e5f-4a2b-8c1d-0e9f8a7b6c5d'
+    const big = (seq: number) => ({ s: 'logs', r: 0, b: 0, d: { event: 'api_request', loggedAt: LOGGED_AT, attributes: row(seq, { pad }) } })
+    // Two loads may take this outbox over at once. Were one to trim the head of k1 and send the rest under k1 first, the other's full
+    // k1 would be dropped as a repeat, and the trimmed rows with it. So neither sends any of k1.
+    const box = { v: 3, updatedAt: START - 120_000, resources, batches: [k1, k2], items: [big(1), big(2), big(3), kept(10, 1)] }
+    const { clock, posts } = world(on, { store: { 'outbox:gone': box } })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await clock.advance(TICK)
+    expect(posts.map(p => [keyOf(p), seqs(p)])).toEqual([[k2, [10]]])
+  })
+
+  test('a batch kept through a refused key (401) is kept under the key it was sent with, for a later load to send under it', withKey, async ($, on) => {
+    const { clock, posts, rig, sets } = world(on, { reply: () => ({ status: 401 }) })
+    await logRow($, rig, row(1))
+    await logRow($, rig, row(2))
+    await clock.advance(TICK)
+    await clock.advance(10 * TICK)
+    expect(posts.length).toBe(1)
+    const box = sets.filter(s => s.key.startsWith('outbox:')).at(-1)!.value as { v: number; batches: string[]; items: { s: string; b?: number }[] }
+    expect(box.batches).toEqual([keyOf(posts[0]!)])
+    expect(box.items.filter(i => i.s === 'logs').map(i => i.b)).toEqual([0, 0])
+    // A later load reads the outbox back and sends its batch under the same header.
+    const read = readOutbox({ ...box, updatedAt: 0 })!
+    const logs = read.items.filter(i => i.s === 'logs')
+    expect(logs.length).toBe(2)
+    expect(idempotencyKeyOf(logs, false)).toBe(keyOf(posts[0]!))
+  })
+
+  test('a batch formed keyless goes under the same header when a load with a key sends it', withKey, async ($, on) => {
+    const k = `5f0c3f8e-2b7a-4d2c-9a51-1d7c4b2e8f01.${whoHash(`${ORG} ${EMAIL}`)}`
+    const withEmail = (seq: number) => ({ s: 'logs', r: 0, b: 0, d: { event: 'api_request', loggedAt: LOGGED_AT, attributes: row(seq, { 'user.email': EMAIL }) } })
+    const box = { v: 3, updatedAt: START - 120_000, resources, batches: [k], items: [withEmail(1), withEmail(2)] }
+    const { clock, posts } = world(on, { store: { 'outbox:gone': box } })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await clock.advance(TICK)
+    expect(posts.map(p => [keyOf(p), seqs(p)])).toEqual([[k, [1, 2]]])
   })
 
   test('a stored key of the wrong shape is let go, and its row still goes, under a new key', withKey, async ($, on) => {
