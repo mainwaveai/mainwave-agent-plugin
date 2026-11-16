@@ -131,6 +131,9 @@ function redirectPlugin() {
   return dir
 }
 const redirect = redirectPlugin()
+// Removed however the run ends: a session that throws, or an interrupt, leaves nothing behind.
+process.on('exit', () => rmSync(redirect, { recursive: true, force: true }))
+process.on('SIGINT', () => process.exit(130))
 
 const server = createServer(async (req, res) => {
   const body = await readBody(req)
@@ -550,7 +553,6 @@ for (const [pass, details] of passes) {
   compare(pass, details, result)
 }
 server.close()
-rmSync(redirect, { recursive: true, force: true })
 
 if (problems.length) {
   // What each session itself said about the plugins, and what the plugin kept: enough to see why without --keep.
