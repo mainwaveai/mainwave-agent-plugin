@@ -24,7 +24,9 @@
 // The mock model answers each request after a different delay (300 to 900 ms), so a request paired with the wrong step, or timed
 // from the wrong start, lands outside the tolerance; and it refuses one request once as overloaded, so Claude Code retries it. The
 // session runs twice: once with prompts and tool details logged (OTEL_LOG_USER_PROMPTS, OTEL_LOG_TOOL_DETAILS), once with neither,
-// so both sides of those settings are compared.
+// so both sides of those settings are compared. The first runs in auto mode, so auto mode's classifier judges the command no rule
+// allows, and the mock blocks it. Claude Code logs no row for the classifier's requests, so the plugin cannot see them: the
+// exporter's spans of a request it logged no row for are a known difference, and the pass fails if the classifier asked nothing.
 //
 //   node tests/e2e/compare.mjs            # exit 0 when the copy matches the exporter and the keyless pass is coherent
 //   node tests/e2e/compare.mjs --keep     # keep the captures and the session's config folder, and print where
@@ -68,15 +70,26 @@ const METRIC_TIME_TOLERANCE_MS = 250
 const SESSION_COUNT_TOLERANCE_MS = 2_000
 
 // ── The mock model ───────────────────────────────────────────────────────────
-// The main loop's prompt names a script of tool calls, one per request; the subagent's prompt names its own. Every other request
+// The main loop's prompt names a script of tool calls, one per request; the subagent's prompt names its own. Auto mode's classifier
+// blocks the command meant to be refused and allows anything else it is asked about (such as the Agent call). Every other request
 // (a title, a summary) gets a short text answer. Each response's usage is distinct, so each request can be told apart by it.
 
+const REFUSED = 'curl -s -o /dev/null http://127.0.0.1:9/'
 let work = ''
 let messageId = 0
 const textOf = c => (typeof c === 'string' ? c : (c ?? []).map(b => (b?.type === 'text' ? b.text : '')).join(' '))
+/** Auto mode's classifier: a request outside the conversation (not streamed) whose instructions ask for a severity. */
+const isClassifier = req => !req.stream && textOf(req.system).includes('<severity>')
+/** What the classifier is asked about: the last line of the transcript it is shown. */
+const classifiedAction = req => textOf(req.messages?.at(-1)?.content).split('</transcript>')[0].trim().split('\n').at(-1) ?? ''
 function modelReply(req) {
   const id = `msg_e2e_${++messageId}`
   const usage = { input_tokens: 1200 + messageId, output_tokens: 20 + messageId, cache_read_input_tokens: 100, cache_creation_input_tokens: 10 }
+  // In either form the classifier reads (a severity against its thresholds, or a yes or no to blocking), at each of its stages.
+  if (isClassifier(req)) {
+    const text = classifiedAction(req).includes(REFUSED) ? '<block>yes</block><severity>100</severity>' : '<block>no</block><severity>0</severity>'
+    return { id, block: { type: 'text', text: `${text}<reason>e2e</reason>` }, stop: 'end_turn', usage }
+  }
   const first = textOf(req.messages?.[0]?.content)
   const tools = (req.tools ?? []).map(t => t?.name)
   const results = (req.messages ?? []).flatMap(m => (Array.isArray(m.content) ? m.content.filter(b => b?.type === 'tool_result') : []))
@@ -89,7 +102,8 @@ function modelReply(req) {
       call('Write', { file_path: join(work, 'a.txt'), content: 'one\ntwo\n' }),
       call('Edit', { file_path: join(work, 'a.txt'), old_string: 'two', new_string: 'three' }),
       call('Bash', { command: 'git -c user.name=e2e -c user.email=e2e@example.com commit -q --allow-empty -m e2e', description: 'Commit' }),
-      call('Bash', { command: 'touch refused.txt', description: 'Not allowed' }),
+      // No rule allows it, and auto mode lets no file command in the working folder through without asking: its classifier judges it.
+      call('Bash', { command: REFUSED, description: 'Not allowed' }),
       call('Agent', { description: 'Sub run', prompt: 'E2E_SUBTASK: run echo sub', subagent_type: 'general-purpose' }),
     ]
   }
@@ -217,9 +231,9 @@ const base = `http://127.0.0.1:${server.address().port}`
 
 /**
  * One session, its telemetry captured. `details` turns prompt and tool-detail logging on; `envBlock` false runs it without Mainwave's
- * env block, the plugin sending keyless.
+ * env block, the plugin sending keyless; `auto` runs it in auto mode.
  */
-async function session(details, envBlock) {
+async function session(details, envBlock, auto) {
   captured = { exporter: { logs: [], traces: [], metrics: [] }, plugin: { logs: [], traces: [], metrics: [] }, other: [] }
   messageId = 0
   overloaded = false
@@ -272,6 +286,7 @@ async function session(details, envBlock) {
     '--settings', settings,
     '--allowedTools', 'Bash(echo e2e),Bash(echo sub),Bash(git -c user.name=e2e -c user.email=e2e@example.com commit:*),Write,Edit,Agent',
     '--model', 'claude-haiku-5-5',
+    ...(auto ? ['--permission-mode', 'auto'] : []),
     '--debug-file', join(config, 'debug.log'),
   ]
 
@@ -367,7 +382,7 @@ function pointsOf(posts) {
 const problems = []
 
 /** Compares one session's two paths, adding what differs to `problems`, and prints what it found. */
-function compare(pass, details, { captured, run }) {
+function compare(pass, details, auto, { captured, run }) {
   const before = problems.length
   /** Known differences: what the plugin cannot reproduce, by what it is, with how often it was seen. */
   const known = new Map()
@@ -471,7 +486,15 @@ function compare(pass, details, { captured, run }) {
   }
   const exById = new Map(exporterSpans.map(s => [s.spanId, s]))
   const plById = new Map(pluginSpans.map(s => [s.spanId, s]))
-  for (const k of exSpans.keys()) if (!plSpans.has(k)) problems.push(`the exporter sent span ${k}, which the plugin did not`)
+  // A request Claude Code logs no row for (auto mode's classifier asks the model so) leaves the plugin nothing to rebuild it from.
+  const logged = new Set(exporterLogs.filter(r => ['api_request', 'api_error'].includes(r.attributes['event.name']?.v)).map(r => r.attributes.request_id?.v))
+  const unlogged = s => s.name === 'claude_code.llm_request' && !logged.has(s.attrs.request_id?.v)
+  for (const [k, s] of exSpans) {
+    if (plSpans.has(k)) continue
+    if (unlogged(s)) noteKnown(`traces: llm_request of a request Claude Code logs no row for (query_source_safe ${s.attrs.query_source_safe?.v})`)
+    else problems.push(`the exporter sent span ${k}, which the plugin did not`)
+  }
+  if (auto && !exporterSpans.some(s => unlogged(s) && s.attrs.query_source_safe?.v === 'auto_mode')) problems.push("no request of auto mode's classifier in the session")
   for (const k of plSpans.keys()) if (!exSpans.has(k)) problems.push(`the plugin sent span ${k}, which the exporter did not`)
   for (const name of ['claude_code.interaction', 'claude_code.llm_request', 'claude_code.tool', 'claude_code.tool.blocked_on_user', 'claude_code.tool.execution']) {
     if (![...exSpans.keys()].some(k => k.startsWith(`${name}|`) && plSpans.has(k))) problems.push(`no ${name} span was matched`)
@@ -695,13 +718,14 @@ function checkKeyless(pass, { captured, run }, reference) {
   for (let i = before; i < problems.length; i++) problems[i] = `${pass}: ${problems[i]}`
 }
 
-const passes = [['prompts and tool details logged', true, true], ['prompts and tool details not logged', false, true], ['no env block, sent keyless', false, false]]
+// The keyless pass is held to the second, which runs as it does: not in auto mode.
+const passes = [['prompts and tool details logged, auto mode', true, true, true], ['prompts and tool details not logged', false, true, false], ['no env block, sent keyless', false, false, false]]
 const results = []
-for (const [pass, details, envBlock] of passes) {
+for (const [pass, details, envBlock, auto] of passes) {
   console.log(`\n${pass}:`)
-  const result = await session(details, envBlock)
+  const result = await session(details, envBlock, auto)
   results.push(result)
-  if (envBlock) compare(pass, details, result)
+  if (envBlock) compare(pass, details, auto, result)
   else checkKeyless(pass, result, results[1].captured)
 }
 server.close()
