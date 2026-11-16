@@ -707,6 +707,26 @@ describe('without the beta, no row names a span: the plugin builds the trace (co
     // A row outside any turn ran in no span the plugin knows.
     expect(observeRow(r, row('retention_sweep', 200, {})).rowCtx).toBeUndefined()
   })
+
+  test('a prompt row folded into an open turn names that turn; a session title\'s row names nothing, its span a root', () => {
+    const r = coherent()
+    turnStart(r, { turnId: 't1', text: 'run it' }, 0)
+    observeRow(r, row('user_prompt', 1, { prompt: 'run it', prompt_length: '6' }))
+    const folded = observeRow(r, row('user_prompt', 5, { prompt: 'also this', prompt_length: '9' })).rowCtx
+    const title = observeRow(r, request(6, 77, { query_source: 'generate_session_title' }, ''))
+    const i = one(turnComplete(r, { turnId: 't1', durationMs: 10 }, 10).spans, 'interaction')
+    expect(folded).toEqual({ traceId: i.traceId, spanId: i.spanId })
+    expect(title.rowCtx).toBeUndefined()
+    expect(one(title.spans, 'llm_request').parentSpanId).toBeUndefined()
+  })
+
+  test("a call's decision row that names a span moves no trace outside a rebuilt turn", () => {
+    const r = coherent()
+    turnStart(r, { turnId: 't1', text: 'go' }, 0)
+    toolStart(r, { tool: 'Bash', tool_use_id: 'toolu_1', command: 'echo e2e' }, 10)
+    observeRow(r, row('tool_decision', 11, { decision: 'accept', source: 'config', tool_name: 'Bash', tool_use_id: 'toolu_1' }, BLOCKED))
+    expect(r.traceMap.size).toBe(0)
+  })
 })
 
 describe('with the beta on, a turn whose prompt row names no span (an SDK host\'s first turn): the plugin rebuilds it', () => {
@@ -796,11 +816,36 @@ describe('with the beta on, a turn whose prompt row names no span (an SDK host\'
     expect(req.rowCtx).toEqual({ traceId: TRACE, spanId: INTERACTION })
   })
 
-  test('a turn with no prompt row at all is mirrored as before: its requests in the open interaction, with ids of their own', () => {
+  test('a turn with no prompt row at all is mirrored as before: its main-loop requests in the open interaction, with ids of their own', () => {
     const r = traced()
     turnStart(r, { turnId: 't', text: 'go' }, 0)
-    const [main] = observeRow(r, request(10, 1201, { query_source: 'generate_session_title' }, '')).spans
+    stepStart(r, undefined, 'claude-haiku-5-5')
+    stepEnd(r, undefined, 5, { stopReason: 'end_turn', usage: usage(1201) }, 9)
+    const [main] = observeRow(r, request(10, 1201, {}, '')).spans
     expect(main!.parentSpanId).toBeUndefined()
     expect(main!.attributes['llm_request.context']).toBe('interaction')
+    expect(r.traceMap.size).toBe(0)
+  })
+
+  test("a rebuilt turn whose requests do name Claude Code's interaction: that span stands for the plugin's", () => {
+    const r = traced()
+    observeRow(r, row('user_prompt', 1, { prompt: 'go', prompt_length: '2' }))
+    turnStart(r, { turnId: 't1', text: 'go' }, 2)
+    stepStart(r, undefined, 'claude-haiku-5-5')
+    stepEnd(r, undefined, 5, { stopReason: 'end_turn', usage: usage(1201) }, 9)
+    const req = observeRow(r, request(10, 1201))
+    const i = one(turnComplete(r, { turnId: 't1', durationMs: 15 }, 16).spans, 'interaction')
+    const span = one(req.spans, 'llm_request')
+    expect([span.traceId, span.parentSpanId, span.attributes['llm_request.context']]).toEqual([i.traceId, i.spanId, 'interaction'])
+    expect(req.rowCtx).toEqual({ traceId: i.traceId, spanId: i.spanId })
+  })
+
+  test('once a prompt row has named its span, a later one that names none starts no rebuilt turn of its own', () => {
+    const r = traced()
+    observeRow(r, row('user_prompt', 1, { prompt: 'go', prompt_length: '2' }, INTERACTION))
+    turnStart(r, { turnId: 't1', text: 'go' }, 2)
+    turnComplete(r, { turnId: 't1', durationMs: 5 }, 10)
+    const held = observeRow(r, row('user_prompt', 20, { prompt: 'x', prompt_length: '1' }))
+    expect(held.rowCtx).toBeUndefined()
   })
 })
