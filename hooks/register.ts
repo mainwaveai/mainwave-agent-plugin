@@ -17,7 +17,7 @@ import { identityOf, isOrgId, mergeIdentity } from './identity.ts'
 import { add, collect, newMeter, type Meter } from './meter.ts'
 import type { CopiedRow } from './otlp.ts'
 import {
-  agentSpawned, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptSubmitted, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
+  agentSpawned, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
 } from './rebuild.ts'
 import { adopt, configure, enqueue, ensureTimer, finish, isCopying, snapshot } from './sender.ts'
 import { applyStamps, entrypointOf, filterStamps, PLUGIN_NAME, stripOwned } from './stamps.ts'
@@ -253,24 +253,31 @@ export async function sessionStart($: SessionStartParams[0], e: SessionStartPara
 
 /** A main-loop turn began: an interaction opens. */
 export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1], next: TurnStartParams[2]) {
+  let out: Emit | null = null
   try {
     const r = await rebuildOf($)
-    if (r !== null) await emit($, turnStart(r, e, await $.clock.now()))
+    if (r !== null) out = turnStart(r, e, await $.clock.now())
   } catch {
     // The turn's interaction is not rebuilt.
   }
-  return next(e)
+  const result = await next(e)
+  // Queued after the turn has gone on: the send queue never holds it.
+  if (out !== null) await emit($, out).catch(() => undefined)
+  return result
 }
 
 /** A turn ended: a main-loop interaction is sent. */
 export async function turnCompleteHook($: TurnCompleteParams[0], e: TurnCompleteParams[1], next: TurnCompleteParams[2]) {
+  let out: Emit | null = null
   try {
     const r = await rebuildOf($)
-    if (r !== null) await emit($, turnComplete(r, e, await $.clock.now()))
+    if (r !== null) out = turnComplete(r, e, await $.clock.now())
   } catch {
     // The turn's interaction is not rebuilt.
   }
-  return next(e)
+  const result = await next(e)
+  if (out !== null) await emit($, out).catch(() => undefined)
+  return result
 }
 
 /** One model request: its start, and its stop reason and usage once it is whole. The stream passes through untouched. */
@@ -324,10 +331,9 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
  */
 export async function commandHook($: CommandParams[0], e: CommandParams[1], next: CommandParams[2]) {
   let r: Rebuild | null = null
-  let flushed: Emit | null = null
   try {
     r = await rebuildOf($)
-    if (r !== null) flushed = commandStart(r, await $.clock.now())
+    if (r !== null) commandStart(r, await $.clock.now())
   } catch {
     r = null
   }
@@ -338,9 +344,9 @@ export async function commandHook($: CommandParams[0], e: CommandParams[1], next
     if (r !== null) {
       try {
         commandEnd(r, await $.clock.now())
-        if (flushed !== null) await emit($, flushed)
+        await emit($, takeReady(r))
       } catch {
-        // The command's interaction goes with what the rows say.
+        // The command's interaction goes with what the rows say, on the next sweep.
       }
     }
   }
@@ -348,13 +354,23 @@ export async function commandHook($: CommandParams[0], e: CommandParams[1], next
 
 /** A prompt submitted: one that runs no slash command sends the command waiting first. The prompt goes on untouched. */
 export async function promptHook($: PromptParams[0], e: PromptParams[1], next: PromptParams[2]) {
+  let r: Rebuild | null = null
+  let out: Emit | null = null
   try {
-    const r = await rebuildOf($)
-    if (r !== null) await emit($, promptSubmitted(r, e, await $.clock.now()))
+    r = await rebuildOf($)
+    if (r !== null) out = promptSubmitted(r, e, await $.clock.now())
+  } catch {
+    r = null
+  }
+  const result = await next(e)
+  // Queued after the prompt has gone on: the send queue never holds it. A dropped prompt starts no turn to take its command over.
+  try {
+    if (r !== null && result.drop !== undefined) out = { spans: [...(out?.spans ?? []), ...promptDropped(r, await $.clock.now()).spans], measures: [...(out?.measures ?? [])] }
+    if (out !== null) await emit($, out)
   } catch {
     // The command waiting goes on the next sweep.
   }
-  return next(e)
+  return result
 }
 
 /** A prompt goes on whatever the hook did; once it has gone on, its result stands. */

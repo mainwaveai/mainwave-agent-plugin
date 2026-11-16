@@ -5,7 +5,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import type { BuiltSpan } from '../hooks/otlp.ts'
 import {
-  agentSpawned, commandEnd, commandStart, commonOf, newRebuild, observeRow, parseTraceparent, promptSubmitted, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart,
+  agentSpawned, commandEnd, commandStart, commonOf, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, takeReady, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart,
   type Emit, type Rebuild, type RowIn, type Settings,
 } from '../hooks/rebuild.ts'
 import { ORG } from './rig.ts'
@@ -333,7 +333,8 @@ describe('slash commands', () => {
     commandStart(r, 100)
     observeRow(r, row('user_prompt', 101, { prompt: '/cost', prompt_length: '5' }, INTERACTION))
     commandEnd(r, 110)
-    const flushed = commandStart(r, 120)
+    commandStart(r, 120)
+    const flushed = takeReady(r)
     observeRow(r, row('user_prompt', 121, { prompt: '/context', prompt_length: '8' }, 'f00df00df00df00d'))
     commandEnd(r, 130)
     const later = sweep(r, 2_200, false)
@@ -388,6 +389,47 @@ describe('slash commands', () => {
     expect(sweep(r2, 2_200, false).spans[0]!.spanId).not.toBe(INTERACTION)
   })
 
+  test("a prompt row that started nothing a while ago is not the next command's", () => {
+    const r = rebuild()
+    observeRow(r, row('user_prompt', 10, { prompt: '<REDACTED>', prompt_length: '17' }, '1111111111111111'))
+    commandStart(r, 5_000)
+    observeRow(r, row('user_prompt', 5_001, { prompt: '<REDACTED>', prompt_length: '5' }, INTERACTION))
+    commandEnd(r, 5_010)
+    const [i] = sweep(r, 8_000, false).spans
+    expect([i!.spanId, i!.attributes['user_prompt_length']]).toEqual([INTERACTION, 5])
+  })
+
+  test('/cost then /exit at once: both are sent, the first even though the session ends inside the second', () => {
+    const r = rebuild()
+    commandStart(r, 100)
+    observeRow(r, row('user_prompt', 101, { prompt: '/cost', prompt_length: '5' }, INTERACTION))
+    commandEnd(r, 110)
+    commandStart(r, 120)
+    observeRow(r, row('user_prompt', 121, { prompt: '/exit', prompt_length: '5' }, 'f00df00df00df00d'))
+    expect(sweep(r, 125, true).spans.map(s => [s.attributes['user_prompt'], s.attributes['interaction.sequence']])).toEqual([['/cost', 1], ['/exit', 2]])
+  })
+
+  test('a command handed to a turn waits for that turn past the usual wait; one whose prompt is dropped goes alone', () => {
+    const r = rebuild()
+    commandStart(r, 100)
+    observeRow(r, row('user_prompt', 101, { prompt: '/review', prompt_length: '7' }, INTERACTION))
+    commandEnd(r, 110)
+    promptSubmitted(r, { command: { name: 'review', args: '' } }, 111)
+    expect(sweep(r, 5_000, false).spans).toEqual([])
+    expect(turnStart(r, { turnId: 't', text: 'Review this change' }, 5_001).spans).toEqual([])
+    expect(r.interaction!.sequence).toBe(1)
+    const r2 = rebuild()
+    commandStart(r2, 100)
+    commandEnd(r2, 110)
+    promptSubmitted(r2, { command: { name: 'review', args: '' } }, 111)
+    expect(promptDropped(r2, 112).spans.length).toBe(1)
+    const r3 = rebuild()
+    commandStart(r3, 100)
+    commandEnd(r3, 110)
+    promptSubmitted(r3, { command: { name: 'review', args: '' } }, 111)
+    expect(sweep(r3, 30_200, false).spans.length).toBe(1)
+  })
+
   test('a command still open when the session ends (/exit) ends with it', () => {
     const r = rebuild()
     commandStart(r, 100)
@@ -403,6 +445,18 @@ describe('the request context', () => {
     turnStart(r, { turnId: 't', text: 'go' }, 0)
     observeRow(r, row('user_prompt', 1, { prompt: 'go', prompt_length: '2' }, INTERACTION))
     const [aux] = observeRow(r, request(10, 77, { query_source: 'generate_session_title' }, '')).spans
+    expect(aux!.attributes['llm_request.context']).toBe('standalone')
+  })
+})
+
+describe('hosts that carry no trace on their rows (the SDK), and those that do', () => {
+  test('once a prompt row has named its span, a spanless request before the next prompt row is standalone', () => {
+    const r = rebuild()
+    turnStart(r, { turnId: 't1', text: 'go' }, 0)
+    observeRow(r, row('user_prompt', 1, { prompt: 'go', prompt_length: '2' }, INTERACTION))
+    turnComplete(r, { turnId: 't1', durationMs: 5 }, 10)
+    turnStart(r, { turnId: 't2', text: 'next' }, 20)
+    const [aux] = observeRow(r, request(21, 88, { query_source: 'generate_session_title' }, '')).spans
     expect(aux!.attributes['llm_request.context']).toBe('standalone')
   })
 })
