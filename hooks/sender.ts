@@ -396,6 +396,9 @@ export async function flush($: EngineInterface, opts: { timeoutMs: number | (() 
   if (sending || !isCopying() || stopped || queue.length === 0) return
   sending = true
   try {
+    // Nothing that may go now (every signal waiting, or every record's organization and email refused): no request, and no settings read.
+    const at = await $.clock.now()
+    if (!SIGNALS.some(sig => ready(sig, at) && queue.some(item => item.s === sig && sendable(item)))) return
     if (await repositoryNamesKey($)) return
     const limitNow = () => (typeof opts.timeoutMs === 'function' ? opts.timeoutMs() : opts.timeoutMs)
     if (opts.together) {

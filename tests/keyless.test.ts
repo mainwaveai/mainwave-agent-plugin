@@ -162,6 +162,17 @@ describe('a session without the env block, sending keyless', () => {
     expect(lastOutbox(store.sets)!.items.length).toBe(2)
   })
 
+  test('with every record refused, a tick makes no request and reads no settings', keyless, async ($, on) => {
+    const { clock, posts, rig } = world(on, { refused: { [ORG]: 'unclaimed' } })
+    await row($, 'user_prompt', { prompt: 'one', prompt_length: '3' })
+    await clock.advance(TICK)
+    const reads = rig.reads.length
+    await row($, 'user_prompt', { prompt: 'two', prompt_length: '3' })
+    await clock.advance(5 * TICK)
+    expect(posts.length).toBe(1)
+    expect(rig.reads.length).toBe(reads)
+  })
+
   test("a request refused as malformed (400) drops that organization and email's batch alone", keyless, async ($, on) => {
     const { clock, seen } = world(on, {
       store: { 'outbox:old': leftBehind([keptRow(ORG_B, EMAIL_B, 1)]) },

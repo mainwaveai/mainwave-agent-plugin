@@ -56,14 +56,20 @@ export function mergeIdentity(held: RowIdentity, seen: RowIdentity): RowIdentity
  */
 const EMAIL_OVERRIDES = ['kiro.user.email']
 
+/** Keyless ingest's own bound on an email: 320 bytes of UTF-8. */
+const ROUTED_EMAIL_BYTES = 320
+
 /**
  * Who a record is routed to without a key: its own `organization.id` and `user.email`, as one string, when both fit their shapes and
  * nothing would override the email; undefined otherwise. Keyless ingest reads the pair from each record, span and data point (never
- * the resource) and takes one pair per request.
+ * the resource) and takes one pair per request. Stricter than keyless ingest where the two differ, so a record it would refuse never
+ * holds up a batch: the email within 320 bytes, and no U+0085 (a space to keyless ingest, not to JavaScript's `\s`).
  */
 export function routingIdentityOf(attributes: Readonly<Record<string, unknown>>): string | undefined {
   const own = (k: string) => Object.prototype.hasOwnProperty.call(attributes, k)
   if (EMAIL_OVERRIDES.some(own)) return undefined
   const { organizationId, email } = identityOf(attributes)
-  return organizationId !== undefined && email !== undefined ? `${organizationId} ${email}` : undefined
+  if (organizationId === undefined || email === undefined) return undefined
+  if (email.includes('\u0085') || new TextEncoder().encode(email).length > ROUTED_EMAIL_BYTES) return undefined
+  return `${organizationId} ${email}`
 }

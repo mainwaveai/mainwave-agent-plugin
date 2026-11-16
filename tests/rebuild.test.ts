@@ -600,6 +600,47 @@ describe('without the beta, no row names a span: the plugin builds the trace (co
     expect(nestedReq.attributes['parent_agent_id']).toBe('a1')
   })
 
+  test('a loop no Agent call starts (a forked skill) stays in one trace, under the interaction open when it was first seen', () => {
+    const r = coherent()
+    const out: Emit[] = []
+    out.push(turnStart(r, { turnId: 't1', text: 'go' }, 0))
+    for (const [id, at] of [['toolu_f1', 10], ['toolu_f2', 20]] as const) {
+      toolStart(r, { tool: 'Read', tool_use_id: id, agentId: 'f1', file_path: '/w/a.ts' }, at)
+      out.push(observeRow(r, row('tool_result', at + 2, { tool_name: 'Read', tool_use_id: id, success: 'true', agent_id: 'f1' })))
+      out.push(toolEnd(r, id, { result: {} }, at + 3))
+    }
+    stepStart(r, 'f1', 'claude-haiku-5-5')
+    out.push(stepEnd(r, 'f1', 25, { stopReason: 'end_turn', usage: usage(1600) }, 28))
+    out.push(observeRow(r, request(29, 1600, { agent_id: 'f1', query_source: 'agent:custom' }, '')))
+    out.push(turnComplete(r, { turnId: 't1', durationMs: 40 }, 40))
+    const { spans } = all(...out)
+    const i = one(spans, 'interaction')
+    expect(new Set(spans.map(s => s.traceId))).toEqual(new Set([i.traceId]))
+    expect(named(spans, 'tool').map(s => s.parentSpanId)).toEqual([i.spanId, i.spanId])
+    expect(one(spans, 'llm_request').parentSpanId).toBe(i.spanId)
+  })
+
+  test('a call that starts several agents (a workflow) has one run, the parent of every one of them', () => {
+    const r = coherent()
+    const out: Emit[] = []
+    out.push(turnStart(r, { turnId: 't1', text: 'go' }, 0))
+    toolStart(r, { tool: 'Workflow', tool_use_id: 'toolu_w' }, 10)
+    out.push(observeRow(r, row('tool_decision', 11, { decision: 'accept', source: 'config', tool_name: 'Workflow', tool_use_id: 'toolu_w' })))
+    agentSpawned(r, 'toolu_w', 'w1', undefined)
+    agentSpawned(r, 'toolu_w', 'w2', undefined)
+    for (const [agent, input] of [['w1', 1700], ['w2', 1701]] as const) {
+      stepStart(r, agent, 'claude-haiku-5-5')
+      out.push(stepEnd(r, agent, 12, { stopReason: 'end_turn', usage: usage(input) }, 15))
+      out.push(observeRow(r, request(16, input, { agent_id: agent, query_source: 'agent:custom' }, '')))
+    }
+    out.push(observeRow(r, row('tool_result', 30, { tool_name: 'Workflow', tool_use_id: 'toolu_w', success: 'true' })))
+    out.push(toolEnd(r, 'toolu_w', { result: {} }, 31))
+    out.push(turnComplete(r, { turnId: 't1', durationMs: 40 }, 40))
+    const { spans } = all(...out)
+    const run = one(spans, 'tool.execution')
+    expect(named(spans, 'llm_request').map(s => s.parentSpanId)).toEqual([run.spanId, run.spanId])
+  })
+
   test('a request whose span goes after its turn has ended still sits under its interaction', () => {
     const r = coherent()
     turnStart(r, { turnId: 't1', text: 'go' }, 0)

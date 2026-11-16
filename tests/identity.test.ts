@@ -63,6 +63,8 @@ describe('routingIdentityOf', () => {
     ['an organization not of its shape', { 'organization.id': 'org-1', 'user.email': 'a@example.com' }, undefined],
     ['an email not of its shape', { 'organization.id': ORG, 'user.email': 'a@example.com\n' }, undefined],
     ['a key that would override the stored email', { 'organization.id': ORG, 'user.email': 'a@example.com', 'kiro.user.email': 'b@example.com' }, undefined],
+    ['an email past 320 bytes of UTF-8, though under 254 characters', { 'organization.id': ORG, 'user.email': `${'é'.repeat(64)}@${'ü'.repeat(120)}.com` }, undefined],
+    ['an email with U+0085, a space to the collector', { 'organization.id': ORG, 'user.email': 'a@exa\u0085mple.com' }, undefined],
   ]
   for (const [name, attributes, want] of cases) test(name, () => expect(routingIdentityOf(attributes)).toBe(want))
 })
