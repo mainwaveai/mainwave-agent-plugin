@@ -18,6 +18,19 @@
 // Every span and measure starts with the attributes Claude Code puts first on each of its records (the session's identity, the
 // organization's resource attributes, the repository): the attributes of the latest row, up to its `event.name`.
 //
+// Without the beta, Claude Code sends no spans and its rows name none, so there is no trace to mirror: the rebuild then makes one
+// itself ("coherent" mode). Each interaction is the root of a trace the plugin starts as the turn (or the slash command) starts; the
+// turn's model requests and tool calls are its children, and a subagent's requests and tool calls are children of its Agent call's
+// execution, whose id the plugin makes as the subagent starts. The same tree as above, every id the plugin's own. Coherent mode holds
+// while the beta is off and no row has named a span; once one has, the rebuild mirrors the rows again, as above.
+//
+// With the beta on, a turn whose prompt row names no span is rebuilt the same way: Claude Code did not trace it (the first turn of a
+// session an SDK host drives, where the beta arrives with the organization's managed settings after the turn has begun), and its
+// exporter sends each request and each tool call as a trace of its own, with no interaction. The plugin starts the interaction, puts
+// the turn's requests and calls under it, and moves each call's trace (its decision's, its subagent's, a skill's) onto the
+// interaction's, keeping the span ids the rows name. In both modes the copied rows carry the ids of the span they ran in, as Claude
+// Code's rows do when it traces (`rowCtx`).
+//
 // Nothing here waits or throws on purpose: a record it cannot pair is sent with what it has, after a short wait (`sweep`).
 
 import type { TelemetryAttribute } from 'claude-code'
@@ -41,21 +54,35 @@ export type Settings = {
   traceparent?: Ctx
   /** The longest string an attribute keeps (`OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT`, else `OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT`). */
   valueLengthLimit?: number
+  /**
+   * Claude Code's enhanced telemetry beta is on (`CLAUDE_CODE_ENHANCED_TELEMETRY_BETA`, else `ENABLE_ENHANCED_TELEMETRY_BETA`): it
+   * traces, and its rows name their spans. Off, the rebuild builds the trace itself (coherent mode).
+   */
+  claudeTraces: boolean
 }
 
 /** What one event produced: finished spans, and additions to counters. */
 export type Emit = { spans: BuiltSpan[]; measures: Measure[] }
 
-type Prompt = { ctx?: Ctx; text: TelemetryAttribute; length: number; atMs: number }
-type Interaction = { turnId: string; sequence: number; prompt?: Prompt; ctx?: Ctx; text: string }
-/** A slash command that runs without a model turn (`/plugins`, `/cost`): an interaction of its own, as Claude Code counts it. */
-type Command = { sequence: number; startMs: number; endMs?: number; prompt?: Prompt; promptAtMs?: number; toTurn?: true }
+/** A prompt row: its span, or, where it names none, the ids the plugin gives the interaction it starts (`own`). */
+type Prompt = { ctx?: Ctx; own?: Ctx; text: TelemetryAttribute; length: number; atMs: number }
+/** A main-loop turn. `rebuilt`: the beta is on, but its prompt row named no span, so the plugin builds its trace. */
+type Interaction = { turnId: string; sequence: number; prompt?: Prompt; ctx?: Ctx; text: string; rebuilt?: true }
+/**
+ * A slash command that runs without a model turn (`/plugins`, `/cost`): an interaction of its own, as Claude Code counts it. In
+ * coherent mode, `ctx` is the interaction's, made as the command starts.
+ */
+type Command = { sequence: number; startMs: number; endMs?: number; prompt?: Prompt; promptAtMs?: number; toTurn?: true; ctx?: Ctx }
+/** Where a span sits in coherent mode: its trace, and its parent's span id (none for a root). */
+type Home = { traceId?: string; parentId?: string }
+/** A request's row, with where it sits in coherent mode as the row came: under the interaction, under its Agent call's run, or a root. */
+type Req = RowIn & { home?: { traceId: string; parentId?: string; context: 'interaction' | 'tool' | 'standalone' } }
 
 /** A prompt row of a slash command: its text starts with `/`, or is redacted, so nothing says it is not. */
 const slashPrompt = (p: Prompt) => typeof p.text !== 'string' || p.text === '<REDACTED>' || p.text.startsWith('/')
 type Step = { loop: string; startMs: number; endMs: number; stopReason: string | null; usage: StepUsage | null }
 type StepUsage = { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }
-type Waiting = { row: RowIn; heldAtMs: number }
+type Waiting = { row: Req; heldAtMs: number }
 type Tool = {
   id: string
   name: string
@@ -65,9 +92,19 @@ type Tool = {
   spanId: string
   endMs?: number
   isError?: boolean
-  decision?: { ctx?: Ctx; decision: string; source?: string; atMs: number }
+  /** The permission decision; `own`, the span id the plugin gives it where its row names none and the plugin builds the trace. */
+  decision?: { ctx?: Ctx; own?: string; decision: string; source?: string; atMs: number }
   result?: { ctx?: Ctx; success?: boolean; error?: TelemetryAttribute; atMs: number }
   spawned?: string
+  /** Started in a rebuilt turn: the trace Claude Code started for it is moved onto the interaction's. */
+  rebuilt?: true
+  /**
+   * Set when the call started in coherent mode: the trace and parent its spans take. A subagent's call whose Agent call is not known
+   * yet takes its subagent's when its spans go.
+   */
+  home?: Home
+  /** In coherent mode, the span id of the call's run, made when it first starts a subagent: every subagent it starts sits under it. */
+  execId?: string
   /** The tool span and its children are sent; an Agent call's execution may wait for its subagent to name it. */
   sent: boolean
   execWaits: boolean
@@ -87,6 +124,8 @@ export type Rebuild = {
   ready: Emit
   /** Whether a prompt row has named its interaction's span: once one has, the host carries the trace onto its rows. */
   sawPromptSpan: boolean
+  /** Whether any row has named a span: once one has, coherent mode is over. */
+  sawSpan: boolean
   /** A `user_prompt` row seen before its turn began. */
   heldPrompt?: Prompt
   interactionIds: Set<string>
@@ -99,8 +138,21 @@ export type Rebuild = {
   /** A subagent's id, by the Agent call that started it, and the agent that started each subagent. */
   agentTool: Map<string, string>
   parentAgent: Map<string, string>
-  /** The span id of the Agent call's execution, as its subagent's rows name it. */
+  /** The span id of the Agent call's execution, as its subagent's rows name it, or as coherent mode made it. */
   execOfAgent: Map<string, string>
+  /** In coherent mode, each subagent's trace and its Agent call's execution span: the parent of its requests and tool calls. */
+  agentCtx: Map<string, Ctx>
+  /**
+   * In coherent mode, each loop with an agent id no Agent call is known to have started (a forked skill, a workflow's agent, or a
+   * subagent seen before its spawn): where it sits, as first seen, so the loop's work stays in one trace.
+   */
+  looseAgents: Map<string, Home>
+  /** In a rebuilt turn, each trace Claude Code started for one of its calls, and the interaction's trace it is moved onto. */
+  traceMap: Map<string, string>
+  /** In a rebuilt turn whose requests do name Claude Code's interaction after all: that span, and the plugin's interaction for it. */
+  spanAlias: Map<string, string>
+  /** The context the row being read ran in, as the plugin's spans have it: set while a row is read, for `observeRow` to answer. */
+  rowCtx?: Ctx
   /** When the session started, while its count waits for the first row to name the session. */
   sessionCountAt?: number
   /** New span and trace ids: random hex of the given length. */
@@ -132,8 +184,39 @@ export function randomHex(hexLength: 16 | 32): string {
 export function newRebuild(settings: Settings, mint: Rebuild['mint'] = randomHex): Rebuild {
   return {
     settings, common: {}, sequence: 0, interactionIds: new Set(), knownIds: new Set(), loopModel: new Map(),
-    steps: [], waiting: [], tools: new Map(), ready: { spans: [], measures: [] }, sawPromptSpan: false, agentTool: new Map(), parentAgent: new Map(), execOfAgent: new Map(), mint,
+    steps: [], waiting: [], tools: new Map(), ready: { spans: [], measures: [] }, sawPromptSpan: false, sawSpan: false, agentTool: new Map(), parentAgent: new Map(),
+    execOfAgent: new Map(), agentCtx: new Map(), looseAgents: new Map(), traceMap: new Map(), spanAlias: new Map(), mint,
   }
+}
+
+/** Whether the rebuild makes the trace itself: Claude Code does not trace, and no row has named a span. */
+export const isCoherent = (r: Rebuild): boolean => !r.settings.claudeTraces && !r.sawSpan
+
+const mintCtx = (r: Rebuild): Ctx => ({ traceId: r.mint(32), spanId: r.mint(16) })
+
+/** Whether the plugin builds the trace of the work under way: in coherent mode, or in a rebuilt turn. */
+const buildsTrace = (r: Rebuild): boolean => isCoherent(r) || r.interaction?.rebuilt === true
+
+/** A trace id as the plugin sends it: a rebuilt turn's call's trace moved onto its interaction's. */
+const retrace = (r: Rebuild, traceId: string): string => r.traceMap.get(traceId) ?? traceId
+/** A span id a row names, as the plugin sends it: a rebuilt turn's interaction for Claude Code's. */
+const respan = (r: Rebuild, spanId: string): string => r.spanAlias.get(spanId) ?? spanId
+
+/** In coherent mode, the context the main loop's work runs in now: the open turn's interaction, or the slash command's. */
+const openCtx = (r: Rebuild): Ctx | undefined => r.interaction?.ctx ?? r.command?.ctx
+
+/**
+ * Where a loop no Agent call is known to have started sits: under the interaction open when it was first seen, or, with none open, a
+ * trace of its own. Settled once per loop.
+ */
+function looseHome(r: Rebuild, agentId: string): { traceId: string; parentId?: string } {
+  let home = r.looseAgents.get(agentId)
+  if (home === undefined) {
+    const open = openCtx(r)
+    home = open ? { traceId: open.traceId, parentId: open.spanId } : { traceId: r.mint(32) }
+    r.looseAgents.set(agentId, home)
+  }
+  return home as { traceId: string; parentId?: string }
 }
 
 const none = (): Emit => ({ spans: [], measures: [] })
@@ -194,10 +277,31 @@ const durationOf = (startMs: number, endMs: number) => Math.max(0, Math.round(en
 
 /**
  * Reads one collector row: the common attributes, the ids it names, and the request, decision or result it reports; and sends any
- * Agent call's execution the row has just named.
+ * Agent call's execution the row has just named. Answers too the context the row ran in, as the plugin's spans have it (`rowCtx`):
+ * the row's own span, its trace moved where a rebuilt turn moves it; or, where the row names none and the plugin builds the trace,
+ * the span it ran in (the interaction, a subagent's Agent call's run, a decision's own). None where neither applies.
  */
-export function observeRow(r: Rebuild, row: RowIn): Emit {
-  return merge(readRow(r, row), namedExecutions(r))
+export function observeRow(r: Rebuild, row: RowIn): Emit & { rowCtx?: Ctx } {
+  r.rowCtx = undefined
+  const out = merge(readRow(r, row), namedExecutions(r))
+  const rowCtx = r.rowCtx ?? contextOfRow(r, row)
+  r.rowCtx = undefined
+  return rowCtx ? { ...out, rowCtx } : out
+}
+
+/** The span a row ran in, where the row does not say and nothing more particular (a prompt, a decision) has said either. */
+function contextOfRow(r: Rebuild, row: RowIn): Ctx | undefined {
+  const ctx = validCtx(row.span)
+  if (ctx) return { traceId: retrace(r, ctx.traceId), spanId: respan(r, ctx.spanId) }
+  if (!buildsTrace(r)) return undefined
+  // A request outside the main loop and its subagents (a session title, a summary) ran in no span: its own is a root.
+  if ((row.event === 'api_request' || row.event === 'api_error') && !hasStep(row)) return undefined
+  const agentId = str(row.attributes['agent_id'])
+  if (agentId === undefined) return openCtx(r)
+  const agent = r.agentCtx.get(agentId)
+  if (agent) return agent
+  const loose = r.looseAgents.get(agentId)
+  return loose?.traceId !== undefined && loose.parentId !== undefined ? { traceId: loose.traceId, spanId: loose.parentId } : undefined
 }
 
 function readRow(r: Rebuild, row: RowIn): Emit {
@@ -226,6 +330,7 @@ function sessionCount(r: Rebuild): Emit | undefined {
 function readRowEvent(r: Rebuild, row: RowIn): Emit {
   const a = row.attributes
   const ctx = validCtx(row.span)
+  if (ctx) r.sawSpan = true
   const agentId = str(a['agent_id'])
   // A subagent's model requests are logged inside the Agent call's run: their span is that run's. Other rows of a subagent may be
   // logged inside another span (a permission decision, a hook), so only a request names it.
@@ -242,11 +347,26 @@ function readRowEvent(r: Rebuild, row: RowIn): Emit {
         r.sawPromptSpan = true
       }
       const it = r.interaction
-      if (it && !it.prompt && (promptFits(prompt, it.text) || (ctx !== undefined && it.ctx?.spanId === ctx.spanId))) it.prompt = prompt
-      else if (!it && r.command && !r.command.prompt && slashPrompt(prompt)) {
-        r.command.prompt = prompt
-        r.command.promptAtMs = row.atMs
+      const forTurn = it !== undefined && !it.prompt && (promptFits(prompt, it.text) || (ctx !== undefined && it.ctx?.spanId === ctx.spanId))
+      const forCommand = !forTurn && it === undefined && r.command !== undefined && !r.command.prompt && slashPrompt(prompt)
+      if (ctx) r.traceMap.delete(ctx.traceId)
+      // A prompt row that names no span: the interaction it starts is the plugin's to build, with these ids (the open turn's or
+      // command's, where the plugin has made them already). Only a row a turn or a command takes, or one with none open, which may
+      // yet start one: with the beta on, only while no prompt row has named a span (the untraced turn is a session's first). A row
+      // folded into an open turn, or one a hook blocks, starts nothing.
+      const mayStart = it === undefined && (isCoherent(r) || !r.sawPromptSpan)
+      if (!ctx && (forTurn || forCommand || mayStart)) prompt.own = (forTurn ? it!.ctx : forCommand ? r.command!.ctx : undefined) ?? mintCtx(r)
+      if (forTurn) {
+        it!.prompt = prompt
+        if (!ctx && it!.ctx === undefined) {
+          it!.ctx = prompt.own
+          if (!isCoherent(r)) it!.rebuilt = true
+        }
+      } else if (forCommand) {
+        r.command!.prompt = prompt
+        r.command!.promptAtMs = row.atMs
       } else r.heldPrompt = prompt
+      r.rowCtx = ctx ?? prompt.own ?? (buildsTrace(r) ? openCtx(r) : undefined)
       return none()
     }
     case 'tool_decision': {
@@ -254,7 +374,15 @@ function readRowEvent(r: Rebuild, row: RowIn): Emit {
       if (ctx) r.knownIds.add(ctx.spanId)
       const tool = id ? r.tools.get(id) : undefined
       const decision = str(a['decision']) ?? 'unknown'
-      if (tool) tool.decision = { ctx, decision, source: str(a['source']), atMs: row.atMs }
+      const home = tool ? homeOfTool(r, tool) : undefined
+      // Where the plugin builds the trace: a decision whose row names no span gets an id of its own, the row with it; one that names
+      // its span (a rebuilt turn) keeps it, and the trace Claude Code started for the call is moved onto the interaction's.
+      const own = tool && home?.traceId !== undefined && !ctx ? r.mint(16) : undefined
+      if (tool?.rebuilt && ctx && home?.traceId !== undefined && ctx.traceId !== home.traceId && ctx.traceId !== r.settings.traceparent?.traceId) {
+        r.traceMap.set(ctx.traceId, home.traceId)
+      }
+      if (own !== undefined) r.rowCtx = { traceId: home!.traceId!, spanId: own }
+      if (tool) tool.decision = { ctx, ...(own !== undefined ? { own } : {}), decision, source: str(a['source']), atMs: row.atMs }
       const name = str(a['tool_name'])
       if (name && CODE_EDIT_TOOLS.includes(name)) {
         const path = tool?.input['file_path'] ?? tool?.input['notebook_path']
@@ -286,6 +414,14 @@ function readRowEvent(r: Rebuild, row: RowIn): Emit {
 /** A main-loop request's row names the interaction it belongs to: kept for a turn whose prompt row never came. */
 function learnInteraction(r: Rebuild, row: RowIn, ctx: Ctx | undefined) {
   if (!ctx || row.attributes['agent_id'] !== undefined || metricQuerySource(row.attributes['query_source']) !== 'main') return
+  // A rebuilt turn whose request names Claude Code's interaction after all: that interaction is the plugin's, ids and trace.
+  const it = r.interaction
+  if (it?.rebuilt && it.ctx && ctx.spanId !== it.ctx.spanId && ctx.traceId !== r.settings.traceparent?.traceId) {
+    r.traceMap.set(ctx.traceId, it.ctx.traceId)
+    r.spanAlias.set(ctx.spanId, it.ctx.spanId)
+    r.interactionIds.add(it.ctx.spanId)
+    return
+  }
   if (r.interaction && !r.interaction.ctx && !r.interaction.prompt?.ctx) {
     r.interaction.ctx = ctx
     r.interactionIds.add(ctx.spanId)
@@ -339,8 +475,29 @@ const sameUsage = (u: StepUsage | null, a: RowIn['attributes']) =>
   u !== null && u.input_tokens === num(a['input_tokens']) && u.output_tokens === num(a['output_tokens'])
   && u.cache_read_input_tokens === (num(a['cache_read_tokens']) ?? 0) && u.cache_creation_input_tokens === (num(a['cache_creation_tokens']) ?? 0)
 
+/**
+ * In coherent mode, where a request sits, read as its row comes (its span may go later, after the turn has ended): a subagent's under
+ * its Agent call's run, the main loop's under the interaction open now. Any other request (a session title, a summary, a classifier)
+ * is a root, as Claude Code's exporter sends it when it traces; so is a main-loop request with no interaction open. A loop no Agent
+ * call is known to have started sits where it was first seen (`looseHome`).
+ */
+function homeOf(r: Rebuild, row: RowIn): Req['home'] {
+  if (!buildsTrace(r) || validCtx(row.span) !== undefined || !hasStep(row)) return undefined
+  const agentId = str(row.attributes['agent_id'])
+  if (agentId !== undefined) {
+    const agent = r.agentCtx.get(agentId)
+    if (agent) return { traceId: agent.traceId, parentId: agent.spanId, context: 'tool' }
+    const loose = looseHome(r, agentId)
+    return { ...loose, context: loose.parentId !== undefined ? 'tool' : 'standalone' }
+  }
+  const open = openCtx(r)
+  return open ? { traceId: open.traceId, parentId: open.spanId, context: 'interaction' } : undefined
+}
+
 /** Pairs a request's row with its step result, or holds it a moment for the step to finish. */
-function pairRequest(r: Rebuild, row: RowIn): Emit {
+function pairRequest(r: Rebuild, rowIn: RowIn): Emit {
+  const home = homeOf(r, rowIn)
+  const row: Req = home ? { ...rowIn, home } : rowIn
   if (!hasStep(row)) return { spans: [llmSpan(r, row, undefined)], measures: [] }
   const loop = loopOf(row.attributes['agent_id'])
   const i = r.steps.findIndex(s => s.loop === loop && (row.event === 'api_error' ? s.usage === null : sameUsage(s.usage, row.attributes)))
@@ -375,9 +532,10 @@ export function stepEnd(r: Rebuild, agentId: string | undefined, startMs: number
 }
 
 /** One `claude_code.llm_request`, as Claude Code ends it. */
-function llmSpan(r: Rebuild, row: RowIn, step: Step | undefined): BuiltSpan {
+function llmSpan(r: Rebuild, row: Req, step: Step | undefined): BuiltSpan {
   const a = row.attributes
-  const parent = validCtx(row.span)
+  const named = validCtx(row.span)
+  const parent = named ? { traceId: named.traceId, spanId: respan(r, named.spanId) } : row.home?.parentId !== undefined ? { traceId: row.home.traceId, spanId: row.home.parentId } : undefined
   const failed = row.event === 'api_error'
   const endMs = row.atMs
   const startMs = Math.min(step?.startMs ?? endMs - (num(a['duration_ms']) ?? 0), endMs)
@@ -387,7 +545,9 @@ function llmSpan(r: Rebuild, row: RowIn, step: Step | undefined): BuiltSpan {
   // interaction's, or none. A row with no span ran outside both, unless the host carries no trace onto its rows at all (one that
   // drives Claude Code through its SDK): there the open interaction has no span of its own either, and the plugin's state says which.
   const traceless = !r.sawPromptSpan && r.interaction !== undefined && r.interaction.prompt?.ctx === undefined && r.interaction.ctx === undefined
-  const context = parent !== undefined
+  const context = row.home !== undefined
+    ? row.home.context
+    : parent !== undefined
     ? (r.interactionIds.has(parent.spanId) ? 'interaction' : 'tool')
     : traceless ? (agentId !== undefined ? 'tool' : 'interaction') : 'standalone'
   const status = num(a['status_code'])
@@ -395,7 +555,7 @@ function llmSpan(r: Rebuild, row: RowIn, step: Step | undefined): BuiltSpan {
   const attempt = num(a['attempt']) ?? 1
   const stop = step?.stopReason ?? undefined
   return {
-    traceId: parent?.traceId ?? r.interaction?.prompt?.ctx?.traceId ?? r.mint(32),
+    traceId: retrace(r, parent?.traceId ?? row.home?.traceId ?? r.interaction?.prompt?.ctx?.traceId ?? r.mint(32)),
     spanId: r.mint(16),
     ...(parent ? { parentSpanId: parent.spanId } : {}),
     name: 'claude_code.llm_request',
@@ -452,7 +612,14 @@ export function turnStart(r: Rebuild, e: { turnId: string; text: string; agentId
   r.command = undefined
   if (command === undefined) r.sequence += 1
   const held = command?.prompt ?? (r.heldPrompt && promptFits(r.heldPrompt, e.text) ? r.heldPrompt : undefined)
-  r.interaction = { turnId: e.turnId, sequence: command?.sequence ?? r.sequence, text: e.text, ...(held ? { prompt: held } : {}) }
+  // In coherent mode the interaction's trace starts now (a command the turn takes over has started it already). With the beta on, a
+  // turn whose prompt row named no span is rebuilt, with the ids the plugin gave that row.
+  const own = held && !held.ctx ? held.own : undefined
+  const ctx = command?.ctx ?? own ?? (isCoherent(r) ? mintCtx(r) : undefined)
+  const rebuilt = !isCoherent(r) && command?.ctx === undefined && own !== undefined
+  r.interaction = {
+    turnId: e.turnId, sequence: command?.sequence ?? r.sequence, text: e.text, ...(held ? { prompt: held } : {}), ...(ctx ? { ctx } : {}), ...(rebuilt ? { rebuilt: true as const } : {}),
+  }
   r.heldPrompt = undefined
   return flushed
 }
@@ -466,9 +633,10 @@ export function commandStart(r: Rebuild, nowMs: number): void {
   // Kept for the next hook or sweep, not handed back: a command like `/exit` may end the session before its own hook returns.
   r.ready = merge(r.ready, endCommand(r, nowMs))
   r.sequence += 1
-  r.command = { sequence: r.sequence, startMs: nowMs }
   const held = r.heldPrompt
-  if (held && slashPrompt(held) && nowMs - held.atMs <= HELD_PROMPT_MS) {
+  const takes = held !== undefined && slashPrompt(held) && nowMs - held.atMs <= HELD_PROMPT_MS
+  r.command = { sequence: r.sequence, startMs: nowMs, ...(isCoherent(r) ? { ctx: (takes ? held!.own : undefined) ?? mintCtx(r) } : {}) }
+  if (held && takes) {
     r.command.prompt = held
     r.command.promptAtMs = held.atMs
     r.heldPrompt = undefined
@@ -519,7 +687,7 @@ function sendCommand(r: Rebuild): Emit {
   if (c === undefined || c.endMs === undefined) return none()
   r.command = undefined
   const endMs = Math.max(c.endMs, c.promptAtMs ?? c.endMs)
-  return interactionSpan(r, { ctx: c.prompt?.ctx, prompt: c.prompt, text: '', sequence: c.sequence, startMs: c.startMs, endMs, durationMs: endMs - c.startMs })
+  return interactionSpan(r, { ctx: c.prompt?.ctx ?? c.ctx ?? c.prompt?.own, prompt: c.prompt, text: '', sequence: c.sequence, startMs: c.startMs, endMs, durationMs: endMs - c.startMs })
 }
 
 /** A turn ended: a main-loop turn's interaction is sent, and its time counts as active; a subagent's frees its Agent call. */
@@ -573,7 +741,29 @@ export function toolStart(r: Rebuild, e: { tool: string; tool_use_id?: string; a
   const id = e.tool_use_id
   if (!id) return
   const { tool: name, tool_use_id: _id, agentId, ...input } = e
-  r.tools.set(id, { id, name, input, ...(agentId ? { agentId } : {}), startMs: nowMs, spanId: r.mint(16), sent: false, execWaits: false })
+  // In coherent mode a call sits under the interaction open now, or, a subagent's, under its Agent call's run (found when its spans
+  // go, if the subagent is not known yet; where it was first seen, if no Agent call ever names it).
+  let home: Home | undefined
+  if (isCoherent(r)) {
+    const parent = agentId ? r.agentCtx.get(agentId) : openCtx(r)
+    if (agentId && !parent) looseHome(r, agentId)
+    home = parent ? { traceId: parent.traceId, parentId: parent.spanId } : {}
+  } else if (r.interaction?.rebuilt && r.interaction.ctx && !agentId) {
+    // A rebuilt turn's call sits under its interaction. A subagent's rows there name their spans, in the Agent call's trace, which
+    // its decision row moves onto the interaction's.
+    home = { traceId: r.interaction.ctx.traceId, parentId: r.interaction.ctx.spanId }
+  }
+  const rebuilt = !isCoherent(r) && home !== undefined
+  r.tools.set(id, { id, name, input, ...(agentId ? { agentId } : {}), ...(home ? { home } : {}), ...(rebuilt ? { rebuilt: true as const } : {}), startMs: nowMs, spanId: r.mint(16), sent: false, execWaits: false })
+}
+
+/** A coherent-mode call's trace and parent, settled the first time its spans or its subagent need them; undefined in any other mode. */
+function homeOfTool(r: Rebuild, tool: Tool): Home | undefined {
+  const home = tool.home
+  if (home === undefined || home.traceId !== undefined) return home
+  const agent = tool.agentId ? r.agentCtx.get(tool.agentId) : undefined
+  tool.home = agent ? { traceId: agent.traceId, parentId: agent.spanId } : tool.agentId ? looseHome(r, tool.agentId) : { traceId: r.mint(32) }
+  return tool.home
 }
 
 /** An Agent call started a subagent, inside another subagent or not. */
@@ -582,6 +772,15 @@ export function agentSpawned(r: Rebuild, toolUseId: string, agentId: string, par
   if (parentAgentId) r.parentAgent.set(agentId, parentAgentId)
   const tool = r.tools.get(toolUseId)
   if (tool) tool.spawned = agentId
+  // In coherent mode the Agent call's run is made now, so the subagent's requests and calls have their parent from the start. A call
+  // that starts several agents (a workflow) has one run, the parent of each.
+  const home = tool ? homeOfTool(r, tool) : undefined
+  // Coherent mode alone: in a rebuilt turn the subagent's rows name the run themselves.
+  if (tool && isCoherent(r) && home?.traceId !== undefined && !r.agentCtx.has(agentId)) {
+    const exec = (tool.execId ??= r.execOfAgent.get(agentId) ?? r.mint(16))
+    r.execOfAgent.set(agentId, exec)
+    r.agentCtx.set(agentId, { traceId: home.traceId, spanId: exec })
+  }
 }
 
 /** A tool call settled: its spans go once its result row is in, and what it did counts toward the metrics. */
@@ -645,8 +844,9 @@ function finishTool(r: Rebuild, tool: Tool, force: boolean): Emit {
   }
   const endMs = tool.endMs
   const mcp = mcpParts(tool.name)
-  const parentId = tool.result?.ctx?.spanId ?? (tool.agentId ? r.execOfAgent.get(tool.agentId) : r.interaction?.prompt?.ctx?.spanId ?? r.interaction?.ctx?.spanId)
-  const traceId = tool.decision?.ctx?.traceId ?? tool.result?.ctx?.traceId ?? r.interaction?.prompt?.ctx?.traceId ?? r.mint(32)
+  const home = homeOfTool(r, tool)
+  const parentId = (tool.result?.ctx ? respan(r, tool.result.ctx.spanId) : undefined) ?? (home ? home.parentId : tool.agentId ? r.execOfAgent.get(tool.agentId) : r.interaction?.prompt?.ctx?.spanId ?? r.interaction?.ctx?.spanId)
+  const traceId = retrace(r, tool.decision?.ctx?.traceId ?? tool.result?.ctx?.traceId ?? home?.traceId ?? r.interaction?.prompt?.ctx?.traceId ?? r.mint(32))
   const conversation = conversationOf(r, tool.agentId)
   const spans: BuiltSpan[] = [{
     traceId,
@@ -674,8 +874,8 @@ function finishTool(r: Rebuild, tool: Tool, force: boolean): Emit {
   if (d) {
     const blockedEnd = Math.min(Math.max(d.atMs, tool.startMs), endMs)
     spans.push({
-      traceId: d.ctx?.traceId ?? traceId,
-      spanId: d.ctx?.spanId ?? r.mint(16),
+      traceId: retrace(r, d.ctx?.traceId ?? traceId),
+      spanId: d.ctx?.spanId ?? d.own ?? r.mint(16),
       parentSpanId: tool.spanId,
       name: 'claude_code.tool.blocked_on_user',
       startMs: tool.startMs,
@@ -711,7 +911,7 @@ function sendExecution(r: Rebuild, tool: Tool): Emit {
   const success = tool.result?.success ?? !tool.isError
   const error = tool.result?.error
   const spanId = (tool.spawned && r.execOfAgent.get(tool.spawned)) || r.mint(16)
-  const traceId = tool.decision?.ctx?.traceId ?? tool.result?.ctx?.traceId ?? r.mint(32)
+  const traceId = retrace(r, tool.decision?.ctx?.traceId ?? tool.result?.ctx?.traceId ?? homeOfTool(r, tool)?.traceId ?? r.mint(32))
   return {
     spans: [{
       traceId,

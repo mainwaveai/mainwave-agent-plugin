@@ -2,7 +2,7 @@
   "name": "mainwave",
   "displayName": "Mainwave",
   "version": "0.1.0",
-  "description": "Reports your Claude Code and Cowork sessions to Mainwave. It adds the plugin's name, version, entry point and route to the telemetry rows Claude Code already sends to your organization's collector, and reads the organization, account, email and device ID those rows carry. With a Mainwave dev ingest key set, it also sends its own copy of those rows to Mainwave's dev collector, with Claude Code's spans and metrics rebuilt beside them, so the two paths can be compared.",
+  "description": "Reports your Claude Code and Cowork sessions to Mainwave. It adds the plugin's name, version, entry point and route to the telemetry rows Claude Code already sends to your organization's collector, and reads the organization, account, email and device ID those rows carry. With a Mainwave dev ingest key set, or keyless sending turned on, it also sends its own copy of those rows to Mainwave's dev collector, with Claude Code's spans and metrics rebuilt beside them.",
   "author": {
     "name": "Mainwave"
   },
@@ -14,6 +14,12 @@
       "description": "An ingest key for Mainwave's dev collector. Set: the plugin sends a copy of Claude Code's telemetry rows, spans and metrics to the dev collector, and nowhere else. Unset: it sends nothing of its own. Only your own settings count: a repository's settings that name this option stop the copy.",
       "sensitive": true,
       "default": ""
+    },
+    "devKeyless": {
+      "type": "boolean",
+      "title": "Send to Mainwave's dev collector without a key",
+      "description": "On, with no dev ingest key set: the plugin sends its copy of Claude Code's telemetry rows, spans and metrics to Mainwave's dev collector with no key, which routes each record by the Claude organization and email it carries. Records that name no organization and email (a session on an API key or a cloud provider) are not sent. Off (the default): nothing is sent without a key. Only your own settings count: a repository's settings that name this option stop the copy.",
+      "default": false
     }
   }
 }

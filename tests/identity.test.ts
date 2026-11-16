@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from 'claude-code/testing'
 
-import { identityOf, mergeIdentity } from '../hooks/identity.ts'
+import { identityOf, mergeIdentity, routingIdentityOf } from '../hooks/identity.ts'
 
 const ORG = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
 const ACCOUNT = '3f2504e0-4f89-41d3-9a0c-0305e82c3301'
@@ -52,4 +52,19 @@ describe('mergeIdentity', () => {
     expect(mergeIdentity(held, { email: 'b@example.com', deviceId: 'd1' })).toEqual({ organizationId: ORG, email: 'b@example.com', deviceId: 'd1' })
     expect(held).toEqual({ organizationId: ORG, email: 'a@example.com' })
   })
+})
+
+describe('routingIdentityOf', () => {
+  const cases: [string, Record<string, unknown>, string | undefined][] = [
+    ['an organization and an email', { 'organization.id': ORG, 'user.email': 'a@example.com', 'user.id': 'd1' }, `${ORG} a@example.com`],
+    ['an organization alone (an API key, with OTEL_RESOURCE_ATTRIBUTES)', { 'organization.id': ORG }, undefined],
+    ['an email alone', { 'user.email': 'a@example.com' }, undefined],
+    ['neither (a cloud provider)', { 'session.id': 's' }, undefined],
+    ['an organization not of its shape', { 'organization.id': 'org-1', 'user.email': 'a@example.com' }, undefined],
+    ['an email not of its shape', { 'organization.id': ORG, 'user.email': 'a@example.com\n' }, undefined],
+    ['a key that would override the stored email', { 'organization.id': ORG, 'user.email': 'a@example.com', 'kiro.user.email': 'b@example.com' }, undefined],
+    ['an email past 320 bytes of UTF-8, though under 254 characters', { 'organization.id': ORG, 'user.email': `${'é'.repeat(64)}@${'ü'.repeat(120)}.com` }, undefined],
+    ['an email with U+0085, a space to the collector', { 'organization.id': ORG, 'user.email': 'a@exa\u0085mple.com' }, undefined],
+  ]
+  for (const [name, attributes, want] of cases) test(name, () => expect(routingIdentityOf(attributes)).toBe(want))
 })

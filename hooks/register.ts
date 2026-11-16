@@ -1,6 +1,7 @@
 // The plugin's hooks module. It stamps the telemetry rows Claude Code exports to the organization's collector (where the organization
-// configured one), keeps the identity those rows carry for the session, and, where the person set a dev ingest key, sends its own
-// copy of each row to Mainwave's dev collector (sender.ts), with the spans and metrics it rebuilds beside them (rebuild.ts, meter.ts).
+// configured one), keeps the identity those rows carry for the session, and, where the person set a dev ingest key or turned keyless
+// sending on, sends its own copy of each row to Mainwave's dev collector (sender.ts), with the spans and metrics it rebuilds beside
+// them (rebuild.ts, meter.ts).
 // It draws nothing and registers no command or tool.
 //
 // The exporter's row always goes on: the copy is queued beside it, never in its place. Fail open: a hook that throws never holds up a
@@ -84,9 +85,14 @@ async function noteIdentity($: EngineInterface, attributes: Readonly<Record<stri
   held = merged
 }
 
-/** The copy of a row the plugin sends: plain data, its route `plugin`. */
-function copyOf(e: Frozen<TelemetryRecordEntry>, attributes: Record<string, TelemetryAttribute>): CopiedRow {
-  const span = e.span === undefined ? undefined : { traceId: e.span.traceId, spanId: e.span.spanId, traceFlags: e.span.traceFlags }
+/**
+ * The copy of a row the plugin sends: plain data, its route `plugin`. Its ids are those of the span it ran in as the plugin's spans
+ * have it (`ctx`, from the rebuild), where the rebuild says; else the row's own.
+ */
+function copyOf(e: Frozen<TelemetryRecordEntry>, attributes: Record<string, TelemetryAttribute>, ctx?: { traceId: string; spanId: string }): CopiedRow {
+  const span = ctx !== undefined
+    ? { traceId: ctx.traceId, spanId: ctx.spanId, traceFlags: e.span?.traceFlags ?? 1 }
+    : e.span === undefined ? undefined : { traceId: e.span.traceId, spanId: e.span.spanId, traceFlags: e.span.traceFlags }
   const route = filterStamps({ 'mainwave.telemetry.route': 'plugin' }).kept
   return { event: e.event, loggedAt: e.loggedAt, ...(span ? { span } : {}), attributes: { ...attributes, ...route } }
 }
@@ -106,17 +112,34 @@ async function settle(read: Promise<string | undefined>): Promise<string | undef
   }
 }
 
+const truthy = (raw: string | undefined) => ['1', 'true', 'yes', 'on'].includes((raw ?? '').trim().toLowerCase())
+
+/**
+ * Whether Claude Code traces, as it decides it: `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA`, else `ENABLE_ENHANCED_TELEMETRY_BETA`, is on.
+ * A read that fails counts as on, so the rebuild mirrors the rows as it always has rather than build a trace of its own.
+ */
+async function readClaudeTraces($: EngineInterface): Promise<boolean> {
+  try {
+    const [beta, legacy] = await Promise.all([$.env.get('CLAUDE_CODE_ENHANCED_TELEMETRY_BETA'), $.env.get('ENABLE_ENHANCED_TELEMETRY_BETA')])
+    return truthy(beta ?? legacy)
+  } catch {
+    return true
+  }
+}
+
 /** The rebuild for this load, its settings read from the environment once. */
 async function makeRebuild($: EngineInterface): Promise<Rebuild> {
-  const [details, traceparent, spanLimit, anyLimit] = await Promise.all([
+  const [details, traceparent, spanLimit, anyLimit, claudeTraces] = await Promise.all([
     settle($.env.get('OTEL_LOG_TOOL_DETAILS')),
     settle($.env.get('TRACEPARENT')),
     settle($.env.get('OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT')),
     settle($.env.get('OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT')),
+    readClaudeTraces($),
   ])
   const limit = positiveInt(spanLimit) ?? positiveInt(anyLimit)
   return newRebuild({
-    toolDetails: ['1', 'true', 'yes', 'on'].includes((details ?? '').trim().toLowerCase()),
+    toolDetails: truthy(details),
+    claudeTraces,
     ...(parseTraceparent(traceparent) ? { traceparent: parseTraceparent(traceparent)! } : {}),
     ...(limit !== undefined ? { valueLengthLimit: limit } : {}),
   })
@@ -172,13 +195,16 @@ async function collectNow($: EngineInterface): Promise<void> {
   }
 }
 
-/** Reads one row into the rebuild: the row's own attributes as Claude Code raised them, before any stamp. */
-async function observe($: EngineInterface, e: Frozen<TelemetryRecordEntry>): Promise<void> {
+/**
+ * Reads one row into the rebuild: the row's own attributes as Claude Code raised them, before any stamp. Answers what it produced
+ * and the ids the row's copy carries, where the rebuild gives them; null when the plugin does not rebuild.
+ */
+async function observe($: EngineInterface, e: Frozen<TelemetryRecordEntry>): Promise<(Emit & { rowCtx?: { traceId: string; spanId: string } }) | null> {
   const r = await rebuildOf($)
-  if (r === null) return
+  if (r === null) return null
   const atMs = Date.parse(e.loggedAt)
   const span = e.span === undefined ? undefined : { traceId: e.span.traceId, spanId: e.span.spanId }
-  await emit($, observeRow(r, { event: e.event, atMs: Number.isFinite(atMs) ? atMs : await $.clock.now(), ...(span ? { span } : {}), attributes: e.attributes }))
+  return observeRow(r, { event: e.event, atMs: Number.isFinite(atMs) ? atMs : await $.clock.now(), ...(span ? { span } : {}), attributes: e.attributes })
 }
 
 /**
@@ -206,12 +232,21 @@ export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams
     attributes = stripOwned(e.attributes)
   }
   if (isCopying()) {
+    // The rebuild reads the row first, so its copy carries the ids the plugin's spans give it. The copy is the plugin's own: a fault
+    // in either never holds the exporter's row, and a fault in the rebuild never holds the copy.
+    // The row's copy is queued before what the row completes, as the row came first.
+    let out: Awaited<ReturnType<typeof observe>> = null
     try {
-      await enqueue($, { s: 'logs', d: copyOf(e, attributes) })
-      await observe($, e)
+      out = await observe($, e)
     } catch {
-      // The copy is the plugin's own: a fault queueing it never holds the exporter's row.
+      out = null
     }
+    try {
+      await enqueue($, { s: 'logs', d: copyOf(e, attributes, out?.rowCtx) })
+    } catch {
+      // Lost to the copy alone.
+    }
+    if (out !== null) await emit($, out).catch(() => undefined)
   }
   return next({ ...e, attributes })
 }
@@ -419,7 +454,9 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
     await finish($, next.budget)
     if (isCopying()) {
       const s = snapshot()
-      $.ui.log(`mainwave: copy to dev: ${s.sent} sent, ${s.dropped} dropped, ${s.queued} kept for a later session`, { to: 'debug' })
+      const withheld = s.keyless ? `, ${s.withheld} held back (no organization and email)` : ''
+      const refusals = s.refusedIdentities > 0 ? `, ${s.refusedIdentities} organization and email refused` : ''
+      $.ui.log(`mainwave: copy to dev${s.keyless ? ' (keyless)' : ''}: ${s.sent} sent, ${s.dropped} dropped, ${s.queued} kept for a later session${withheld}${refusals}`, { to: 'debug' })
     }
   } catch {
     // What could not be kept is lost to the copy alone: the exporter's rows went on.

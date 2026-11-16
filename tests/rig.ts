@@ -186,3 +186,59 @@ export function memoryStore(on: On, entries: Record<string, unknown> = {}) {
   on('store.keys', async () => ({ value: [...data.keys()] }) as never)
   return { data, sets, deletes }
 }
+
+// ── Keyless ingest ────────────────────────────────────────────────────────────
+// The dev collector's rules for a request with no key, as its owners wrote them: routed by the `organization.id` and `user.email`
+// on every item (a log record, a span, a metric data point), never the resource's.
+
+type KeyValues = { key: string; value: Record<string, unknown> }[]
+
+/** Each item's own attributes in an OTLP/JSON request body of any signal, in order. */
+export function itemAttributes(post: Post): KeyValues[] {
+  const body = JSON.parse(post.body) as Record<string, unknown[]>
+  const out: KeyValues[] = []
+  for (const rl of (body['resourceLogs'] ?? []) as { scopeLogs: { logRecords: { attributes?: KeyValues }[] }[] }[]) {
+    for (const sl of rl.scopeLogs) for (const r of sl.logRecords) out.push(r.attributes ?? [])
+  }
+  for (const rs of (body['resourceSpans'] ?? []) as { scopeSpans: { spans: { attributes?: KeyValues }[] }[] }[]) {
+    for (const ss of rs.scopeSpans) for (const s of ss.spans) out.push(s.attributes ?? [])
+  }
+  for (const rm of (body['resourceMetrics'] ?? []) as { scopeMetrics: { metrics: Record<string, { dataPoints?: { attributes?: KeyValues }[] }>[] }[] }[]) {
+    for (const sm of rm.scopeMetrics) {
+      for (const m of sm.metrics) {
+        for (const kind of ['sum', 'gauge', 'histogram', 'exponentialHistogram', 'summary']) for (const p of m[kind]?.dataPoints ?? []) out.push(p.attributes ?? [])
+      }
+    }
+  }
+  return out
+}
+
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** What keyless ingest answers a request, and whose it took it to be. */
+export type KeylessAnswer = { status: number; text: string; identity?: string }
+
+/**
+ * Keyless ingest's answer: 401 for a request with any Authorization header (it takes the key path); 400 when an item lacks
+ * `organization.id` or `user.email`, carries either twice or carries `kiro.user.email`, when the items name more than one pair, or
+ * when the pair has not the shape; 403 with the reason for an organization `refused` names; else 200.
+ */
+export function keylessAnswer(post: Post, refused: Record<string, 'unclaimed' | 'email_domain'> = {}): KeylessAnswer {
+  if (Object.keys(post.headers).some(h => h.toLowerCase() === 'authorization')) return { status: 401, text: '{"error":"unauthorized"}' }
+  let seen: string | undefined
+  for (const attrs of itemAttributes(post)) {
+    if (attrs.some(a => a.key === 'kiro.user.email')) return { status: 400, text: '{"error":"kiro.user.email"}' }
+    const orgs = attrs.filter(a => a.key === 'organization.id')
+    const emails = attrs.filter(a => a.key === 'user.email')
+    if (orgs.length !== 1 || emails.length !== 1) return { status: 400, text: '{"error":"organization.id and user.email once on every item"}' }
+    const pair = `${orgs[0]!.value['stringValue']} ${emails[0]!.value['stringValue']}`
+    if (seen !== undefined && seen !== pair) return { status: 400, text: '{"error":"one organization.id and user.email per request"}' }
+    seen = pair
+  }
+  if (seen === undefined) return { status: 200, text: '{}' }
+  const [org, email] = seen.split(' ') as [string, string]
+  if (!UUID_SHAPE.test(org) || !/^[^@\s]+@[^@\s]+$/.test(email)) return { status: 400, text: '{"error":"shape"}', identity: seen }
+  const reason = refused[org]
+  if (reason) return { status: 403, text: JSON.stringify({ error: 'not accepted', reason }), identity: seen }
+  return { status: 200, text: '{"partialSuccess":{}}', identity: seen }
+}
