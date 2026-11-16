@@ -40,6 +40,8 @@ jobs:
         run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && claude --version
       - name: Versions match
         run: scripts/check-version.sh
+      - name: One plugin, at the root (org sync refuses a manifest anywhere else)
+        run: scripts/check-layout.sh
       - name: Validate the plugin and its marketplace
         run: claude plugin validate .
       - name: Hooks as the engine will load them
