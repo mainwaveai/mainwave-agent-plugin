@@ -32,6 +32,7 @@ function world(on: On, opts: { reply?: (n: number, post: Post) => Reply; store?:
     return { turnId: e.turnId, index: e.index, answer: '', toolUses: [], stopReason: 'tool_use', usage: { ...USAGE, model: 'claude-haiku-5-5' } } as never
   })
   on('tool.call', () => ({ result: { stdout: 'hi', stderr: '', interrupted: false, isImage: false, noOutputExpected: false } }) as never)
+  on('command.run', () => ({ text: 'Total cost: $0.00' }) as never)
   return { clock, posts, rig }
 }
 
@@ -169,6 +170,19 @@ describe('a model stream closed early', () => {
     const span = body.resourceSpans[0].scopeSpans[0].spans[0]
     expect(span.name).toBe('claude_code.llm_request')
     expect(span.startTimeUnixNano).toBe(`${START + 10_000}000000`)
+  })
+})
+
+describe('a slash command', () => {
+  test('that asks no model goes on untouched, and is sent as an interaction with its prompt row\'s ids', withKey, async ($, on) => {
+    const { clock, posts } = world(on)
+    const result = await $.command.run({ command: 'usage', args: '' } as never)
+    expect(result).toEqual({ text: 'Total cost: $0.00' })
+    await row($, 'user_prompt', { prompt: '/cost', prompt_length: '5' }, INTERACTION)
+    await clock.advance(5_000)
+    const [i] = spans(posts).filter(s => s.name === 'claude_code.interaction')
+    expect(i).toEqual(expect.objectContaining({ traceId: TRACE, spanId: INTERACTION }))
+    expect(i!.attrs['user_prompt']).toBe('/cost')
   })
 })
 

@@ -5,7 +5,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import type { BuiltSpan } from '../hooks/otlp.ts'
 import {
-  agentSpawned, commonOf, newRebuild, observeRow, parseTraceparent, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart,
+  agentSpawned, commandEnd, commandStart, commonOf, newRebuild, observeRow, parseTraceparent, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart,
   type Emit, type Rebuild, type RowIn, type Settings,
 } from '../hooks/rebuild.ts'
 import { ORG } from './rig.ts'
@@ -293,6 +293,60 @@ describe('tools', () => {
     expect(toolEnd(r, 'toolu_8', { result: {} }, 40).measures.map(m => [m.name, m.value])).toEqual([['claude_code.commit.count', 1], ['claude_code.pull_request.count', 1]])
     toolStart(r, { tool: 'Bash', tool_use_id: 'toolu_9', command: 'git commit -m x' }, 50)
     expect(toolEnd(r, 'toolu_9', { isError: true, result: 'exit 1' }, 60).measures).toEqual([])
+  })
+})
+
+describe('slash commands', () => {
+  test('a command that asks no model is an interaction of its own, with its prompt row\'s ids, whichever comes first', () => {
+    for (const rowFirst of [true, false]) {
+      const r = rebuild()
+      commandStart(r, 100)
+      let out: Emit = { spans: [], measures: [] }
+      if (rowFirst) observeRow(r, row('user_prompt', 105, { prompt: '/context', prompt_length: '8' }, INTERACTION))
+      out = commandEnd(r, 113)
+      if (!rowFirst) out = all(out, observeRow(r, row('user_prompt', 120, { prompt: '/cost', prompt_length: '5' }, INTERACTION)))
+      expect(all(out, sweep(r, 1_000, false)).spans).toEqual([])
+      out = sweep(r, 2_200, false)
+      const [i] = named(out.spans, 'interaction')
+      expect(i).toEqual(expect.objectContaining({ traceId: TRACE, spanId: INTERACTION, startMs: 100, endMs: rowFirst ? 113 : 120 }))
+      expect(i!.attributes).toEqual(expect.objectContaining({ user_prompt: rowFirst ? '/context' : '/cost', 'interaction.sequence': 1, 'interaction.duration_ms': rowFirst ? 13 : 20 }))
+      expect(out.measures).toEqual([expect.objectContaining({ name: 'claude_code.active_time.total', value: rowFirst ? 0.013 : 0.02 })])
+    }
+  })
+
+  test('a command that goes on to ask the model is one interaction with its turn', () => {
+    const r = rebuild()
+    commandStart(r, 100)
+    observeRow(r, row('user_prompt', 101, { prompt: '/review', prompt_length: '7' }, INTERACTION))
+    expect(commandEnd(r, 110).spans).toEqual([])
+    turnStart(r, { turnId: 't1', text: 'Review this change' })
+    expect(sweep(r, 5_000, false).spans).toEqual([])
+    const { spans } = turnComplete(r, { turnId: 't1', durationMs: 50 }, 200)
+    expect(spans.map(s => [s.name, s.spanId, s.attributes['user_prompt'], s.attributes['interaction.sequence']])).toEqual([['claude_code.interaction', INTERACTION, '/review', 1]])
+    turnStart(r, { turnId: 't2', text: 'next' })
+    expect(r.interaction!.sequence).toBe(2)
+  })
+
+  test('a command still open when the session ends (/exit) ends with it', () => {
+    const r = rebuild()
+    commandStart(r, 100)
+    observeRow(r, row('user_prompt', 101, { prompt: '/exit', prompt_length: '5' }, INTERACTION))
+    const [i] = sweep(r, 115, true).spans
+    expect(i).toEqual(expect.objectContaining({ name: 'claude_code.interaction', spanId: INTERACTION, startMs: 100, endMs: 115 }))
+  })
+})
+
+describe('hosts that carry no trace on their rows (the SDK)', () => {
+  test("a main-loop request with no span on its row runs in the open interaction; a subagent's in its tool", () => {
+    const r = rebuild()
+    turnStart(r, { turnId: 't', text: 'go' })
+    const [main] = observeRow(r, request(10, 1201, { query_source: 'generate_session_title' }, '')).spans
+    expect(main!.attributes['llm_request.context']).toBe('interaction')
+    const [sub] = observeRow(r, request(20, 1202, { query_source: 'generate_session_title', agent_id: 'a1' }, '')).spans
+    expect(sub!.attributes['llm_request.context']).toBe('tool')
+    turnComplete(r, { turnId: 't', durationMs: 30 }, 40)
+    const [after] = observeRow(r, request(50, 1203, { query_source: 'generate_session_title' }, '')).spans
+    expect(after!.attributes['llm_request.context']).toBe('standalone')
   })
 })
 

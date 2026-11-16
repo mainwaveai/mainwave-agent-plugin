@@ -5,8 +5,8 @@
 //
 // The exporter's row always goes on: the copy is queued beside it, never in its place. Fail open: a hook that throws never holds up a
 // row, a turn, a tool call or the session. A row whose stamping failed goes on without any key the plugin owns, as Claude Code wrote
-// it otherwise. The hooks that watch turns, model requests and tool calls only observe: each passes its event on unchanged, and its
-// result back unchanged.
+// it otherwise. The hooks that watch turns, model requests, tool calls, slash commands and spawns only observe: each passes its event on
+// unchanged, and its result back unchanged.
 
 import { atom, update } from 'claude-code'
 import type { CatchHandler, EngineInterface, Frozen, Hook, Next, Register, StreamHook, TelemetryAttribute, TelemetryLogResult, TelemetryRecordEntry, Timer } from 'claude-code'
@@ -17,7 +17,7 @@ import { identityOf, isOrgId, mergeIdentity } from './identity.ts'
 import { add, collect, newMeter, type Meter } from './meter.ts'
 import type { CopiedRow } from './otlp.ts'
 import {
-  agentSpawned, newRebuild, observeRow, parseTraceparent, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
+  agentSpawned, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
 } from './rebuild.ts'
 import { adopt, configure, enqueue, ensureTimer, finish, isCopying, snapshot } from './sender.ts'
 import { applyStamps, entrypointOf, filterStamps, PLUGIN_NAME, stripOwned } from './stamps.ts'
@@ -37,6 +37,8 @@ type TurnCompleteParams = Parameters<Hook<'turn.complete'>>
 type StepParams = Parameters<StreamHook<'turn.step'>>
 type ToolCallParams = Parameters<Hook<'tool.call'>>
 type ToolCatchParams = Parameters<CatchHandler<Hook<'tool.call'>>>
+type CommandParams = Parameters<Hook<'command.run'>>
+type CommandCatchParams = Parameters<CatchHandler<Hook<'command.run'>>>
 type SpawnParams = Parameters<Hook<'agent.spawn'>>
 type SpawnCatchParams = Parameters<CatchHandler<Hook<'agent.spawn'>>>
 
@@ -314,6 +316,34 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
   return result
 }
 
+/**
+ * A slash command: when it ran, so one that asks no model (`/plugins`, `/cost`, `/exit`) is an interaction of its own, as Claude Code
+ * counts it. The command and its result pass through untouched.
+ */
+export async function commandHook($: CommandParams[0], e: CommandParams[1], next: CommandParams[2]) {
+  let r: Rebuild | null = null
+  try {
+    r = await rebuildOf($)
+    if (r !== null) commandStart(r, await $.clock.now())
+  } catch {
+    r = null
+  }
+  const result = await next(e)
+  if (r !== null) {
+    try {
+      await emit($, commandEnd(r, await $.clock.now()))
+    } catch {
+      // The command's interaction goes with what the rows say.
+    }
+  }
+  return result
+}
+
+/** A command goes on whatever the hook did; once it has gone on, its result stands. */
+export function commandCatch($: CommandCatchParams[0], e: CommandCatchParams[1], next: CommandCatchParams[2]) {
+  return next(e)
+}
+
 /** A tool call goes on whatever the hook did; once it has gone on, its result stands. */
 export function toolCatch($: ToolCatchParams[0], e: ToolCatchParams[1], next: ToolCatchParams[2]) {
   return next(e)
@@ -378,6 +408,7 @@ export const register: Register = (on, options) => {
   on('turn.step', stepHook)
   on('turn.complete', turnCompleteHook)
   on('tool.call', toolCallHook).catch(toolCatch)
+  on('command.run', commandHook).catch(commandCatch)
   on('agent.spawn', spawnHook).catch(spawnCatch)
 
   on('session.end', sessionEnd)

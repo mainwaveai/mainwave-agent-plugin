@@ -62,6 +62,7 @@ describe('entrypointOf', () => {
   test('known values pass, anything else is other', () => {
     expect(entrypointOf('cli')).toBe('cli')
     expect(entrypointOf('remote_cowork')).toBe('remote_cowork')
+    expect(entrypointOf('t3-code')).toBe('t3-code')
     expect(entrypointOf('CLI')).toBe('other')
     expect(entrypointOf(undefined)).toBe('other')
     expect(entrypointOf(3)).toBe('other')

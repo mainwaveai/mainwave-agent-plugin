@@ -4,8 +4,9 @@
 //
 // What Claude Code's exporter sends, and where each part comes from here (Claude Code 2.1.322, with CLAUDE_CODE_ENHANCED_TELEMETRY_BETA):
 //
-//   claude_code.interaction               one per main-loop turn. Its trace and span ids are the `user_prompt` row's; its end is the
-//                                         turn's `turn.complete`, its start that less the turn's duration.
+//   claude_code.interaction               one per main-loop turn, and one per slash command that asks no model. Its trace and span
+//                                         ids are the `user_prompt` row's; a turn's end is its `turn.complete`, its start that less
+//                                         the turn's duration; a command's spans its `command.run`.
 //   ├─ claude_code.llm_request            one per model request: the `api_request` (or `api_error`) row, paired with its `turn.step`
 //   │                                     for the stop reason and the start. Its parent is the row's span; its own id no row carries,
 //   │                                     so it is new.
@@ -47,6 +48,8 @@ export type Emit = { spans: BuiltSpan[]; measures: Measure[] }
 
 type Prompt = { ctx?: Ctx; text: TelemetryAttribute; length: number }
 type Interaction = { turnId: string; sequence: number; prompt?: Prompt; ctx?: Ctx; text: string }
+/** A slash command that runs without a model turn (`/plugins`, `/cost`): an interaction of its own, as Claude Code counts it. */
+type Command = { sequence: number; startMs: number; endMs?: number; prompt?: Prompt; promptAtMs?: number }
 type Step = { loop: string; startMs: number; endMs: number; stopReason: string | null; usage: StepUsage | null }
 type StepUsage = { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }
 type Waiting = { row: RowIn; heldAtMs: number }
@@ -75,6 +78,8 @@ export type Rebuild = {
   common: Attrs
   sequence: number
   interaction?: Interaction
+  /** The slash command running or just run, until its interaction is sent or a model turn takes it over. */
+  command?: Command
   /** A `user_prompt` row seen before its turn began. */
   heldPrompt?: Prompt
   interactionIds: Set<string>
@@ -226,7 +231,10 @@ function readRowEvent(r: Rebuild, row: RowIn): Emit {
       }
       const it = r.interaction
       if (it && !it.prompt && (promptFits(prompt, it.text) || (ctx !== undefined && it.ctx?.spanId === ctx.spanId))) it.prompt = prompt
-      else r.heldPrompt = prompt
+      else if (!it && r.command && !r.command.prompt) {
+        r.command.prompt = prompt
+        r.command.promptAtMs = row.atMs
+      } else r.heldPrompt = prompt
       return none()
     }
     case 'tool_decision': {
@@ -363,7 +371,11 @@ function llmSpan(r: Rebuild, row: RowIn, step: Step | undefined): BuiltSpan {
   const startMs = Math.min(step?.startMs ?? endMs - (num(a['duration_ms']) ?? 0), endMs)
   const model = str(a['model'])
   const agentId = str(a['agent_id'])
-  const context = parent === undefined ? 'standalone' : r.interactionIds.has(parent.spanId) ? 'interaction' : 'tool'
+  // Claude Code names the context the request ran in: a tool's (a subagent's requests run inside its Agent call), the open
+  // interaction's, or none. Where a host does not carry the trace onto the row (the SDK), the plugin's own state says which.
+  const context = parent !== undefined
+    ? (r.interactionIds.has(parent.spanId) ? 'interaction' : 'tool')
+    : agentId !== undefined ? 'tool' : r.interaction !== undefined ? 'interaction' : 'standalone'
   const status = num(a['status_code'])
   const error = str(a['error'])
   const attempt = num(a['attempt']) ?? 1
@@ -419,10 +431,38 @@ const promptFits = (prompt: Prompt, text: string) => prompt.length === text.leng
 /** A main-loop turn began: an interaction opens, with the prompt row that came before it, if one did. */
 export function turnStart(r: Rebuild, e: { turnId: string; text: string; agentId?: string }): void {
   if (e.agentId !== undefined) return
-  r.sequence += 1
-  const held = r.heldPrompt && promptFits(r.heldPrompt, e.text) ? r.heldPrompt : undefined
-  r.interaction = { turnId: e.turnId, sequence: r.sequence, text: e.text, ...(held ? { prompt: held } : {}) }
+  // A command that goes on to ask the model (a skill, a prompt command) is one interaction with its turn, as in Claude Code.
+  const command = r.command
+  r.command = undefined
+  if (command === undefined) r.sequence += 1
+  const held = command?.prompt ?? (r.heldPrompt && promptFits(r.heldPrompt, e.text) ? r.heldPrompt : undefined)
+  r.interaction = { turnId: e.turnId, sequence: command?.sequence ?? r.sequence, text: e.text, ...(held ? { prompt: held } : {}) }
   r.heldPrompt = undefined
+}
+
+/** A slash command began: an interaction opens, unless a model turn takes it over. */
+export function commandStart(r: Rebuild, nowMs: number): void {
+  if (r.interaction !== undefined) return
+  r.sequence += 1
+  r.command = { sequence: r.sequence, startMs: nowMs }
+}
+
+/**
+ * A slash command ended. Its interaction goes after a short wait (`sweep`), never at once: a command that asks the model (a skill, a
+ * prompt command) starts its turn right after, and the turn takes the interaction over.
+ */
+export function commandEnd(r: Rebuild, nowMs: number): Emit {
+  if (r.command !== undefined) r.command.endMs = nowMs
+  return none()
+}
+
+/** One slash command's interaction, from the command's start to its end or its prompt row, whichever is later. */
+function sendCommand(r: Rebuild): Emit {
+  const c = r.command
+  if (c === undefined || c.endMs === undefined) return none()
+  r.command = undefined
+  const endMs = Math.max(c.endMs, c.promptAtMs ?? c.endMs)
+  return interactionSpan(r, { ctx: c.prompt?.ctx, prompt: c.prompt, text: '', sequence: c.sequence, startMs: c.startMs, endMs, durationMs: endMs - c.startMs })
 }
 
 /** A turn ended: a main-loop turn's interaction is sent, and its time counts as active; a subagent's frees its Agent call. */
@@ -436,29 +476,34 @@ export function turnComplete(r: Rebuild, e: { turnId: string; durationMs: number
   if (!it || it.turnId !== e.turnId) return none()
   r.interaction = undefined
   const durationMs = Math.max(0, Math.round(e.durationMs))
-  const startMs = nowMs - durationMs
-  const ctx = it.prompt?.ctx ?? it.ctx ?? { traceId: r.mint(32), spanId: r.mint(16) }
+  return interactionSpan(r, { ctx: it.prompt?.ctx ?? it.ctx, prompt: it.prompt, text: it.text, sequence: it.sequence, startMs: nowMs - durationMs, endMs: nowMs, durationMs })
+}
+
+/** One `claude_code.interaction`, a turn's or a slash command's, and its time as active time. */
+function interactionSpan(r: Rebuild, i: { ctx?: Ctx; prompt?: Prompt; text: string; sequence: number; startMs: number; endMs: number; durationMs: number }): Emit {
+  const ctx = i.ctx ?? { traceId: r.mint(32), spanId: r.mint(16) }
   const parent = r.settings.traceparent?.traceId === ctx.traceId ? r.settings.traceparent : undefined
+  const durationMs = Math.max(0, Math.round(i.durationMs))
   const span: BuiltSpan = {
     traceId: ctx.traceId,
     spanId: ctx.spanId,
     ...(parent ? { parentSpanId: parent.spanId } : {}),
     name: 'claude_code.interaction',
-    startMs,
-    endMs: nowMs,
+    startMs: i.startMs,
+    endMs: i.endMs,
     attributes: attrs(r, [
       ...head(r, 'interaction'),
       ['gen_ai.operation.name', 'invoke_agent'],
       ['gen_ai.conversation.id', conversationOf(r, undefined)],
-      ['user_prompt', it.prompt?.text ?? '<REDACTED>'],
-      ['user_prompt_length', it.prompt ? it.prompt.length : it.text.length],
-      ['interaction.sequence', it.sequence],
+      ['user_prompt', i.prompt?.text ?? '<REDACTED>'],
+      ['user_prompt_length', i.prompt ? i.prompt.length : i.text.length],
+      ['interaction.sequence', i.sequence],
       ['parent.source', parent ? 'env' : 'none'],
       ['queued_sends', 0],
       ['interaction.duration_ms', durationMs],
     ]),
   }
-  const active: Measure = { name: 'claude_code.active_time.total', value: durationMs / 1000, attributes: attrs(r, [...Object.entries(r.common), ['type', 'cli']]), atMs: nowMs }
+  const active: Measure = { name: 'claude_code.active_time.total', value: durationMs / 1000, attributes: attrs(r, [...Object.entries(r.common), ['type', 'cli']]), atMs: i.endMs }
   return { spans: [span], measures: [active] }
 }
 
@@ -648,6 +693,10 @@ export function sweep(r: Rebuild, nowMs: number, final: boolean): Emit {
   }
   r.waiting = keep
   r.steps = r.steps.filter(s => nowMs - s.endMs < STEP_KEEP_MS)
+  // A command whose prompt row has not come goes with what it has; at the end of the session (`/exit`), one still running ends now.
+  const c = r.command
+  if (c !== undefined && final && c.endMs === undefined) c.endMs = nowMs
+  if (c !== undefined && c.endMs !== undefined && (final || nowMs - c.endMs >= PAIR_WAIT_MS)) out = merge(out, sendCommand(r))
   for (const tool of [...r.tools.values()]) {
     if (tool.endedAtMs === undefined) {
       if (nowMs - tool.startMs >= TOOL_KEEP_MS) r.tools.delete(tool.id)
@@ -661,7 +710,7 @@ export function sweep(r: Rebuild, nowMs: number, final: boolean): Emit {
 }
 
 /** Whether anything waits for a sweep: a request, a step result or a tool call. */
-export const waits = (r: Rebuild) => r.waiting.length > 0 || r.steps.length > 0 || r.tools.size > 0
+export const waits = (r: Rebuild) => r.waiting.length > 0 || r.steps.length > 0 || r.tools.size > 0 || r.command !== undefined
 
 /** Sends any Agent call's execution its subagent has just named. */
 export function namedExecutions(r: Rebuild): Emit {

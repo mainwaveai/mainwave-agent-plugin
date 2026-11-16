@@ -29,7 +29,7 @@ It also reads who the session is from those rows: the organization (`organizatio
 
 | What Claude Code sends | What the plugin rebuilds it from |
 | --- | --- |
-| `claude_code.interaction`, one per turn of the main conversation | Its trace and span IDs are the `user_prompt` row's; its end is the turn's end, and its start that less the turn's duration |
+| `claude_code.interaction`, one per turn of the main conversation, and one per slash command that asks no model (`/plugins`, `/cost`, `/exit`) | Its trace and span IDs are the `user_prompt` row's. A turn's end is the turn's end, and its start that less the turn's duration; a command's runs from the command's start to its end |
 | `claude_code.llm_request`, one per model request | The request's `api_request` (or `api_error`) row: model, tokens, request ID, time to first token, effort, query source. The request's own stream gives its start and stop reason. Its parent is the row's span |
 | `claude_code.tool`, one per tool call | The tool call itself: its name, its input (the command, file, skill or agent type, where `OTEL_LOG_TOOL_DETAILS` asks for them) and its time. Its parent is its `tool_result` row's span |
 | `claude_code.tool.blocked_on_user`, the call's permission decision | The `tool_decision` row: its trace and span IDs, the decision and its source |
@@ -38,7 +38,7 @@ It also reads who the session is from those rows: the organization (`organizatio
 | `claude_code.lines_of_code.count` | Each Edit and Write call's result: its patch, or the whole file written |
 | `claude_code.commit.count`, `claude_code.pull_request.count` | Each Bash command that succeeded, read by Claude Code's own rules (`git commit`, `gh pr create`, `glab mr create` and so on), and each MCP tool named for creating a pull request |
 | `claude_code.code_edit_tool.decision` | Each `tool_decision` row of an Edit, Write or NotebookEdit call |
-| `claude_code.active_time.total` (`type` `cli`) | Each turn's duration |
+| `claude_code.active_time.total` (`type` `cli`) | Each interaction's duration, a turn's or a command's |
 | `claude_code.session.count` | The session's start |
 
 Every span and data point starts with the attributes Claude Code puts first on all its records (the session's identity, the organization's resource attributes, the repository): the plugin takes them from the latest row, everything before its `event.name`. Metrics are monotonic sums with delta temporality, as Claude Code sends them: summed between collections, collected every `OTEL_METRIC_EXPORT_INTERVAL` milliseconds (a minute unless set) and once more as the session ends.
@@ -51,6 +51,8 @@ Every span and data point starts with the attributes Claude Code puts first on a
 | The rows Claude Code raises while it starts (`managed_settings_resolved`, `plugin_loaded`) | They come before any plugin is loaded |
 | The span IDs of `llm_request`, `tool` and `tool.execution` (but an Agent call's `tool.execution`) | No row carries them, so the plugin makes its own. Trace IDs, the other span IDs and every parent are the exporter's; a `blocked_on_user` or `tool.execution` span's parent is the plugin's `tool` span |
 | Span times and the `duration_ms` attributes | The plugin times a span from the events around it: a few milliseconds from the exporter's |
+| Trace and span IDs of `interaction` and of the main conversation's `llm_request` spans, where Claude Code runs under a host that drives it through its SDK | Such a host's rows name no span for a prompt or a request, and the exporter starts each of those spans as a trace of its own; the plugin makes its own IDs. Tool spans and subagents keep the exporter's |
+| A slash command's interaction times | The plugin times the command from its hook; under `claude -p`, Claude Code starts the interaction when the process starts |
 | `first_content_ms` on `llm_request` | The plugin has the request's time to first token (`ttft_ms`) and sends that |
 | `stop_reason` on requests outside a conversation (a session title, a summary, a classifier) | The plugin sees the stream of the main conversation's requests and its subagents', not those |
 | `attempt` on a request that succeeded after retries, and the attempts' span events | Its row does not say which attempt it was; the plugin sends 1 |
@@ -72,7 +74,7 @@ Every span and data point starts with the attributes Claude Code puts first on a
 
 Rules it keeps:
 
-- **It never holds anything up.** The exporter's row always goes on, whether or not the copy could be queued. If stamping fails, the row goes on as Claude Code wrote it, minus any key the plugin owns. The hooks on turns, model requests, tool calls and subagents only watch: each passes its event and its result on unchanged, and a fault in one is caught.
+- **It never holds anything up.** The exporter's row always goes on, whether or not the copy could be queued. If stamping fails, the row goes on as Claude Code wrote it, minus any key the plugin owns. The hooks on turns, model requests, tool calls, slash commands and subagents only watch: each passes its event and its result on unchanged, and a fault in one is caught.
 - **Nothing else can pose as it.** Any key under `mainwave.mod.` or `mainwave.telemetry.` already on a row is removed before the plugin adds its own, and each value it adds must fit a fixed shape.
 - **Its key goes to one place.** The plugin sends the dev ingest key only to the dev collector, as a bearer token, and never writes it to a row, a file or a log. The plugin never reads the organization's collector URL or key. This holds against settings, not against other plugins: any plugin the person installs can see and rewrite every plugin's requests, this one's included, so a dev key is only as safe as the person's other plugins.
 - **It adds nothing else.** No prompts, tool arguments, results or file contents beyond what Claude Code's own rows and spans carry, under the same settings (`OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_TOOL_DETAILS`); no commands, panes or tools.
@@ -147,7 +149,7 @@ claude plugin validate .        # reads the manifest, the marketplace and the ho
 claude plugin test .            # runs tests/*.test.ts against the engine
 scripts/check-version.sh        # plugin.json and hooks/version.ts agree
 scripts/check-layout.sh         # one plugin, at the root: org sync refuses a .claude-plugin/ or plugin.json anywhere else
-scripts/check-hooks.sh          # the row, tool call and spawn hooks keep their fail-open .catch; the turn hooks and session.end are hooked
+scripts/check-hooks.sh          # the row, tool call, command and spawn hooks keep their fail-open .catch; the turn hooks and session.end are hooked
 node tests/e2e/compare.mjs      # one real session, model mocked: the plugin's copy against the exporter's logs, spans and metrics
 claude --plugin-dir .           # a session with the plugin loaded from this folder
 ```
@@ -160,7 +162,7 @@ A release bumps the version in both `.claude-plugin/plugin.json` and `hooks/vers
 
 | Module | What it holds |
 | --- | --- |
-| `hooks/register.ts` | the hooks: the collector row hook and its fail-open handler, the turn, model request, tool call and spawn hooks, `session.start` and `session.end` |
+| `hooks/register.ts` | the hooks: the collector row hook and its fail-open handler, the turn, model request, tool call, command and spawn hooks, `session.start` and `session.end` |
 | `hooks/stamps.ts` | the keys the plugin owns, their shape rules, and the strip of forged keys |
 | `hooks/settings.ts` | where the dev ingest key may come from, and its shape |
 | `hooks/identity.ts` | the organization, account, email and device read from a row |
