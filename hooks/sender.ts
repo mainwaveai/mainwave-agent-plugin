@@ -17,7 +17,7 @@
 // under a key it has already taken whole, and such a record with it. Nor is part of a batch sent under its key: two loads that take
 // over the same outbox could each send the batch, and were the smaller copy stored first, the rest would be dropped with the other.
 // So a retry carries the same records under the same key. Past the caps, only the oldest records the caps need go; when one of them
-// was in a batch, the rest of that batch lose its key and go again in a new batch under a new one: a header the collector has not
+// was in a batch, the rest of that batch loses its key and go again in a new batch under a new one: a header the collector has not
 // seen, so they may be stored twice, never lost.
 //
 // A batch formed keyless has its organization and email's hash in its key, so it goes under the same header whichever way a later
@@ -269,19 +269,21 @@ async function readResource($: EngineInterface): Promise<string> {
  * record of that batch loses the key, and `takeBatch` forms them into a new batch under a new key. They may be stored twice, never lost.
  */
 function dropOldest(): void {
+  const unkey = new Set<string>()
   while (queue.length > QUEUE_ROWS || queuedBytes > QUEUE_BYTES) {
     const gone = queue.shift()
     if (gone === undefined) break
     queuedBytes -= gone.size
     counts.dropped += 1
-    const k = gone.batch
-    if (k === undefined) continue
-    queue = queue.map(item => {
-      if (item.batch !== k) return item
-      const { batch: _gone, ...unkeyed } = item
-      return unkeyed as Queued
-    })
+    if (gone.batch !== undefined) unkey.add(gone.batch)
   }
+  // Once, after the loop: an outbox taken over can drop thousands of records, and stripping is the same in any order.
+  if (unkey.size === 0) return
+  queue = queue.map(item => {
+    if (item.batch === undefined || !unkey.has(item.batch)) return item
+    const { batch: _gone, ...unkeyed } = item
+    return unkeyed as Queued
+  })
 }
 
 /**
@@ -355,8 +357,8 @@ function takeBatch(signal: Signal): Queued[] {
   const key = head.batch
   let fresh: string | undefined
   if (key === undefined) {
-    // Formed keyless, the key holds its organization and email's hash, so the batch has the same header whichever way it is sent. A
-    // bare id, should the hash fail, still fits: `idempotencyKeyOf` adds the hash at send time.
+    // Formed keyless, the key holds its organization and email's hash, so the batch has the same header whichever way it is sent. The
+    // fallback only keeps a fault here from leaving the batch out of the queue; nothing has been taken from it yet.
     try {
       fresh = who !== undefined ? `${newId()}.${whoHash(who)}` : newId()
     } catch {

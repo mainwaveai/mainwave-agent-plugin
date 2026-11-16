@@ -80,6 +80,7 @@ const keptRow = (org: string, email: string, seq: number) => ({ s: 'logs', r: 0,
 /** An outbox an earlier session left a minute and more ago, so this session takes it over. */
 const leftBehind = (items: unknown[]) => ({ v: 2, updatedAt: START - 120_000, resources: [JSON.stringify({ 'service.name': 'claude-code' })], items })
 
+const sequencesOf = (post: Post) => itemAttributes(post).map(a => Number(Object.values(a.find(kv => kv.key === 'event.sequence')?.value ?? {})[0]))
 const emailsOf = (post: Post) => [...new Set(itemAttributes(post).map(a => a.find(kv => kv.key === 'user.email')?.value['stringValue']))]
 const lastOutbox = (sets: { key: string; value: unknown }[]) => sets.filter(s => s.key.startsWith('outbox:')).at(-1)?.value as { items: { d: { attributes: Record<string, unknown> } }[] } | undefined
 
@@ -267,18 +268,20 @@ describe('the idempotency key, keyless', () => {
 
   test('a stored key of 111 characters goes keyless with its hash at exactly 128; one of 112 is let go and its record goes under a new key', keyless, async ($, on) => {
     const k111 = 'a'.repeat(111)
-    const k112 = 'b'.repeat(112)
+    // Not a hex digit, so no fresh key can start with it.
+    const k112 = 'g'.repeat(112)
     const box = { ...leftBehind([{ ...keptRow(ORG, EMAIL, 1), b: 0 }, { ...keptRow(ORG, EMAIL, 2), b: 1 }]), v: 3, batches: [k111, k112] }
     const { clock, seen } = world(on, { store: { 'outbox:old': box } })
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
     await clock.advance(TICK)
     const logs = seen.filter(s => PATH(s.post.url) === '/v1/logs')
     expect(logs.map(s => s.answer.status)).toEqual([200, 200])
+    expect(logs.map(s => sequencesOf(s.post))).toEqual([[1], [2]])
     const [a, b] = logs.map(s => keyOf(s.post))
     expect(a).toBe(`${k111}.${HASH}`)
     expect(a!.length).toBe(128)
     expect(b).toMatch(IDEMPOTENCY_KEY)
-    expect(b!.startsWith('b')).toBe(false)
+    expect(b).not.toContain(k112.slice(0, 8))
     expect(b!.endsWith(`.${HASH}`)).toBe(true)
   })
 
