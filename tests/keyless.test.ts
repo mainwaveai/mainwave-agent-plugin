@@ -264,6 +264,45 @@ describe('the idempotency key, keyless', () => {
     expect(b).toBe(`${k}.${HASH}`)
     for (const key of [a, b]) expect(key).toMatch(IDEMPOTENCY_KEY)
   })
+
+  test('a stored key of 111 characters goes keyless with its hash at exactly 128; one of 112 is let go and its record goes under a new key', keyless, async ($, on) => {
+    const k111 = 'a'.repeat(111)
+    const k112 = 'b'.repeat(112)
+    const box = { ...leftBehind([{ ...keptRow(ORG, EMAIL, 1), b: 0 }, { ...keptRow(ORG, EMAIL, 2), b: 1 }]), v: 3, batches: [k111, k112] }
+    const { clock, seen } = world(on, { store: { 'outbox:old': box } })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await clock.advance(TICK)
+    const logs = seen.filter(s => PATH(s.post.url) === '/v1/logs')
+    expect(logs.map(s => s.answer.status)).toEqual([200, 200])
+    const [a, b] = logs.map(s => keyOf(s.post))
+    expect(a).toBe(`${k111}.${HASH}`)
+    expect(a!.length).toBe(128)
+    expect(b).toMatch(IDEMPOTENCY_KEY)
+    expect(b!.startsWith('b')).toBe(false)
+    expect(b!.endsWith(`.${HASH}`)).toBe(true)
+  })
+
+  test('past the queue caps, a batch formed with a key over two people loses only the oldest record; the rest go under new keys', keyless, async ($, on) => {
+    const k = '5f0c3f8e-2b7a-4d2c-9a51-1d7c4b2e8f01'
+    const pad = 'x'.repeat(400_000)
+    const big = (org: string, email: string, seq: number) => {
+      const r = keptRow(org, email, seq)
+      return { ...r, b: 0, d: { ...r.d, attributes: { ...r.d.attributes, pad } } }
+    }
+    const box = { ...leftBehind([big(ORG_B, EMAIL_B, 1), big(ORG, EMAIL, 2), big(ORG_B, EMAIL_B, 3)]), v: 3, batches: [k] }
+    const { clock, seen } = world(on, { store: { 'outbox:old': box } })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await clock.advance(TICK)
+    const logs = seen.filter(s => PATH(s.post.url) === '/v1/logs')
+    expect(logs.map(s => s.answer.status)).toEqual([200, 200])
+    expect(logs.map(s => emailsOf(s.post))).toEqual([[EMAIL], [EMAIL_B]])
+    expect(logs.map(s => itemAttributes(s.post).length)).toEqual([1, 1])
+    const [a, b] = logs.map(s => keyOf(s.post))
+    expect(a!.startsWith(k)).toBe(false)
+    expect(b!.startsWith(k)).toBe(false)
+    expect(a!.endsWith(`.${HASH}`)).toBe(true)
+    expect(b!.endsWith(`.${whoHash(`${ORG_B} ${EMAIL_B}`)}`)).toBe(true)
+  })
 })
 
 describe('the key option', () => {

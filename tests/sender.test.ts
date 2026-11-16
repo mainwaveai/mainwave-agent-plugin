@@ -255,7 +255,16 @@ describe('the idempotency key', () => {
     await clock.advance(TICK)
     expect(posts.map(p => seqs(p).length)).toEqual([200, 200, 50, 1])
     for (const p of posts) expect(keyOf(p)).toMatch(IDEMPOTENCY_KEY)
+    // A key made with a dev ingest key holds no `.`, so sent keyless it never looks like a key that has its hash already.
+    for (const p of posts) expect(keyOf(p)).not.toContain('.')
     expect(new Set(posts.map(keyOf)).size).toBe(4)
+  })
+
+  test("a stored key that ends in '.' and 16 hex digits is taken to hold its hash already: sent keyless as it is", () => {
+    const k = `5f0c3f8e-2b7a-4d2c-9a51-1d7c4b2e8f01.${whoHash('someone else')}`
+    expect(idempotencyKeyOf([{ batch: k, who: `${ORG} ${EMAIL}` }], true)).toBe(k)
+    expect(idempotencyKeyOf([{ batch: k, who: `${ORG} ${EMAIL}` }], false)).toBe(k)
+    expect(idempotencyKeyOf([{ batch: 'abc', who: `${ORG} ${EMAIL}` }], true)).toBe(`abc.${whoHash(`${ORG} ${EMAIL}`)}`)
   })
 
   test('the outbox keeps the key of a batch still in flight at session end, each key once', withKey, async ($, on) => {
@@ -309,7 +318,7 @@ describe('the idempotency key', () => {
     expect(keyOf(posts[1]!)).not.toBe(k)
   })
 
-  test('a batch put back past the queue caps is dropped whole, never resent in part under its key', withKey, async ($, on) => {
+  test('a batch put back past the queue caps loses only the rows the caps need; the rest go under a new key, none under its own', withKey, async ($, on) => {
     const pad = 'x'.repeat(300_000)
     const { clock, posts, rig } = world(on, { reply: n => (n === 1 ? 'hang' : { status: 200 }) })
     await logRow($, rig, row(1, { pad }))
@@ -320,22 +329,27 @@ describe('the idempotency key', () => {
     await logRow($, rig, row(4, { pad }))
     await clock.advance(10_000)
     await clock.advance(2 * TICK)
-    expect(posts.map(seqs)).toEqual([[1, 2], [3, 4]])
+    // 1.2 MB with 1 and 2 back: 1 alone goes, and 2 leaves the hung batch's key for a new batch with 3 and 4.
+    expect(posts.map(seqs)).toEqual([[1, 2], [2, 3, 4]])
+    expect(keyOf(posts[1]!)).toMatch(IDEMPOTENCY_KEY)
     expect(keyOf(posts[1]!)).not.toBe(keyOf(posts[0]!))
   })
 
-  test('a stored batch taken over past the queue caps is dropped whole; the next batch goes under its own key', withKey, async ($, on) => {
+  test('a stored batch taken over past the queue caps loses only the rows the caps need; the rest go under a new key', withKey, async ($, on) => {
     const pad = 'x'.repeat(400_000)
     const k1 = '5f0c3f8e-2b7a-4d2c-9a51-1d7c4b2e8f01'
     const k2 = 'a3b1c9d7-6e5f-4a2b-8c1d-0e9f8a7b6c5d'
     const big = (seq: number) => ({ s: 'logs', r: 0, b: 0, d: { event: 'api_request', loggedAt: LOGGED_AT, attributes: row(seq, { pad }) } })
     // Two loads may take this outbox over at once. Were one to trim the head of k1 and send the rest under k1 first, the other's full
-    // k1 would be dropped as a repeat, and the trimmed rows with it. So neither sends any of k1.
+    // k1 would be dropped as a repeat, and the trimmed rows with it. So neither sends any of k1 under k1: what is left goes under a new key.
     const box = { v: 3, updatedAt: START - 120_000, resources, batches: [k1, k2], items: [big(1), big(2), big(3), kept(10, 1)] }
     const { clock, posts } = world(on, { store: { 'outbox:gone': box } })
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
     await clock.advance(TICK)
-    expect(posts.map(p => [keyOf(p), seqs(p)])).toEqual([[k2, [10]]])
+    expect(posts.map(seqs)).toEqual([[2, 3], [10]])
+    expect(keyOf(posts[0]!)).toMatch(IDEMPOTENCY_KEY)
+    expect([k1, k2]).not.toContain(keyOf(posts[0]!))
+    expect(keyOf(posts[1]!)).toBe(k2)
   })
 
   test('a batch kept through a refused key (401) is kept under the key it was sent with, for a later load to send under it', withKey, async ($, on) => {

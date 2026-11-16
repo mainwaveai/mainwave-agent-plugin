@@ -16,7 +16,9 @@
 // session end) is sent again, metrics included. A key never covers a record it was not first sent with: the collector drops a retry
 // under a key it has already taken whole, and such a record with it. Nor is part of a batch sent under its key: two loads that take
 // over the same outbox could each send the batch, and were the smaller copy stored first, the rest would be dropped with the other.
-// So a retry carries the same records, or none: past the caps, the whole batch goes.
+// So a retry carries the same records under the same key. Past the caps, only the oldest records the caps need go; when one of them
+// was in a batch, the rest of that batch lose its key and go again in a new batch under a new one: a header the collector has not
+// seen, so they may be stored twice, never lost.
 //
 // A batch formed keyless has its organization and email's hash in its key, so it goes under the same header whichever way a later
 // load sends it. A batch formed with a key goes keyless as one batch per person, each under its key with that person's hash after
@@ -262,8 +264,9 @@ async function readResource($: EngineInterface): Promise<string> {
 }
 
 /**
- * Drops the oldest records past the queue's caps. A record in a batch takes the whole batch with it: part of a batch is never sent
- * under its key, as the collector would drop the full batch, sent by another load, as a repeat of it.
+ * Drops the oldest records past the queue's caps, only as many as the caps need. Part of a batch is never sent under its key, as the
+ * collector would drop the full batch, sent by another load, as a repeat of it: so when a dropped record was in a batch, every other
+ * record of that batch loses the key, and `takeBatch` forms them into a new batch under a new key. They may be stored twice, never lost.
  */
 function dropOldest(): void {
   while (queue.length > QUEUE_ROWS || queuedBytes > QUEUE_BYTES) {
@@ -271,16 +274,13 @@ function dropOldest(): void {
     if (gone === undefined) break
     queuedBytes -= gone.size
     counts.dropped += 1
-    if (gone.batch === undefined) continue
-    const rest: Queued[] = []
-    for (const item of queue) {
-      if (item.batch !== gone.batch) rest.push(item)
-      else {
-        queuedBytes -= item.size
-        counts.dropped += 1
-      }
-    }
-    queue = rest
+    const k = gone.batch
+    if (k === undefined) continue
+    queue = queue.map(item => {
+      if (item.batch !== k) return item
+      const { batch: _gone, ...unkeyed } = item
+      return unkeyed as Queued
+    })
   }
 }
 
@@ -343,8 +343,9 @@ function nextSignal(now: number): Signal | undefined {
  *
  * Where that record was already in a batch, the batch is that one again: the records queued under its key (without a key, those of
  * that organization and email), nothing added, so its key covers only records it was first sent with. Otherwise a new batch is formed
- * of the oldest records in no batch yet, and each is given the new batch's key (without a key, with the organization and email's hash
- * in it).
+ * of the oldest records in no batch yet (new ones, and the rest of a batch `dropOldest` cut into), and each is given the new batch's
+ * key (without a key, with the organization and email's hash in it). The key is made before the queue is touched, so a fault in making
+ * it loses no record.
  */
 function takeBatch(signal: Signal): Queued[] {
   const keyless = mode === 'keyless'
@@ -352,6 +353,16 @@ function takeBatch(signal: Signal): Queued[] {
   if (head === undefined) return []
   const who = keyless ? head.who : undefined
   const key = head.batch
+  let fresh: string | undefined
+  if (key === undefined) {
+    // Formed keyless, the key holds its organization and email's hash, so the batch has the same header whichever way it is sent. A
+    // bare id, should the hash fail, still fits: `idempotencyKeyOf` adds the hash at send time.
+    try {
+      fresh = who !== undefined ? `${newId()}.${whoHash(who)}` : newId()
+    } catch {
+      fresh = newId()
+    }
+  }
   const batch: Queued[] = []
   const rest: Queued[] = []
   let bytes = 0
@@ -373,13 +384,11 @@ function takeBatch(signal: Signal): Queued[] {
   }
   queue = rest
   queuedBytes -= bytes
-  if (key !== undefined) return batch
-  // Formed keyless, the key holds its organization and email's hash, so the batch has the same header whichever way it is sent.
-  const fresh = who !== undefined ? `${newId()}.${whoHash(who)}` : newId()
+  if (fresh === undefined) return batch
   return batch.map(item => ({ ...item, batch: fresh }))
 }
 
-/** Puts a batch back at the head of the queue, its records still under its key; past the caps, the whole batch goes. */
+/** Puts a batch back at the head of the queue, its records still under its key; past the caps, `dropOldest` drops what they need. */
 function putBack(batch: Queued[]): void {
   queue = [...batch, ...queue]
   queuedBytes += batch.reduce((n, r) => n + r.size, 0)
