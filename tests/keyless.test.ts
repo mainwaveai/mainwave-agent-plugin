@@ -110,6 +110,17 @@ describe('a session without the env block, sending keyless', () => {
     expect(by('tool').parentSpanId).toBe(by('interaction').spanId)
     expect(by('tool.blocked_on_user').parentSpanId).toBe(by('tool').spanId)
     expect(by('tool.execution').parentSpanId).toBe(by('tool').spanId)
+    // The copied rows carry the ids of the span each ran in, as Claude Code's rows do when it traces.
+    const rows: Record<string, { traceId?: string; spanId?: string }> = {}
+    for (const { post } of seen.filter(s => PATH(s.post.url) === '/v1/logs')) {
+      for (const rl of JSON.parse(post.body).resourceLogs) {
+        for (const sl of rl.scopeLogs) {
+          for (const r of sl.logRecords) rows[r.attributes.find((a: { key: string }) => a.key === 'event.name').value.stringValue] = { traceId: r.traceId, spanId: r.spanId }
+        }
+      }
+    }
+    const at = (n: string) => ({ traceId: by(n).traceId, spanId: by(n).spanId })
+    expect(rows).toEqual({ user_prompt: at('interaction'), api_request: at('interaction'), tool_decision: at('tool.blocked_on_user'), tool_result: at('interaction') })
   })
 
   test('records that name no organization and email are held back: never sent, never kept', keyless, async ($, on) => {
@@ -203,7 +214,8 @@ describe('the keyless option', () => {
   })
 
   test('with a key set too, the key wins: a bearer token, and records with no email go as well', { options: { devKeyless: true, devIngestKey: KEY } }, async ($, on) => {
-    const { clock, posts } = world(on)
+    // The collector's key path: any key is taken here.
+    const { clock, posts } = world(on, { answer: () => ({ status: 200 }) })
     await row($, 'api_request', { cost_usd: 0.1 }, { 'organization.id': ORG, 'session.id': 's-1' })
     await clock.advance(TICK)
     const logs = posts.filter(p => PATH(p.url) === '/v1/logs')

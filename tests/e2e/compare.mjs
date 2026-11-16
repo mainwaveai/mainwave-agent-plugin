@@ -613,10 +613,31 @@ function checkKeyless(pass, { captured, run }, reference) {
     for (const p of captured.plugin[s]) if (p.status !== 200) problems.push(`keyless ingest refused a ${s} request (${p.status}): ${p.error}`)
   }
   const rows = logRecordsOf(captured.plugin.logs)
-  if (rows.some(r => r.traceId || r.spanId)) problems.push('with no env block a row named a span')
   if (!rows.some(r => r.attributes['event.name']?.v === 'api_request')) problems.push('no api_request row was sent')
 
   const spans = spansOf(captured.plugin.traces)
+  // Each row carries the ids of the span it ran in, as the exporter's rows do: by event, the kinds of span its rows name are the
+  // ones the exporter's rows named in the same session with the env block, and a row's trace is that span's.
+  const pointed = (list, spanList) => {
+    const byId = new Map(spanList.map(s => [s.spanId, s]))
+    const out = new Map()
+    for (const r of list) {
+      const ev = r.attributes['event.name']?.v
+      const span = r.spanId ? byId.get(r.spanId) : undefined
+      if (span && span.traceId !== r.traceId) problems.push(`a ${ev} row in a trace other than its span's`)
+      const kind = !r.spanId ? 'none' : span ? span.name.replace('claude_code.', '') : 'a span never sent'
+      out.set(ev, new Set([...(out.get(ev) ?? []), kind]))
+    }
+    return out
+  }
+  const wantRows = pointed(logRecordsOf(reference.exporter.logs).filter(r => !STARTUP.has(r.attributes['event.name']?.v)), spansOf(reference.exporter.traces))
+  const gotRows = pointed(rows, spans)
+  const kinds = m => [...m].map(([ev, k]) => `${ev}: ${[...k].sort().join(' and ')}`).sort()
+  for (const ev of new Set([...wantRows.keys(), ...gotRows.keys()])) {
+    const [w, g] = [[...(wantRows.get(ev) ?? [])].sort().join(' and '), [...(gotRows.get(ev) ?? [])].sort().join(' and ')]
+    if (w !== g) problems.push(`logs: ${ev} rows name ${g || 'nothing'}, where the exporter's named ${w || 'nothing'}`)
+  }
+  console.log(`  rows name: ${kinds(gotRows).join('; ')}`)
   const byId = new Map(spans.map(s => [s.spanId, s]))
   const name = s => s.name.replace('claude_code.', '')
   const parentOf = s => (s.parentSpanId ? byId.get(s.parentSpanId) : undefined)
