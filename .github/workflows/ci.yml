@@ -21,10 +21,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Normally `latest`, what people run: Claude Code updates itself, so a break from a new release is a real signal. Pinned for
-  # now: under 2.1.326 the auto-mode comparison sees cost and token series with `query_source` `auxiliary` that the plugin's copy lacks,
-  # and a `plugin_loaded` row that differs. Back to `latest` once the comparison knows them.
-  CLAUDE_CODE_VERSION: 2.1.325
   DISABLE_AUTOUPDATER: '1'
 
 jobs:
@@ -39,7 +35,11 @@ jobs:
         with:
           node-version: 22
       - name: Install Claude Code
-        run: npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" && claude --version
+        # The version is pinned in .github/claude-code/package.json, where Dependabot proposes each new release: a release that
+        # breaks the comparison shows as that pull request failing, not as every other one.
+        run: |
+          version=$(node -p "require('./.github/claude-code/package.json').devDependencies['@anthropic-ai/claude-code']")
+          npm install -g "@anthropic-ai/claude-code@${version}" && claude --version
       - name: Versions match
         run: scripts/check-version.sh
       - name: One plugin, at the root (org sync refuses a manifest anywhere else)
