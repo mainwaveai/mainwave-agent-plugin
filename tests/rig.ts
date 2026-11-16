@@ -100,12 +100,19 @@ export type Post = { url: string; method?: string; headers: Record<string, strin
 /** How the network answers the nth request (1-based): a status, `reject` (no network), or `hang` (no answer). */
 export type Reply = { status: number; text?: string } | 'reject' | 'hang'
 
-/** The network beneath the plugin: records every request and answers each as `reply` says (200 when not given). */
-export function network(on: On, reply: (n: number, post: Post) => Reply = () => ({ status: 200 })): Post[] {
-  const posts: Post[] = []
+/**
+ * The network beneath the plugin: records every request and answers each as `reply` says (200 when not given). With `only`, a
+ * request to any other URL is answered 200 and kept in `others` instead, so `posts` and `reply`'s count see the named URLs alone.
+ */
+export function network(on: On, reply: (n: number, post: Post) => Reply = () => ({ status: 200 }), only?: (url: string) => boolean): Post[] & { others: Post[] } {
+  const posts = Object.assign([] as Post[], { others: [] as Post[] })
   on('http.fetch', async (_$, e) => {
     const req = e as unknown as { url: string; init?: { method?: string; headers?: Record<string, string>; body?: unknown } }
     const post: Post = { url: req.url, method: req.init?.method, headers: { ...(req.init?.headers ?? {}) }, body: String(req.init?.body ?? '') }
+    if (only && !only(req.url)) {
+      posts.others.push(post)
+      return { value: { status: 200, ok: true, headers: {}, text: '{"partialSuccess":{}}' } } as never
+    }
     posts.push(post)
     const r = reply(posts.length, post)
     if (r === 'reject') throw new Error('network refused in test')

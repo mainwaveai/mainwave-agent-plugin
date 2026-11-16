@@ -8,8 +8,8 @@ A Claude Code mod at the repository root: `.claude-plugin/plugin.json` (manifest
 claude plugin validate .        # manifest, marketplace and hooks module, read the way Claude Code will
 claude plugin test .            # tests/*.test.ts against the engine
 scripts/check-version.sh        # plugin.json and hooks/version.ts agree
-scripts/check-hooks.sh          # the row hook keeps its fail-open .catch; session.end is hooked
-node tests/e2e/compare.mjs      # one real session, model mocked: the plugin's copy against the exporter's rows
+scripts/check-hooks.sh          # the row, tool call and spawn hooks keep their fail-open .catch; the turn hooks and session.end are hooked
+node tests/e2e/compare.mjs      # one real session, model mocked: the plugin's copy against the exporter's logs, spans and metrics
 ```
 
 CI runs all five on every pull request. The type check is local only (README, Developing).

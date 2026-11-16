@@ -4,7 +4,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { boot, DEV_URL, KEY, keyOption, log, LOGGED_AT, memoryStore, network, ORG, ownedKeys, records, STAMPED, type Layers, type Reply } from './rig.ts'
+import { boot, DEV_URL, KEY, keyOption, log, LOGGED_AT, memoryStore, network, ORG, ownedKeys, records, STAMPED, type Layers, type Post, type Reply } from './rig.ts'
 
 const withKey = { options: { devIngestKey: KEY } }
 const SPAN = { traceId: '7d2fa3029813d71c9ad4ef05815fa7d5', spanId: 'e4a76fb0fca33a96', traceFlags: 1 }
@@ -26,7 +26,8 @@ const row = (seq: number, extra: Record<string, unknown> = {}) => ({
 function world(on: On, opts: { layers?: Layers; env?: Record<string, string>; reply?: (n: number) => Reply; store?: Record<string, unknown> } = {}) {
   const clock = mock.clock(on, { now: START })
   const { sets, data } = memoryStore(on, opts.store ?? {})
-  const posts = network(on, opts.reply)
+  // The log rows' copy alone: the spans and metrics rebuilt beside them have tests of their own.
+  const posts = network(on, opts.reply, url => url === DEV_URL)
   const rig = boot(on, { entrypoint: 'cli', layers: opts.layers, env: opts.env })
   // The engine's own steps beneath the plugin's session hooks, and its debug log.
   on('session.start', (_$, e) => ({ cwd: (e as { cwd: string }).cwd }) as never)
@@ -47,7 +48,14 @@ async function logRow($: Engine, rig: ReturnType<typeof boot>, attributes: Recor
   return rig.rows[rig.rows.length - 1]!.attributes
 }
 
-const sentSequences = (posts: ReturnType<typeof network>) => posts.flatMap(p => (p.url === DEV_URL ? records(p).map(r => r.attributes['event.sequence']) : []))
+/** The `event.sequence` of each log row an outbox the store holds keeps, in order. */
+const outboxSequences = (box: unknown) => {
+  const b = box as { v: number; items: { s: string; d: { attributes: Record<string, unknown> } }[] }
+  expect(b.v).toBe(2)
+  return b.items.filter(i => i.s === 'logs').map(i => i.d.attributes['event.sequence'])
+}
+
+const sentSequences = (posts: readonly Post[]) => posts.flatMap(p => (p.url === DEV_URL ? records(p).map(r => r.attributes['event.sequence']) : []))
 
 describe('without a key', () => {
   test('the plugin sends nothing and writes nothing', async ($, on) => {
@@ -204,8 +212,7 @@ describe('retry', () => {
     await logRow($, rig, row(2))
     await clock.advance(10 * TICK)
     expect(posts.length).toBe(1)
-    const last = sets.filter(s => s.key.startsWith('outbox:')).at(-1)!.value as { rows: { attributes: Record<string, unknown> }[] }
-    expect(last.rows.map(r => r.attributes['event.sequence'])).toEqual([1, 2])
+    expect(outboxSequences(sets.filter(s => s.key.startsWith('outbox:')).at(-1)!.value)).toEqual([1, 2])
   })
 })
 
@@ -226,10 +233,10 @@ describe('across sessions', () => {
     await $.session.end({ reason: 'other', sessionId: 's-1', resume } as never)
     expect(posts.length).toBe(1)
     expect(logs.length).toBe(1)
-    expect(logs[0]).toContain('0 sent, 0 dropped, 1 kept for a later session')
+    // The row's own copy is kept; its request's span and its cost and token points went to their own paths.
+    expect(logs[0]).toContain('3 sent, 0 dropped, 1 kept for a later session')
     expect(logs.join('')).not.toContain(KEY)
-    const last = sets.filter(s => s.key.startsWith('outbox:')).at(-1)!.value as { rows: { attributes: Record<string, unknown> }[] }
-    expect(last.rows.map(r => r.attributes['event.sequence'])).toEqual([1])
+    expect(outboxSequences(sets.filter(s => s.key.startsWith('outbox:')).at(-1)!.value)).toEqual([1])
     expect(JSON.stringify(sets)).not.toContain(KEY)
   })
 
@@ -252,6 +259,29 @@ describe('across sessions', () => {
     expect(records(posts[0]!)[0]!.resource['service.version']).toBe('2.1.300')
   })
 
+  test("a later session sends what an outbox kept of each signal to that signal's path", withKey, async ($, on) => {
+    const resources = [JSON.stringify({ 'service.name': 'claude-code', 'service.version': '2.1.300' })]
+    const span = { traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), name: 'claude_code.tool', startMs: 1, endMs: 2, attributes: { tool_name: 'Bash' } }
+    const point = { name: 'claude_code.commit.count', startMs: 1, timeMs: 2, value: 1, attributes: {} }
+    const box = { v: 2, updatedAt: START - 120_000, resources, items: [
+      { s: 'logs', r: 0, d: { event: 'api_request', loggedAt: LOGGED_AT, attributes: row(7) } },
+      { s: 'traces', r: 0, d: span },
+      { s: 'metrics', r: 0, d: point },
+      { s: 'traces', r: 0, d: { name: 'not a span' } },
+      { s: 'elsewhere', r: 0, d: span },
+    ] }
+    const clock = mock.clock(on, { now: START })
+    memoryStore(on, { 'outbox:gone': box })
+    const all = network(on)
+    boot(on, { entrypoint: 'cli' })
+    on('session.start', (_$, e) => ({ cwd: (e as { cwd: string }).cwd }) as never)
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await clock.advance(TICK)
+    expect(all.map(p => p.url).sort()).toEqual([DEV_URL, 'https://collector.dev.mainwave.com/v1/metrics', 'https://collector.dev.mainwave.com/v1/traces'])
+    const traces = JSON.parse(all.find(p => p.url.endsWith('/traces'))!.body)
+    expect(traces.resourceSpans[0].scopeSpans[0].spans.map((x: { spanId: string }) => x.spanId)).toEqual(['b'.repeat(16)])
+  })
+
   test('an outbox of the wrong shape is cleared, not sent', withKey, async ($, on) => {
     const { clock, posts, rig, data } = world(on, { store: { 'outbox:bad': { v: 1, rows: 'x' } } })
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
@@ -262,7 +292,7 @@ describe('across sessions', () => {
   })
 
   test('an outbox a later version wrote is left alone', withKey, async ($, on) => {
-    const later = { v: 2, updatedAt: 0, anything: ['new'] }
+    const later = { v: 3, updatedAt: 0, anything: ['new'] }
     const { clock, posts, data } = world(on, { store: { 'outbox:later': later } })
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
     await clock.advance(20 * TICK)
@@ -285,8 +315,8 @@ describe('across sessions', () => {
     await logRow($, rig, row(1))
     await clock.advance(TICK)
     await $.session.end({ reason: 'other', sessionId: 's-1', resume } as never)
-    const boxes = [...data.entries()].filter(([k]) => k.startsWith('outbox:')).map(([, v]) => v as { rows: { attributes: Record<string, unknown> }[] })
-    expect(boxes.flatMap(b => b.rows.map(r => r.attributes['event.sequence']))).toEqual([1])
+    const boxes = [...data.entries()].filter(([k]) => k.startsWith('outbox:')).map(([, v]) => v)
+    expect(boxes.flatMap(outboxSequences)).toEqual([1])
   })
 
   test('after a /clear, rows the end could not send go on being sent, with no new row', withKey, async ($, on) => {

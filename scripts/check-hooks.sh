@@ -1,6 +1,7 @@
 #!/bin/sh
-# What the engine will load, as `claude plugin validate --json` reports it: the collector row hook with its fail-open `.catch`, and
-# session.end. A hook dropped, or a `.catch` removed, fails here: the tests call the hook bodies, not the registrations.
+# What the engine will load, as `claude plugin validate --json` reports it: the collector row hook, the tool call hook and the spawn
+# hook each with its fail-open `.catch`; the turn hooks the rebuilt spans need; and session.end. A hook dropped, or a `.catch`
+# removed, fails here: the unit tests call the hook bodies, not the registrations.
 set -eu
 cd "$(dirname "$0")/.."
 claude plugin validate . --json | node -e '
@@ -12,9 +13,13 @@ process.stdin.on("data", d => (s += d)).on("end", () => {
   const gating = hooks.flatMap(c => c.gatingHooks ?? [])
   const fail = []
   if (!notes.some(n => /hooks: .*\btelemetry\.log\{to=collector\}/.test(n))) fail.push("no telemetry.log hook on the collector stream")
-  if (!notes.some(n => /hooks: .*\bsession\.end\b/.test(n))) fail.push("no session.end hook")
-  const row = gating.find(g => g.hook === "telemetry.log{to=collector}")
-  if (row === undefined || row.hasCatch !== true) fail.push("the telemetry.log hook has no .catch")
+  for (const h of ["session.end", "turn.start", "turn.step", "turn.complete"]) {
+    if (!notes.some(n => new RegExp(`hooks: .*\\b${h.replace(".", "\\.")}\\b`).test(n))) fail.push(`no ${h} hook`)
+  }
+  for (const h of ["telemetry.log{to=collector}", "tool.call", "agent.spawn"]) {
+    const g = gating.find(x => x.hook === h)
+    if (g === undefined || g.hasCatch !== true) fail.push(`the ${h} hook has no .catch`)
+  }
   if (fail.length) { console.error("check-hooks: " + fail.join("; ")); process.exit(1) }
-  console.log("hooks: telemetry.log{to=collector} with .catch, session.end")
+  console.log("hooks: telemetry.log{to=collector}, tool.call and agent.spawn with .catch; turn.start, turn.step, turn.complete, session.end")
 })'
