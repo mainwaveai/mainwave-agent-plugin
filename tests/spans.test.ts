@@ -20,7 +20,8 @@ function world(on: On, opts: { reply?: (n: number, post: Post) => Reply; store?:
   const clock = mock.clock(on, { now: START })
   memoryStore(on, opts.store)
   const posts = network(on, opts.reply)
-  const rig = boot(on, { entrypoint: 'cli', env: { OTEL_LOG_TOOL_DETAILS: '1', OTEL_RESOURCE_ATTRIBUTES: 'mainwave.source=coding_agent.claude_code' } })
+  // The org-wide env block's beta: Claude Code traces, and its rows name their spans.
+  const rig = boot(on, { entrypoint: 'cli', env: { OTEL_LOG_TOOL_DETAILS: '1', OTEL_RESOURCE_ATTRIBUTES: 'mainwave.source=coding_agent.claude_code', CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: '1' } })
   on('session.start', (_$, e) => ({ cwd: (e as { cwd: string }).cwd }) as never)
   on('session.end', (_$, e) => ({ sessionId: (e as { sessionId: string }).sessionId }) as never)
   on('ui.log', () => ({ value: undefined }) as never)

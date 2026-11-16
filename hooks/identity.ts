@@ -49,3 +49,21 @@ export function mergeIdentity(held: RowIdentity, seen: RowIdentity): RowIdentity
   }
   return changed ? next : held
 }
+
+/**
+ * Keys a Mainwave source processor stores in place of a record's `user.email`. Keyless ingest refuses a record that carries one, as
+ * it could be routed by one address and shown under another.
+ */
+const EMAIL_OVERRIDES = ['kiro.user.email']
+
+/**
+ * Who a record is routed to without a key: its own `organization.id` and `user.email`, as one string, when both fit their shapes and
+ * nothing would override the email; undefined otherwise. Keyless ingest reads the pair from each record, span and data point (never
+ * the resource) and takes one pair per request.
+ */
+export function routingIdentityOf(attributes: Readonly<Record<string, unknown>>): string | undefined {
+  const own = (k: string) => Object.prototype.hasOwnProperty.call(attributes, k)
+  if (EMAIL_OVERRIDES.some(own)) return undefined
+  const { organizationId, email } = identityOf(attributes)
+  return organizationId !== undefined && email !== undefined ? `${organizationId} ${email}` : undefined
+}

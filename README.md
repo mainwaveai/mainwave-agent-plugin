@@ -21,7 +21,7 @@ Mainwave can then tell which sessions run the plugin, which version, and where.
 
 It also reads who the session is from those rows: the organization (`organization.id`), the account (`user.account_uuid`), the email (`user.email`) and the device (`user.id`, an ID Claude Code keeps per installation). It keeps them in memory for the session and sends them nowhere new. Later versions use them to ask Mainwave for the session's settings.
 
-**It sends its own copy, to Mainwave's dev collector.** This is the first step toward the plugin delivering a session's telemetry by itself. Where a person has set a dev ingest key (see Settings), the plugin sends a copy of a session's log rows, spans and metrics to `https://collector.dev.mainwave.com` (`/v1/logs`, `/v1/traces` and `/v1/metrics`), and nowhere else. Claude Code's exporter goes on sending the originals wherever the organization pointed it, so nothing is counted twice, and the two can be compared record for record.
+**It sends its own copy, to Mainwave's dev collector.** This is the first step toward the plugin delivering a session's telemetry by itself. Where a person has set a dev ingest key, or turned on sending without one (see Settings), the plugin sends a copy of a session's log rows, spans and metrics to `https://collector.dev.mainwave.com` (`/v1/logs`, `/v1/traces` and `/v1/metrics`), and nowhere else. Where the organization's `env` block is in place, Claude Code's exporter goes on sending the originals wherever the organization pointed it, so nothing is counted twice, and the two can be compared record for record. Without it, the plugin's copy is all that is sent.
 
 - **Log rows** are copies: the exporter's row as Claude Code raised it, with the same attributes (identity, `event.name`, `event.sequence`, `event.timestamp`), the same time and the same trace and span IDs.
 - **Spans and metrics are rebuilt.** They never pass through a plugin: the one hook Claude Code gives plugins for its telemetry carries log rows alone. So the plugin puts them back together from what it does see: the rows, and Claude Code's own events for turns, model requests, tool calls and subagents. What it sends has the exporter's names, attributes, attribute order and value types, and the exporter's trace IDs; the table below says where each comes from.
@@ -40,6 +40,11 @@ It also reads who the session is from those rows: the organization (`organizatio
 | `claude_code.code_edit_tool.decision` | Each `tool_decision` row of an Edit, Write or NotebookEdit call |
 | `claude_code.active_time.total` (`type` `cli`) | Each interaction's duration, a turn's or a command's |
 | `claude_code.session.count` | The session's start |
+
+**With and without the env block.** Claude Code ties its rows to its spans only when it traces, which Mainwave's `env` block turns on (`CLAUDE_CODE_ENHANCED_TELEMETRY_BETA`, with a traces exporter). Without it, Claude Code still hands the plugin every row and every event, but no row names a span, and there are no exporter spans to mirror. So the plugin decides once per load, from that variable (`CLAUDE_CODE_ENHANCED_TELEMETRY_BETA`, else `ENABLE_ENHANCED_TELEMETRY_BETA`, as Claude Code reads it):
+
+- **On: it mirrors the exporter**, ids and all, as the table above says. That holds under a host that drives Claude Code through its SDK too, where some rows name spans and others do not and the exporter's own spans are partly disconnected: the plugin copies that shape rather than repair it.
+- **Off, and no row has named a span: it builds the trace itself.** Each interaction is the root of a trace of its own, started as the turn (or the slash command) starts. The turn's model requests and tool calls are its children, each call's `blocked_on_user` and `execution` spans the call's, and a subagent's requests and calls are children of its Agent call's `execution` span, nested subagents included. Every id is the plugin's own. A request outside the main loop and its subagents (a session title, a summary, a classifier) is a root, as the exporter sends it. If a row ever names a span after all, the plugin goes back to mirroring from then on.
 
 Every span and data point starts with the attributes Claude Code puts first on all its records (the session's identity, the organization's resource attributes, the repository): the plugin takes them from the latest row, everything before its `event.name`. Metrics are monotonic sums with delta temporality, as Claude Code sends them: summed between collections, collected every `OTEL_METRIC_EXPORT_INTERVAL` milliseconds (a minute unless set) and once more as the session ends.
 
@@ -68,7 +73,10 @@ Every span and data point starts with the attributes Claude Code puts first on a
 | `parent.source` `event` and `queued_sends` above 0 on `interaction`, and the span's links | Claude Code sets them only for a prompt that carries a trace from another session (in its own hosted environments); the plugin sends `env` or `none`, and 0 |
 | Metric points whose request timed out or was cut off at session end | They may have landed; sending them again could count them twice, so they are dropped |
 | `mainwave.telemetry.route` on spans and metrics | Added by design; the exporter's spans and metrics carry no route, as the plugin cannot stamp them |
+| Without the env block: every trace and span id, and a trace id on the log rows | Claude Code makes none; the plugin makes its own for its spans and leaves the rows as Claude Code raised them |
+| Without the env block: a parent from `TRACEPARENT` | Each interaction is the root of its trace, whatever trace the host started |
 
+- **Keyless:** with no key, the plugin sends no `Authorization` header (one would send the request down the key path, where it is refused). The dev collector routes each request by the `organization.id` and `user.email` on every record, span and data point in it (never the resource's), one pair per request. So the plugin queues only records that carry both, each of the right shape: a session on an API key or a cloud provider names no organization or email, and its records are held back, not sent. Each batch holds one pair's records alone, so a batch the collector refuses holds back or drops no one else's. A refusal of the pair (403, reason `unclaimed`: no Mainwave workspace has claimed the Claude organization; `email_domain`: the email's domain is not one the workspace accepts) stops sending that pair's records until the plugin loads again, and keeps them; other pairs, from outboxes earlier sessions left, go on. Any other refusal stops sending for the load, as a refused key does. Keyless sending is for the dev collector alone.
 - **How it goes:** the hooks only queue. A timer sends the queue in batches of up to 200 records of one signal every 5 seconds, and the end of a session sends one more batch of each signal at once. After a network failure, a timeout or a busy collector, the batch goes back in the queue and the wait before that signal's next try doubles, up to a minute; the other signals go on. A path the collector does not have (404) is not tried again until the plugin loads again, and its records are kept. A batch the collector refuses as malformed, or that cannot be written as a request, is dropped. A refused key stops sending until the plugin loads again. A metric batch whose request timed out, or was cut off as the session ended, is dropped rather than tried again: it may have landed, and a delta sent twice counts twice. A span waits up to 2 seconds for the event it pairs with, then goes with what it has.
 - **What survives:** the queue, all three signals together, is kept in the plugin's store (about 1 MB at most, a few hundred to a few thousand records, oldest dropped first), saved at most every 10 seconds and at session end, so records a session could not send are sent by a later one. A process that dies loses at most the last 10 seconds or so of copies, and the metrics since their last collection. The end of a session is short (Claude Code gives all of a session's end hooks 1.5 seconds together), so the last batches may be sent by the next session instead.
 
@@ -76,16 +84,16 @@ Rules it keeps:
 
 - **It never holds anything up.** The exporter's row always goes on, whether or not the copy could be queued. If stamping fails, the row goes on as Claude Code wrote it, minus any key the plugin owns. The hooks on turns, model requests, tool calls, slash commands and subagents only watch: each passes its event and its result on unchanged, and a fault in one is caught.
 - **Nothing else can pose as it.** Any key under `mainwave.mod.` or `mainwave.telemetry.` already on a row is removed before the plugin adds its own, and each value it adds must fit a fixed shape.
-- **Its key goes to one place.** The plugin sends the dev ingest key only to the dev collector, as a bearer token, and never writes it to a row, a file or a log. The plugin never reads the organization's collector URL or key. This holds against settings, not against other plugins: any plugin the person installs can see and rewrite every plugin's requests, this one's included, so a dev key is only as safe as the person's other plugins.
+- **Its key goes to one place.** The plugin sends the dev ingest key only to the dev collector, as a bearer token, and never writes it to a row, a file or a log. Keyless, it sends no key at all. The plugin never reads the organization's collector URL or key. This holds against settings, not against other plugins: any plugin the person installs can see and rewrite every plugin's requests, this one's included, so a dev key is only as safe as the person's other plugins.
 - **It adds nothing else.** No prompts, tool arguments, results or file contents beyond what Claude Code's own rows and spans carry, under the same settings (`OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_TOOL_DETAILS`); no commands, panes or tools.
 
-With no collector configured and no dev key, the plugin has no rows to stamp and sends nothing.
+With no collector configured, no dev key and keyless sending off, the plugin has no rows to stamp and sends nothing.
 
 ## What is coming
 
 In rough order, each in a later version:
 
-1. **Its own telemetry, without the env block.** Once Mainwave's collector accepts telemetry without a key, the plugin sends a session's rows, spans and metrics itself, so an organization needs nothing but the plugin.
+1. **Its own telemetry, without the env block, by default.** The plugin can already send a session's rows, spans and metrics without the env block or a key, to the dev collector, where a person turns it on. Next it does so to Mainwave's production collector, without anyone turning it on, so an organization needs nothing but the plugin.
 2. **Settings from Mainwave.** At session start the plugin asks Mainwave for the organization's settings and the session's state, by the organization, account, email and device it read.
 3. **Attributes.** The organization's attribute list in the session: Claude or the person sets a value (such as the project) with `/mainwave:attribute`, or proposes a new one for an admin to accept.
 4. **Anthropic's plugin directory.** A public listing, so updates reach every organization that sets the plugin to Required, and personal Pro and Max accounts can install it.
@@ -118,7 +126,10 @@ Answer `y` to add the marketplace, then pick a scope. From a shell: `claude plug
 
 ## Settings
 
-The plugin has one option, `devIngestKey`: an ingest key for Mainwave's dev collector. Unset (the default), the plugin sends nothing of its own. There is no switch to turn stamping off; to stop the plugin, remove it.
+The plugin has two options, both for Mainwave's dev collector. With neither set (the default), the plugin sends nothing of its own. There is no switch to turn stamping off; to stop the plugin, remove it.
+
+- `devIngestKey`: an ingest key for the dev collector. Set, the copy goes with it as a bearer token.
+- `devKeyless`: `true` sends the copy without a key, routed by the Claude organization and email on each record (see Keyless, above). It needs the collector to route the organization to a Mainwave workspace. A key, where one is set too, wins.
 
 Set the key from a shell, so it is kept in secure storage. It is read from standard input, so it stays out of the command line and shell history:
 
@@ -136,9 +147,19 @@ Your own settings (`~/.claude/settings.json`, or `--settings`) also work, with t
 }
 ```
 
+Keyless sending is a plain switch, in your own settings:
+
+```json
+{
+  "pluginConfigs": {
+    "mainwave@synced": { "options": { "devKeyless": true } }
+  }
+}
+```
+
 The name to use is the plugin's ID: `mainwave@synced` for org sync, `mainwave@mainwave` for an install from this repository, or `mainwave` (or `mainwave@inline`) for a `--plugin-dir` load.
 
-Only the person's own settings count. If a repository's settings (`.claude/settings.json` or `.claude/settings.local.json`) name `devIngestKey` under any of the plugin's IDs, to any value, or cannot be read, the plugin sends nothing and drops what it had queued.
+Only the person's own settings count. If a repository's settings (`.claude/settings.json` or `.claude/settings.local.json`) name `devIngestKey` or `devKeyless` under any of the plugin's IDs, to any value, or cannot be read, the plugin sends nothing and drops what it had queued.
 
 ## Developing
 
@@ -150,13 +171,13 @@ claude plugin test .            # runs tests/*.test.ts against the engine
 scripts/check-version.sh        # plugin.json and hooks/version.ts agree
 scripts/check-layout.sh         # one plugin, at the root: org sync refuses a .claude-plugin/ or plugin.json anywhere else
 scripts/check-hooks.sh          # the row, tool call, command and spawn hooks keep their fail-open .catch; the turn hooks and session.end are hooked
-node tests/e2e/compare.mjs      # one real session, model mocked: the plugin's copy against the exporter's logs, spans and metrics
+node tests/e2e/compare.mjs      # real sessions, model mocked: the plugin's copy against the exporter's; without the env block, keyless and coherent
 claude --plugin-dir .           # a session with the plugin loaded from this folder
 ```
 
 CI runs all but the last on every pull request.
 
-The end-to-end comparison runs `claude -p` in a fresh config folder and a scratch git repository, with an API key and a local mock of the Anthropic API, so no login and no organization's settings reach it, and nothing leaves the machine. The mock model scripts a turn that runs Bash, writes and edits a file, commits, is refused a command and starts a background subagent; it answers each request after a different delay, and refuses one request once as overloaded, so Claude Code retries it. The session runs twice: with prompts and tool details logged, and with neither. Claude Code's exporter sends all three signals to a local receiver, and a test-only plugin, built in a temporary folder from `tests/e2e/redirect.ts`, sends the plugin's copy there too. The script pairs every log row by session, event name and sequence; every span by what identifies it (its ID where the rows name it, else its request ID or tool call ID); and every metric series by its name and attributes, summing its points. It compares each pair field by field, attribute keys in order and value types included, and fails on any difference but the known ones in the table above, which it lists with their counts. `--keep` keeps what was received. The type check runs locally: start one interactive session with `claude --plugin-dir .`, which writes Claude Code's declarations to `.claude-plugin/types/` (gitignored), then run `npx -p typescript@5.6.3 tsc -p .`.
+The end-to-end comparison runs `claude -p` in a fresh config folder and a scratch git repository, with an API key and a local mock of the Anthropic API, so no login and no organization's settings reach it, and nothing leaves the machine. The mock model scripts a turn that runs Bash, writes and edits a file, commits, is refused a command and starts a background subagent; it answers each request after a different delay, and refuses one request once as overloaded, so Claude Code retries it. The session runs three times: with the env block, once with prompts and tool details logged and once with neither, and then without it. With it, Claude Code's exporter sends all three signals to a local receiver, and a test-only plugin, built in a temporary folder from `tests/e2e/redirect.ts`, sends the plugin's copy there too. The script pairs every log row by session, event name and sequence; every span by what identifies it (its ID where the rows name it, else its request ID or tool call ID); and every metric series by its name and attributes, summing its points. It compares each pair field by field, attribute keys in order and value types included, and fails on any difference but the known ones in the table above, which it lists with their counts. Without the env block, the exporter sends nothing and the plugin sends keyless; the receiver applies keyless ingest's rules (no `Authorization` header; one `organization.id` and one `user.email` on every item, the same pair across a request) and the script fails on any request it refuses, and on any span out of its place in the interaction's trace. As the session runs on an API key, its rows carry an organization and an email there only through `OTEL_RESOURCE_ATTRIBUTES`, standing in for what a login puts on them. `--keep` keeps what was received. The type check runs locally: start one interactive session with `claude --plugin-dir .`, which writes Claude Code's declarations to `.claude-plugin/types/` (gitignored), then run `npx -p typescript@5.6.3 tsc -p .`.
 
 A release bumps the version in both `.claude-plugin/plugin.json` and `hooks/version.ts`.
 
@@ -164,12 +185,12 @@ A release bumps the version in both `.claude-plugin/plugin.json` and `hooks/vers
 | --- | --- |
 | `hooks/register.ts` | the hooks: the collector row hook and its fail-open handler, the turn, model request, tool call, command and spawn hooks, `session.start` and `session.end` |
 | `hooks/stamps.ts` | the keys the plugin owns, their shape rules, and the strip of forged keys |
-| `hooks/settings.ts` | where the dev ingest key may come from, and its shape |
-| `hooks/identity.ts` | the organization, account, email and device read from a row |
-| `hooks/rebuild.ts` | Claude Code's spans, and the measures behind its metrics, rebuilt from rows and events |
+| `hooks/settings.ts` | where the dev ingest key and the keyless switch may come from, and their shapes |
+| `hooks/identity.ts` | the organization, account, email and device read from a row, and the pair a record is routed by without a key |
+| `hooks/rebuild.ts` | Claude Code's spans, and the measures behind its metrics, rebuilt from rows and events; without the env block, the trace built by the plugin |
 | `hooks/derive.ts` | the rules Claude Code fills attributes by: tool names, query sources, Bash commands, line counts, languages |
 | `hooks/meter.ts` | the counters behind the metrics, collected as delta points |
-| `hooks/sender.ts` | the copy: one queue for all three signals, timer, batches, retries and the outbox kept in the store |
+| `hooks/sender.ts` | the copy: one queue for all three signals, timer, batches (keyless, one organization and email each), retries and the outbox kept in the store |
 | `hooks/otlp.ts` | the copy as OTLP/JSON (log records, spans, metric points), with the resource rebuilt as the exporter builds it |
 | `hooks/http.ts` | `fetchWithin`: a request with a time limit that ends with its session |
 

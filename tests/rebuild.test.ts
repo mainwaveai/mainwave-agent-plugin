@@ -5,7 +5,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import type { BuiltSpan } from '../hooks/otlp.ts'
 import {
-  agentSpawned, commandEnd, commandStart, commonOf, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, takeReady, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart,
+  agentSpawned, commandEnd, commandStart, commonOf, isCoherent, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, takeReady, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart,
   type Emit, type Rebuild, type RowIn, type Settings,
 } from '../hooks/rebuild.ts'
 import { ORG } from './rig.ts'
@@ -19,7 +19,7 @@ const COMMON = { 'mainwave.source': 'coding_agent.claude_code', 'organization.id
 /** A rebuild whose new ids count up, so tests can name them. */
 function rebuild(settings: Partial<Settings> = {}): Rebuild {
   let n = 0
-  return newRebuild({ toolDetails: true, ...settings }, len => (++n).toString(16).padStart(len, 'a'))
+  return newRebuild({ toolDetails: true, claudeTraces: true, ...settings }, len => (++n).toString(16).padStart(len, 'a'))
 }
 
 const row = (event: string, atMs: number, attributes: Record<string, unknown>, spanId?: string): RowIn => ({
@@ -496,5 +496,160 @@ describe('the session', () => {
     const r = rebuild({ valueLengthLimit: 5 })
     const { spans } = observeRow(r, request(1, 7, { query_source: 'compact', model: 'claude-haiku-5-5-long-name' }, ''))
     expect(spans[0]!.attributes['model']).toBe('claud')
+  })
+})
+
+describe('without the beta, no row names a span: the plugin builds the trace (coherent mode)', () => {
+  const coherent = () => rebuild({ claudeTraces: false })
+  const one = (spans: BuiltSpan[], name: string) => {
+    const found = named(spans, name)
+    expect(found.length).toBe(1)
+    return found[0]!
+  }
+
+  /** A main-loop turn with one Bash call, as Claude Code raises it without the beta: the same events and rows, none naming a span. */
+  function bareTurn(r: Rebuild, id = 't1', at = 0, input = 1201) {
+    const out: Emit[] = []
+    out.push(observeRow(r, row('user_prompt', at + 1, { prompt: 'run it', prompt_length: '6' })))
+    out.push(turnStart(r, { turnId: id, text: 'run it' }, at + 2))
+    stepStart(r, undefined, 'claude-haiku-5-5')
+    toolStart(r, { tool: 'Bash', tool_use_id: `${id}_bash`, command: 'echo e2e', description: 'x' }, at + 30)
+    out.push(observeRow(r, row('tool_decision', at + 35, { decision: 'accept', source: 'config', tool_name: 'Bash', tool_use_id: `${id}_bash` })))
+    out.push(stepEnd(r, undefined, at + 10, { stopReason: 'tool_use', usage: usage(input) }, at + 40))
+    out.push(observeRow(r, request(at + 41, input, {}, '')))
+    out.push(observeRow(r, row('tool_result', at + 80, { tool_name: 'Bash', tool_use_id: `${id}_bash`, success: 'true' })))
+    out.push(toolEnd(r, `${id}_bash`, { result: { stdout: 'e2e' } }, at + 81))
+    stepStart(r, undefined, 'claude-haiku-5-5')
+    out.push(observeRow(r, request(at + 120, input + 1, {}, '')))
+    out.push(stepEnd(r, undefined, at + 90, { stopReason: 'end_turn', usage: usage(input + 1) }, at + 121))
+    out.push(turnComplete(r, { turnId: id, durationMs: 128 }, at + 130))
+    return all(...out)
+  }
+
+  test('the interaction is the root of its own trace; its requests and calls are its children, the decision and the run the call\'s', () => {
+    const { spans } = bareTurn(coherent())
+    const i = one(spans, 'interaction')
+    expect(i.parentSpanId).toBeUndefined()
+    expect(i.attributes['user_prompt']).toBe('run it')
+    expect(new Set(spans.map(s => s.traceId))).toEqual(new Set([i.traceId]))
+    const reqs = named(spans, 'llm_request')
+    expect(reqs.map(s => [s.parentSpanId, s.attributes['llm_request.context']])).toEqual([[i.spanId, 'interaction'], [i.spanId, 'interaction']])
+    const tool = one(spans, 'tool')
+    expect(tool.parentSpanId).toBe(i.spanId)
+    expect(one(spans, 'tool.blocked_on_user').parentSpanId).toBe(tool.spanId)
+    expect(one(spans, 'tool.execution').parentSpanId).toBe(tool.spanId)
+    expect(new Set(spans.map(s => s.spanId)).size).toBe(spans.length)
+  })
+
+  test('each turn is a trace of its own', () => {
+    const r = coherent()
+    const first = one(bareTurn(r, 't1', 0, 1201).spans, 'interaction')
+    const second = bareTurn(r, 't2', 1_000, 1301).spans
+    const i2 = one(second, 'interaction')
+    expect(i2.traceId).not.toBe(first.traceId)
+    expect(i2.attributes['interaction.sequence']).toBe(2)
+    expect(new Set(second.map(s => s.traceId))).toEqual(new Set([i2.traceId]))
+  })
+
+  test("a subagent's requests and calls sit under its Agent call's run, in the turn's trace, nested subagents too", () => {
+    const r = coherent()
+    const out: Emit[] = []
+    out.push(turnStart(r, { turnId: 't1', text: 'go' }, 0))
+    toolStart(r, { tool: 'Agent', tool_use_id: 'toolu_a', subagent_type: 'general-purpose', prompt: 'p', description: 'd' }, 10)
+    out.push(observeRow(r, row('tool_decision', 11, { decision: 'accept', source: 'config', tool_name: 'Agent', tool_use_id: 'toolu_a' })))
+    agentSpawned(r, 'toolu_a', 'a1', undefined)
+    // A background subagent: the call returns as the subagent starts, and the subagent runs on.
+    out.push(observeRow(r, row('tool_result', 20, { tool_name: 'Agent', tool_use_id: 'toolu_a', success: 'true' })))
+    out.push(toolEnd(r, 'toolu_a', { result: { status: 'async_launched' } }, 21))
+    stepStart(r, 'a1', 'claude-haiku-5-5')
+    out.push(stepEnd(r, 'a1', 22, { stopReason: 'tool_use', usage: usage(1300) }, 28))
+    out.push(observeRow(r, request(29, 1300, { agent_id: 'a1', query_source: 'agent:builtin:general-purpose' }, '')))
+    toolStart(r, { tool: 'Bash', tool_use_id: 'toolu_s', agentId: 'a1', command: 'echo sub' }, 30)
+    out.push(observeRow(r, row('tool_decision', 31, { decision: 'accept', source: 'config', tool_name: 'Bash', tool_use_id: 'toolu_s', agent_id: 'a1' })))
+    out.push(observeRow(r, row('tool_result', 35, { tool_name: 'Bash', tool_use_id: 'toolu_s', success: 'true', agent_id: 'a1' })))
+    out.push(toolEnd(r, 'toolu_s', { result: { stdout: 'sub' } }, 36))
+    toolStart(r, { tool: 'Agent', tool_use_id: 'toolu_n', agentId: 'a1', subagent_type: 'Explore', prompt: 'p', description: 'd' }, 40)
+    out.push(observeRow(r, row('tool_decision', 41, { decision: 'accept', source: 'config', tool_name: 'Agent', tool_use_id: 'toolu_n', agent_id: 'a1' })))
+    agentSpawned(r, 'toolu_n', 'a2', 'a1')
+    stepStart(r, 'a2', 'claude-haiku-5-5')
+    out.push(stepEnd(r, 'a2', 42, { stopReason: 'end_turn', usage: usage(1400) }, 48))
+    out.push(observeRow(r, request(49, 1400, { agent_id: 'a2', query_source: 'agent:builtin:Explore' }, '')))
+    out.push(observeRow(r, row('tool_result', 50, { tool_name: 'Agent', tool_use_id: 'toolu_n', success: 'true', agent_id: 'a1' })))
+    out.push(toolEnd(r, 'toolu_n', { result: {} }, 51))
+    // The main turn ends while the background subagent's spans are all sent.
+    out.push(turnComplete(r, { turnId: 't1', durationMs: 60 }, 60))
+    const { spans } = all(...out)
+
+    const i = one(spans, 'interaction')
+    expect(new Set(spans.map(s => s.traceId))).toEqual(new Set([i.traceId]))
+    const byUse = (name: string, id: string) => named(spans, name).find(s => s.attributes['tool_use_id'] === id)!
+    const agentCall = byUse('tool', 'toolu_a')
+    const agentRun = byUse('tool.execution', 'toolu_a')
+    expect(agentCall.parentSpanId).toBe(i.spanId)
+    expect(agentRun.parentSpanId).toBe(agentCall.spanId)
+    const subReq = named(spans, 'llm_request').find(s => s.attributes['agent_id'] === 'a1')!
+    expect([subReq.parentSpanId, subReq.attributes['llm_request.context']]).toEqual([agentRun.spanId, 'tool'])
+    expect(byUse('tool', 'toolu_s').parentSpanId).toBe(agentRun.spanId)
+    expect(byUse('tool.execution', 'toolu_s').parentSpanId).toBe(byUse('tool', 'toolu_s').spanId)
+    const nestedCall = byUse('tool', 'toolu_n')
+    const nestedRun = byUse('tool.execution', 'toolu_n')
+    expect(nestedCall.parentSpanId).toBe(agentRun.spanId)
+    expect(nestedRun.parentSpanId).toBe(nestedCall.spanId)
+    const nestedReq = named(spans, 'llm_request').find(s => s.attributes['agent_id'] === 'a2')!
+    expect(nestedReq.parentSpanId).toBe(nestedRun.spanId)
+    expect(nestedReq.attributes['parent_agent_id']).toBe('a1')
+  })
+
+  test('a request whose span goes after its turn has ended still sits under its interaction', () => {
+    const r = coherent()
+    turnStart(r, { turnId: 't1', text: 'go' }, 0)
+    expect(observeRow(r, request(10, 1201, {}, '')).spans).toEqual([])
+    const i = one(turnComplete(r, { turnId: 't1', durationMs: 15 }, 15).spans, 'interaction')
+    const req = one(sweep(r, 3_000, false).spans, 'llm_request')
+    expect([req.traceId, req.parentSpanId, req.attributes['llm_request.context']]).toEqual([i.traceId, i.spanId, 'interaction'])
+  })
+
+  test("a request outside the main loop and its subagents (a session title) is a root, as Claude Code's exporter sends it", () => {
+    const r = coherent()
+    turnStart(r, { turnId: 't1', text: 'go' }, 0)
+    const aux = one(observeRow(r, request(10, 77, { query_source: 'generate_session_title' }, '')).spans, 'llm_request')
+    expect(aux.parentSpanId).toBeUndefined()
+    expect(aux.attributes['llm_request.context']).toBe('standalone')
+  })
+
+  test("a slash command that asks no model is a trace of its own; one a turn takes over is that turn's interaction", () => {
+    const r = coherent()
+    commandStart(r, 0)
+    commandEnd(r, 5)
+    const cmd = one(sweep(r, 5_000, false).spans, 'interaction')
+    expect(cmd.parentSpanId).toBeUndefined()
+    commandStart(r, 6_000)
+    promptSubmitted(r, { command: 'review' }, 6_001)
+    commandEnd(r, 6_002)
+    turnStart(r, { turnId: 't2', text: 'review it' }, 6_003)
+    stepStart(r, undefined, 'claude-haiku-5-5')
+    stepEnd(r, undefined, 6_004, { stopReason: 'end_turn', usage: usage(1500) }, 6_010)
+    const req = one(observeRow(r, request(6_011, 1500, {}, '')).spans, 'llm_request')
+    const turn = one(turnComplete(r, { turnId: 't2', durationMs: 20 }, 6_020).spans, 'interaction')
+    expect(turn.traceId).not.toBe(cmd.traceId)
+    expect([req.traceId, req.parentSpanId]).toEqual([turn.traceId, turn.spanId])
+    expect(turn.attributes['interaction.sequence']).toBe(2)
+  })
+
+  test('once a row names a span the rebuild mirrors the rows again', () => {
+    const r = coherent()
+    expect(isCoherent(r)).toBe(true)
+    observeRow(r, row('user_prompt', 1, { prompt: 'go', prompt_length: '2' }, INTERACTION))
+    expect(isCoherent(r)).toBe(false)
+    turnStart(r, { turnId: 't1', text: 'go' }, 2)
+    const i = one(turnComplete(r, { turnId: 't1', durationMs: 5 }, 10).spans, 'interaction')
+    expect([i.traceId, i.spanId]).toEqual([TRACE, INTERACTION])
+  })
+
+  test('with the beta on, rows that name no span are mirrored as Claude Code sends them: each request a root of its own', () => {
+    const r = rebuild({ claudeTraces: true })
+    const { spans } = bareTurn(r)
+    expect(named(spans, 'llm_request').map(s => s.parentSpanId)).toEqual([undefined, undefined])
+    expect(new Set(spans.map(s => s.traceId)).size).toBeGreaterThan(1)
   })
 })

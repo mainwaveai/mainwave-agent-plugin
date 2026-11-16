@@ -1,6 +1,7 @@
 // The plugin's hooks module. It stamps the telemetry rows Claude Code exports to the organization's collector (where the organization
-// configured one), keeps the identity those rows carry for the session, and, where the person set a dev ingest key, sends its own
-// copy of each row to Mainwave's dev collector (sender.ts), with the spans and metrics it rebuilds beside them (rebuild.ts, meter.ts).
+// configured one), keeps the identity those rows carry for the session, and, where the person set a dev ingest key or turned keyless
+// sending on, sends its own copy of each row to Mainwave's dev collector (sender.ts), with the spans and metrics it rebuilds beside
+// them (rebuild.ts, meter.ts).
 // It draws nothing and registers no command or tool.
 //
 // The exporter's row always goes on: the copy is queued beside it, never in its place. Fail open: a hook that throws never holds up a
@@ -106,17 +107,34 @@ async function settle(read: Promise<string | undefined>): Promise<string | undef
   }
 }
 
+const truthy = (raw: string | undefined) => ['1', 'true', 'yes', 'on'].includes((raw ?? '').trim().toLowerCase())
+
+/**
+ * Whether Claude Code traces, as it decides it: `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA`, else `ENABLE_ENHANCED_TELEMETRY_BETA`, is on.
+ * A read that fails counts as on, so the rebuild mirrors the rows as it always has rather than build a trace of its own.
+ */
+async function readClaudeTraces($: EngineInterface): Promise<boolean> {
+  try {
+    const [beta, legacy] = await Promise.all([$.env.get('CLAUDE_CODE_ENHANCED_TELEMETRY_BETA'), $.env.get('ENABLE_ENHANCED_TELEMETRY_BETA')])
+    return truthy(beta ?? legacy)
+  } catch {
+    return true
+  }
+}
+
 /** The rebuild for this load, its settings read from the environment once. */
 async function makeRebuild($: EngineInterface): Promise<Rebuild> {
-  const [details, traceparent, spanLimit, anyLimit] = await Promise.all([
+  const [details, traceparent, spanLimit, anyLimit, claudeTraces] = await Promise.all([
     settle($.env.get('OTEL_LOG_TOOL_DETAILS')),
     settle($.env.get('TRACEPARENT')),
     settle($.env.get('OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT')),
     settle($.env.get('OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT')),
+    readClaudeTraces($),
   ])
   const limit = positiveInt(spanLimit) ?? positiveInt(anyLimit)
   return newRebuild({
-    toolDetails: ['1', 'true', 'yes', 'on'].includes((details ?? '').trim().toLowerCase()),
+    toolDetails: truthy(details),
+    claudeTraces,
     ...(parseTraceparent(traceparent) ? { traceparent: parseTraceparent(traceparent)! } : {}),
     ...(limit !== undefined ? { valueLengthLimit: limit } : {}),
   })
@@ -419,7 +437,9 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
     await finish($, next.budget)
     if (isCopying()) {
       const s = snapshot()
-      $.ui.log(`mainwave: copy to dev: ${s.sent} sent, ${s.dropped} dropped, ${s.queued} kept for a later session`, { to: 'debug' })
+      const withheld = s.keyless ? `, ${s.withheld} held back (no organization and email)` : ''
+      const refusals = s.refusedIdentities > 0 ? `, ${s.refusedIdentities} organization and email refused` : ''
+      $.ui.log(`mainwave: copy to dev${s.keyless ? ' (keyless)' : ''}: ${s.sent} sent, ${s.dropped} dropped, ${s.queued} kept for a later session${withheld}${refusals}`, { to: 'debug' })
     }
   } catch {
     // What could not be kept is lost to the copy alone: the exporter's rows went on.

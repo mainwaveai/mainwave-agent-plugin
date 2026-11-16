@@ -10,6 +10,14 @@
 // collector busy) goes back to the head of the queue and the timer waits longer before the next try. A batch the collector refuses
 // as malformed is dropped. A refused key stops sending until the plugin loads again, keeping the queue.
 //
+// Two ways to send: with the person's dev ingest key as a bearer token, or, where the person turned keyless sending on instead, with
+// no `Authorization` header at all. Keyless ingest routes each request by the `organization.id` and `user.email` on every record,
+// span and data point in it, and takes one pair per request. So without a key the plugin queues only records that carry both (a
+// session on an API key or a cloud provider names no organization: its records are held back, never sent), and each batch holds one
+// pair's records alone, so a batch the collector refuses holds back or drops no other person's. A refusal of the pair (403
+// `unclaimed`: no Mainwave workspace has claimed the organization; `email_domain`: the email's domain is not the workspace's) stops
+// sending that pair's records until the plugin loads again, and keeps them; other pairs go on.
+//
 // The queue is kept in `$.store` under this load's own key, so rows left at the end of a session, or by a process that died, are
 // sent by a later one: an outbox no load has touched for a minute is taken over by the next load that looks.
 //
@@ -19,7 +27,8 @@ import type { EngineInterface, PluginOptions, Timer } from 'claude-code'
 
 import { fetchWithin, type FetchOutcome } from './http.ts'
 import { logsBody, metricsBody, resourceOf, tracesBody, type BuiltSpan, type CopiedRow, type MetricPoint } from './otlp.ts'
-import { ingestKeyOf, KEY_OPTION, namesOption, type Layer } from './settings.ts'
+import { routingIdentityOf } from './identity.ts'
+import { ingestKeyOf, KEY_OPTION, KEYLESS_OPTION, keylessOf, namesOption, type Layer } from './settings.ts'
 
 /** The one place the copy goes, a path per signal. Nothing reads another URL from settings or the environment. */
 export const DEV_COLLECTOR = 'https://collector.dev.mainwave.com'
@@ -59,7 +68,8 @@ export const OUTBOX_PREFIX = 'outbox:'
 
 /** One record to send: a log row's copy, a rebuilt span, or a metric data point, tagged with its signal. */
 export type Item = { s: 'logs'; d: CopiedRow } | { s: 'traces'; d: BuiltSpan } | { s: 'metrics'; d: MetricPoint }
-type Queued = Item & { resource: string; size: number }
+/** A queued record: its resource as JSON, its size, and, without a key, who it is routed to (`routingIdentityOf`). */
+type Queued = Item & { resource: string; size: number; who?: string }
 /** What the store keeps: each record's resource as an index into `resources`. Version 1 held log rows alone, as `rows`. */
 export const OUTBOX_VERSION = 2
 type Outbox = { v: 2; updatedAt: number; resources: string[]; items: { s: Signal; r: number; d: unknown }[] }
@@ -79,6 +89,17 @@ export function verdictOf(outcome: FetchOutcome): Verdict {
   return 'retry'
 }
 
+/** Why keyless ingest refused a request's organization and email (a 403 that names it), or undefined for any other answer. */
+export function refusalOf(outcome: FetchOutcome): 'unclaimed' | 'email_domain' | undefined {
+  if (outcome.ok || outcome.reason !== 'status' || outcome.status !== 403) return undefined
+  try {
+    const reason = (JSON.parse(outcome.text) as { reason?: unknown } | null)?.reason
+    return reason === 'unclaimed' || reason === 'email_domain' ? reason : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * Whether a request may have reached the collector though no answer said so: it timed out, or the session ended while it waited. Log
  * rows and spans sent twice are one record to the collector (it keeps one per id); a metric's delta point sent twice would count twice,
@@ -88,6 +109,10 @@ const mayHaveLanded = (outcome: FetchOutcome) => !outcome.ok && (outcome.reason 
 
 // Per load of the module; `configure` starts them over.
 let key: string | null = null
+/** How the copy is sent: with the key, keyless, or not at all. */
+let mode: 'key' | 'keyless' | null = null
+/** The organizations and emails keyless ingest refused this load: their records are kept, not sent. */
+let refusedWho = new Set<string>()
 let outboxKey = ''
 let queue: Queued[] = []
 let queuedBytes = 0
@@ -105,7 +130,7 @@ let scopeVersion: string | undefined
 let dirty = false
 let persistedAt = 0
 let adoptedAt = Number.NEGATIVE_INFINITY
-let counts = { sent: 0, dropped: 0 }
+let counts = { sent: 0, dropped: 0, withheld: 0 }
 
 function freshWaits(): Record<Signal, { backoffMs: number; nextTryAt: number }> {
   return { logs: { backoffMs: 0, nextTryAt: 0 }, traces: { backoffMs: 0, nextTryAt: 0 }, metrics: { backoffMs: 0, nextTryAt: 0 } }
@@ -119,10 +144,12 @@ function newId(): string {
   }
 }
 
-/** Starts the sender over for a load of the module, with the key from the plugin's options. */
+/** Starts the sender over for a load of the module: with the key from the plugin's options, else keyless if they turn it on. */
 export function configure(options: PluginOptions | undefined): void {
   timer?.cancel()
   key = ingestKeyOf(options?.[KEY_OPTION])
+  mode = key !== null ? 'key' : keylessOf(options?.[KEYLESS_OPTION]) ? 'keyless' : null
+  refusedWho = new Set()
   outboxKey = `${OUTBOX_PREFIX}${newId()}`
   queue = []
   queuedBytes = 0
@@ -139,16 +166,25 @@ export function configure(options: PluginOptions | undefined): void {
   dirty = false
   persistedAt = 0
   adoptedAt = Number.NEGATIVE_INFINITY
-  counts = { sent: 0, dropped: 0 }
+  counts = { sent: 0, dropped: 0, withheld: 0 }
 }
 
-/** Whether rows are copied at all: a key of the right shape, and no repository naming it. */
-export const isCopying = (): boolean => key !== null && !refused
+/** Whether rows are copied at all: a key of the right shape or keyless sending on, and no repository naming either. */
+export const isCopying = (): boolean => mode !== null && !refused
+
+/** Who a record is routed to without a key: the `organization.id` and `user.email` on the record itself. */
+const whoOf = (d: unknown): string | undefined => {
+  const attributes = (d as { attributes?: unknown } | null)?.attributes
+  return attributes !== null && typeof attributes === 'object' ? routingIdentityOf(attributes as Record<string, unknown>) : undefined
+}
 
 /** What the sender holds now, for tests and the end-of-session debug line. Never the key. */
 export function snapshot() {
   const backoffMs = Math.max(...SIGNALS.map(sig => waits[sig].backoffMs))
-  return { queued: queue.length, inflight: inflight.length, sent: counts.sent, dropped: counts.dropped, stopped, refused, backoffMs, off: [...off] }
+  return {
+    queued: queue.length, inflight: inflight.length, sent: counts.sent, dropped: counts.dropped, withheld: counts.withheld, stopped, refused, backoffMs,
+    off: [...off], keyless: mode === 'keyless', refusedIdentities: refusedWho.size,
+  }
 }
 
 async function readResource($: EngineInterface): Promise<string> {
@@ -183,6 +219,12 @@ function dropOldest(): void {
  */
 export async function enqueue($: EngineInterface, item: Item): Promise<void> {
   if (!isCopying()) return
+  // Without a key, a record that names no organization and email has nowhere to go: it is held back, never queued.
+  const who = mode === 'keyless' ? whoOf(item.d) : undefined
+  if (mode === 'keyless' && who === undefined) {
+    counts.withheld += 1
+    return
+  }
   resource ??= readResource($)
   const res = await resource
   const size = JSON.stringify(item.d).length
@@ -190,7 +232,7 @@ export async function enqueue($: EngineInterface, item: Item): Promise<void> {
     counts.dropped += 1
     return
   }
-  queue.push({ ...item, resource: res, size } as Queued)
+  queue.push({ ...item, resource: res, size, ...(who !== undefined ? { who } : {}) } as Queued)
   queuedBytes += size
   dirty = true
   dropOldest()
@@ -210,20 +252,30 @@ export function ensureTimer($: EngineInterface): void {
 /** Whether a signal may be sent now: its path answers, and it is not waiting after a failure. */
 const ready = (signal: Signal, now: number) => !off.has(signal) && now >= waits[signal].nextTryAt
 
+/** Whether a record may go at all this load: with a key, any; without one, one routed to an organization and email not refused. */
+const sendable = (item: Queued) => mode !== 'keyless' || (item.who !== undefined && !refusedWho.has(item.who))
+
 /** The signal of the oldest queued record that may be sent now, if any. */
 function nextSignal(now: number): Signal | undefined {
-  return queue.find(item => ready(item.s, now))?.s
+  return queue.find(item => ready(item.s, now) && sendable(item))?.s
 }
 
-/** The oldest records of one signal, in order; the rest of the queue keeps its order. */
+/**
+ * The oldest records of one signal, in order; the rest of the queue keeps its order. Without a key, those of the oldest sendable
+ * record's organization and email alone: keyless ingest takes one pair per request.
+ */
 function takeBatch(signal: Signal): Queued[] {
+  const keyless = mode === 'keyless'
+  const who = keyless ? queue.find(item => item.s === signal && sendable(item))?.who : undefined
+  if (keyless && who === undefined) return []
   const batch: Queued[] = []
   const rest: Queued[] = []
   let bytes = 0
   let full = false
   for (const item of queue) {
-    if (full || item.s !== signal || batch.length >= BATCH_ROWS || (batch.length > 0 && bytes + item.size > BATCH_BYTES)) {
-      if (item.s === signal) full = true
+    const mine = item.s === signal && (!keyless || item.who === who)
+    if (full || !mine || batch.length >= BATCH_ROWS || (batch.length > 0 && bytes + item.size > BATCH_BYTES)) {
+      if (mine) full = true
       rest.push(item)
       continue
     }
@@ -294,7 +346,8 @@ async function send($: EngineInterface, batch: readonly Queued[], limit: number,
   try {
     return await fetchWithin($, DEV_URLS[batch[0]!.s], {
       method: 'POST',
-      headers: { 'content-type': 'application/json', authorization: `Bearer ${key}` },
+      // Without a key, no Authorization header at all: any one sends the request down the key path, where it is refused.
+      headers: mode === 'keyless' ? { 'content-type': 'application/json' } : { 'content-type': 'application/json', authorization: `Bearer ${key}` },
       body,
       timeoutMs: limit,
     })
@@ -322,7 +375,10 @@ function settle(batch: Queued[], outcome: FetchOutcome | 'unwritable', now: numb
     return
   }
   putBack(batch)
-  if (verdict === 'stop') stopped = true
+  // A keyless refusal of one organization and email holds back that pair's records alone; any other refusal stops the load.
+  const who = batch[0]!.who
+  if (verdict === 'stop' && mode === 'keyless' && who !== undefined && refusalOf(outcome) !== undefined) refusedWho.add(who)
+  else if (verdict === 'stop') stopped = true
   else if (verdict === 'off') off.add(signal)
   // A request cut off by the session's end says nothing about the collector: the next session tries again at once.
   else if (outcome.ok || outcome.reason !== 'stopped') {
@@ -410,7 +466,8 @@ export function readOutbox(v: unknown): { updatedAt: number; items: Queued[] } |
       d = row
     }
     if (!fits(s, d)) continue
-    items.push({ s, d, resource: res, size: JSON.stringify(d).length } as Queued)
+    const who = whoOf(d)
+    items.push({ s, d, resource: res, size: JSON.stringify(d).length, ...(who !== undefined ? { who } : {}) } as Queued)
   }
   return { updatedAt: v['updatedAt'] as number, items }
 }
@@ -470,8 +527,11 @@ export async function adopt($: EngineInterface): Promise<void> {
       if (box !== null && now - box.updatedAt < STALE_MS) continue
       await $.store.delete(k)
       if (box === null || box.items.length === 0) continue
-      queue = [...box.items, ...queue]
-      queuedBytes += box.items.reduce((n, r) => n + r.size, 0)
+      // Without a key, records an earlier load kept that name no organization and email are held back, as new ones are.
+      const items = mode === 'keyless' ? box.items.filter(item => item.who !== undefined) : box.items
+      counts.withheld += box.items.length - items.length
+      queue = [...items, ...queue]
+      queuedBytes += items.reduce((n, r) => n + r.size, 0)
       dirty = true
       dropOldest()
     }

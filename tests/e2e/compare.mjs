@@ -12,12 +12,21 @@
 // A difference the plugin cannot avoid is a known difference: reported with its count, never failed and never hidden. Any other
 // difference fails.
 //
+// A third pass runs the same session without Mainwave's env block: no telemetry settings at all, so Claude Code's exporter sends
+// nothing and no row names a span, and the plugin sends keyless (`devKeyless`, no key). There is nothing to compare with, so the
+// receiver plays keyless ingest instead: it refuses a request with an Authorization header (401), or one whose records, spans or data
+// points do not each carry one `organization.id` and one `user.email`, the same pair across the request (400). The pass fails on any
+// refusal, and checks that the spans make one trace per interaction: the interaction a root, the main loop's requests and calls its
+// children, each call's decision and run the call's, and a subagent's requests and calls under its Agent call's run. The session runs
+// on an API key, so its rows name an organization and an email only through OTEL_RESOURCE_ATTRIBUTES, which stands in for what an
+// account's login puts on them.
+//
 // The mock model answers each request after a different delay (300 to 900 ms), so a request paired with the wrong step, or timed
 // from the wrong start, lands outside the tolerance; and it refuses one request once as overloaded, so Claude Code retries it. The
 // session runs twice: once with prompts and tool details logged (OTEL_LOG_USER_PROMPTS, OTEL_LOG_TOOL_DETAILS), once with neither,
 // so both sides of those settings are compared.
 //
-//   node tests/e2e/compare.mjs            # exit 0 when the copy matches the exporter
+//   node tests/e2e/compare.mjs            # exit 0 when the copy matches the exporter and the keyless pass is coherent
 //   node tests/e2e/compare.mjs --keep     # keep the captures and the session's config folder, and print where
 //
 // Needs `claude` and `git` on PATH. The session runs in a fresh CLAUDE_CONFIG_DIR with an API key, so no login and no
@@ -44,6 +53,8 @@ const ROUTE = 'mainwave.telemetry.route'
 const STARTUP = new Set(['managed_settings_resolved', 'plugin_loaded'])
 /** An example organization, put on every record through the resource so the plugin's stamping path runs as in a real organization. */
 const ORG = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
+/** An example person in it, put on every record in the keyless pass, as a login would. */
+const EMAIL = 'e2e@example.com'
 /**
  * How far a rebuilt span's start or end may be from the exporter's: the plugin times spans from the hooks around them, and on a cold,
  * slow machine the session's first model request can start a hundred milliseconds before Claude Code's span does (its setup runs
@@ -117,6 +128,31 @@ function readBody(req) {
   })
 }
 
+/**
+ * Keyless ingest's answer to a request of the plugin's in the keyless pass: 401 for any Authorization header, 400 for an item without
+ * exactly one `organization.id` and one `user.email`, or for two pairs in one request, else 200.
+ */
+function keylessAnswer(headers, body) {
+  if (headers['authorization'] !== undefined) return { status: 401, error: 'an Authorization header' }
+  const doc = JSON.parse(body)
+  const items = [
+    ...(doc.resourceLogs ?? []).flatMap(rl => rl.scopeLogs.flatMap(sl => sl.logRecords)),
+    ...(doc.resourceSpans ?? []).flatMap(rs => rs.scopeSpans.flatMap(ss => ss.spans)),
+    ...(doc.resourceMetrics ?? []).flatMap(rm => rm.scopeMetrics.flatMap(sm => sm.metrics.flatMap(m => (m.sum ?? m.gauge ?? m.histogram ?? {}).dataPoints ?? []))),
+  ]
+  let pair
+  for (const item of items) {
+    const org = (item.attributes ?? []).filter(a => a.key === 'organization.id')
+    const email = (item.attributes ?? []).filter(a => a.key === 'user.email')
+    if (org.length !== 1 || email.length !== 1) return { status: 400, error: 'an item without one organization.id and one user.email' }
+    const p = `${org[0].value.stringValue} ${email[0].value.stringValue}`
+    if (pair !== undefined && pair !== p) return { status: 400, error: 'two organizations or emails in one request' }
+    pair = p
+  }
+  return { status: 200 }
+}
+
+let keylessRules = false
 let overloaded = false
 /**
  * The test-only plugin that sends the plugin's dev-collector requests to the receiver, built in a temporary folder: its manifest lives
@@ -160,7 +196,13 @@ const server = createServer(async (req, res) => {
   }
   const signal = SIGNALS.find(s => path === `/v1/${s}` || path === `/plugin/v1/${s}`)
   if (req.method === 'POST' && signal) {
-    captured[path.startsWith('/plugin/') ? 'plugin' : 'exporter'][signal].push({ auth: req.headers['authorization'], type: req.headers['content-type'], body })
+    const who = path.startsWith('/plugin/') ? 'plugin' : 'exporter'
+    const answer = who === 'plugin' && keylessRules ? keylessAnswer(req.headers, body) : { status: 200 }
+    captured[who][signal].push({ auth: req.headers['authorization'], type: req.headers['content-type'], body, status: answer.status, error: answer.error })
+    if (answer.status !== 200) {
+      res.writeHead(answer.status, { 'content-type': 'application/json' })
+      return res.end(JSON.stringify({ error: answer.error }))
+    }
   } else {
     captured.other.push(`${req.method} ${path}`)
   }
@@ -173,18 +215,23 @@ const base = `http://127.0.0.1:${server.address().port}`
 
 // ── The session ──────────────────────────────────────────────────────────────
 
-/** One session, its telemetry captured. `details` turns prompt and tool-detail logging on. */
-async function session(details) {
+/**
+ * One session, its telemetry captured. `details` turns prompt and tool-detail logging on; `envBlock` false runs it without Mainwave's
+ * env block, the plugin sending keyless.
+ */
+async function session(details, envBlock) {
   captured = { exporter: { logs: [], traces: [], metrics: [] }, plugin: { logs: [], traces: [], metrics: [] }, other: [] }
   messageId = 0
   overloaded = false
+  keylessRules = !envBlock
   const config = mkdtempSync(join(tmpdir(), 'mainwave-e2e-'))
   work = mkdtempSync(join(tmpdir(), 'mainwave-e2e-work-'))
   // A repository, so the session's git commit has somewhere to go. Its config is the command's own: no user or system config is read.
   const git = (...a) => execFileSync('git', a, { cwd: work, env: { PATH: process.env.PATH, HOME: work, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' } })
   git('init', '-q', '-b', 'main')
   git('-c', 'user.name=e2e', '-c', 'user.email=e2e@example.com', 'commit', '-q', '--allow-empty', '-m', 'init')
-  const settings = JSON.stringify({ pluginConfigs: { 'mainwave@inline': { options: { devIngestKey: PLUGIN_KEY } }, mainwave: { options: { devIngestKey: PLUGIN_KEY } } } })
+  const options = envBlock ? { devIngestKey: PLUGIN_KEY } : { devKeyless: true }
+  const settings = JSON.stringify({ pluginConfigs: { 'mainwave@inline': { options }, mainwave: { options } } })
 
   const env = {
     PATH: process.env.PATH,
@@ -196,6 +243,11 @@ async function session(details) {
     ANTHROPIC_API_KEY: 'sk-ant-e2e-not-a-key',
     ANTHROPIC_BASE_URL: base,
     DISABLE_AUTOUPDATER: '1',
+    MW_E2E_RECEIVER: `${base}/plugin`,
+  }
+  // Without the env block: no telemetry settings at all. The organization and email reach the rows as a login would put them there.
+  if (!envBlock) Object.assign(env, { OTEL_RESOURCE_ATTRIBUTES: `organization.id=${ORG},user.email=${EMAIL}` })
+  else Object.assign(env, {
     CLAUDE_CODE_ENABLE_TELEMETRY: '1',
     // All three signals, as Mainwave's org-wide setup turns them on, and the beta that gives Claude Code spans and ties rows to them.
     OTEL_LOGS_EXPORTER: 'otlp',
@@ -210,8 +262,7 @@ async function session(details) {
     // The metric interval stays at its default (a minute), so each path collects once, as the session ends: one point per series.
     OTEL_RESOURCE_ATTRIBUTES: `mainwave.source=coding_agent.claude_code,service.name=claude-code,deployment.environment=e2e,organization.id=${ORG}`,
     ...(details ? { OTEL_LOG_USER_PROMPTS: '1', OTEL_LOG_TOOL_DETAILS: '1' } : {}),
-    MW_E2E_RECEIVER: `${base}/plugin`,
-  }
+  })
 
   const args = [
     '-p', 'E2E_MAINTASK: run the steps, then say ok.',
@@ -549,13 +600,87 @@ function compare(pass, details, { captured, run }) {
   for (let i = before; i < problems.length; i++) problems[i] = `${pass}: ${problems[i]}`
 }
 
-const passes = [['prompts and tool details logged', true], ['prompts and tool details not logged', false]]
+/**
+ * The keyless pass: the exporter sent nothing, keyless ingest refused nothing, every signal arrived, and the spans make one coherent
+ * trace per interaction, with as many spans of each kind as the exporter sent of the same session.
+ */
+function checkKeyless(pass, { captured, run }, reference) {
+  const before = problems.length
+  if (run.code !== 0) problems.push(`claude exited ${run.code}:\n${run.out.slice(-2000)}`)
+  for (const s of SIGNALS) {
+    if (captured.exporter[s].length > 0) problems.push(`with no env block the exporter sent ${s}`)
+    if (captured.plugin[s].length === 0) problems.push(`the plugin sent no ${s}`)
+    for (const p of captured.plugin[s]) if (p.status !== 200) problems.push(`keyless ingest refused a ${s} request (${p.status}): ${p.error}`)
+  }
+  const rows = logRecordsOf(captured.plugin.logs)
+  if (rows.some(r => r.traceId || r.spanId)) problems.push('with no env block a row named a span')
+  if (!rows.some(r => r.attributes['event.name']?.v === 'api_request')) problems.push('no api_request row was sent')
+
+  const spans = spansOf(captured.plugin.traces)
+  const byId = new Map(spans.map(s => [s.spanId, s]))
+  const name = s => s.name.replace('claude_code.', '')
+  const parentOf = s => (s.parentSpanId ? byId.get(s.parentSpanId) : undefined)
+  const bad = new Map()
+  const note = (what, s) => bad.set(what, [...(bad.get(what) ?? []), `${name(s)} ${s.attrs.request_id?.v ?? s.attrs.tool_use_id?.v ?? s.spanId}`])
+  const callOf = new Map(spans.filter(s => s.name === 'claude_code.tool').map(s => [s.attrs.tool_use_id?.v, s]))
+  // The Agent call that started each subagent: the call whose run its first request names, if anything names it.
+  for (const s of spans) {
+    const parent = parentOf(s)
+    if (s.parentSpanId && !parent) note('a parent that was never sent', s)
+    if (parent && parent.traceId !== s.traceId) note("a trace other than its parent's", s)
+    switch (s.name) {
+      case 'claude_code.interaction':
+        if (s.parentSpanId) note('an interaction that is not a root', s)
+        break
+      case 'claude_code.llm_request': {
+        const agent = s.attrs.agent_id?.v
+        if (s.attrs['llm_request.context']?.v === 'standalone') {
+          if (s.parentSpanId) note('a standalone request with a parent', s)
+        } else if (agent === undefined ? parent?.name !== 'claude_code.interaction' : parent?.name !== 'claude_code.tool.execution' || callOf.get(parent.attrs.tool_use_id?.v)?.attrs.tool_name?.v !== 'Agent') {
+          note(agent === undefined ? 'a main-loop request not under an interaction' : "a subagent's request not under an Agent call's run", s)
+        }
+        break
+      }
+      case 'claude_code.tool': {
+        const agent = s.attrs.agent_id?.v
+        const ok = agent === undefined ? parent?.name === 'claude_code.interaction' : parent?.name === 'claude_code.tool.execution' && callOf.get(parent.attrs.tool_use_id?.v)?.attrs.tool_name?.v === 'Agent'
+        if (!ok) note(agent === undefined ? 'a main-loop call not under an interaction' : "a subagent's call not under an Agent call's run", s)
+        break
+      }
+      case 'claude_code.tool.blocked_on_user':
+      case 'claude_code.tool.execution':
+        if (parent?.name !== 'claude_code.tool') note('a decision or run not under its call', s)
+        break
+    }
+  }
+  for (const [what, list] of bad) problems.push(`traces: ${what} (${list.length}, e.g. ${list[0]})`)
+  if (!spans.some(s => s.name === 'claude_code.llm_request' && s.attrs.agent_id !== undefined)) problems.push("no subagent's request was sent")
+  if (!spans.some(s => s.name === 'claude_code.tool' && s.attrs.agent_id !== undefined)) problems.push("no subagent's call was sent")
+  const interactions = spans.filter(s => s.name === 'claude_code.interaction')
+  if (new Set(interactions.map(s => s.traceId)).size !== interactions.length) problems.push('two interactions share a trace')
+  const count = list => list.reduce((m, s) => m.set(name(s), (m.get(name(s)) ?? 0) + 1), new Map())
+  const want = count(spansOf(reference.exporter.traces))
+  const got = count(spans)
+  for (const k of new Set([...want.keys(), ...got.keys()])) if (want.get(k) !== got.get(k)) problems.push(`traces: ${got.get(k) ?? 0} ${k} spans, where the exporter sent ${want.get(k) ?? 0} of the same session`)
+
+  const points = pointsOf(captured.plugin.metrics)
+  for (const m of ['claude_code.cost.usage', 'claude_code.token.usage', 'claude_code.lines_of_code.count', 'claude_code.commit.count']) {
+    if (!points.some(p => p.name === m)) problems.push(`no ${m} point was sent`)
+  }
+  const requests = captured.plugin.logs.length + captured.plugin.traces.length + captured.plugin.metrics.length
+  console.log(`keyless: ${requests} requests, none refused; ${rows.length} rows, ${spans.length} spans in ${new Set(spans.map(s => s.traceId)).size} traces (${interactions.length} interactions), ${points.length} metric points`)
+  console.log(`  spans: ${[...got].map(([n, c]) => `${n} ${c}`).join(', ')}`)
+  for (let i = before; i < problems.length; i++) problems[i] = `${pass}: ${problems[i]}`
+}
+
+const passes = [['prompts and tool details logged', true, true], ['prompts and tool details not logged', false, true], ['no env block, sent keyless', false, false]]
 const results = []
-for (const [pass, details] of passes) {
+for (const [pass, details, envBlock] of passes) {
   console.log(`\n${pass}:`)
-  const result = await session(details)
+  const result = await session(details, envBlock)
   results.push(result)
-  compare(pass, details, result)
+  if (envBlock) compare(pass, details, result)
+  else checkKeyless(pass, result, results[1].captured)
 }
 server.close()
 
@@ -585,4 +710,4 @@ for (const { captured, run, config, work } of results) {
 }
 
 if (problems.length) process.exit(1)
-console.log('the copy matches the exporter')
+console.log('the copy matches the exporter, and without the env block it goes keyless in coherent traces')
