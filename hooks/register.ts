@@ -1,7 +1,6 @@
 // The plugin's hooks module. It stamps the telemetry rows Claude Code exports to the organization's collector (where the organization
-// configured one), keeps the identity those rows carry for the session, and, where the person set a dev ingest key or turned keyless
-// sending on, sends its own copy of each row to Mainwave's dev collector (sender.ts), with the spans and metrics it rebuilds beside
-// them (rebuild.ts, meter.ts).
+// configured one), keeps the identity those rows carry for the session, and sends its own copy of each row to Mainwave's dev collector
+// (sender.ts), keyless or with the person's dev ingest key, with the spans and metrics it rebuilds beside them (rebuild.ts, meter.ts).
 // It draws nothing and registers no command or tool.
 //
 // The exporter's row always goes on: the copy is queued beside it, never in its place. Fail open: a hook that throws never holds up a
@@ -20,7 +19,7 @@ import type { CopiedRow } from './otlp.ts'
 import {
   agentSpawned, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
 } from './rebuild.ts'
-import { adopt, configure, enqueue, ensureTimer, finish, isCopying, snapshot } from './sender.ts'
+import { adopt, configure, enqueue, ensureTimer, finish, isCopying, keyMalformed, snapshot } from './sender.ts'
 import { applyStamps, entrypointOf, filterStamps, PLUGIN_NAME, stripOwned } from './stamps.ts'
 import { VERSION } from './version.ts'
 
@@ -452,6 +451,8 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
       if (e.reason !== 'clear' && e.reason !== 'resume') await collectNow($)
     }
     await finish($, next.budget)
+    // Never the value: only that it does not fit.
+    if (keyMalformed()) $.ui.log('mainwave: copy off: the devIngestKey option holds a key of the wrong shape', { to: 'debug' })
     if (isCopying()) {
       const s = snapshot()
       const withheld = s.keyless ? `, ${s.withheld} held back (no organization and email)` : ''

@@ -1,4 +1,4 @@
-// End to end: the copy sent without a key, as a session without Mainwave's env block runs. The engine beneath is played by rig.ts and
+// End to end: the copy sent without a key (the default), as a session without Mainwave's env block runs. The engine beneath is played by rig.ts and
 // the kit's mocks, and the network by keyless ingest's own rules (rig.ts `keylessAnswer`): no Authorization header, the organization
 // and email on every record, span and data point, one pair per request.
 
@@ -7,7 +7,8 @@ import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
 import { boot, EMAIL, itemAttributes, KEY, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, type KeylessAnswer, type Layers, type Post, type Reply } from './rig.ts'
 
-const keyless = { options: { devKeyless: true } }
+/** No options: the plugin's defaults, so no key, so keyless. */
+const keyless = { options: {} }
 const START = 1_800_000_000_000
 const TICK = 5_000
 /** Another organization and a person in it, whose records an earlier session left behind. */
@@ -162,15 +163,22 @@ describe('a session without the env block, sending keyless', () => {
     expect(lastOutbox(store.sets)!.items.map(i => i.d.attributes['user.email'])).toEqual([EMAIL_B])
   })
 
-  test("the session's own refusal (403 email_domain) stops its sending and keeps its records", keyless, async ($, on) => {
-    const { clock, posts, store } = world(on, { refused: { [ORG]: 'email_domain' } })
+  test("the session's own refusal (403 email_domain) stops its sending, keeps what was queued, and queues no more", keyless, async ($, on) => {
+    const { clock, posts, store, logs } = world(on, { refused: { [ORG]: 'email_domain' } })
     await row($, 'user_prompt', { prompt: 'one', prompt_length: '3' })
     await clock.advance(TICK)
-    await row($, 'user_prompt', { prompt: 'two', prompt_length: '3' })
+    for (let i = 0; i < 20; i++) await row($, 'user_prompt', { prompt: 'two', prompt_length: '3' })
     await clock.advance(5 * TICK)
     await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
     expect(posts.length).toBe(1)
-    expect(lastOutbox(store.sets)!.items.length).toBe(2)
+    expect(lastOutbox(store.sets)!.items.map(i => i.d.attributes['prompt'])).toEqual(['one'])
+    expect(logs.join('')).toContain('20 held back')
+  })
+
+  test('a session with no outbox to take over reads no settings for it', keyless, async ($, on) => {
+    const { rig } = world(on)
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    expect(rig.reads).toEqual([])
   })
 
   test('with every record refused, a tick makes no request and reads no settings', keyless, async ($, on) => {
@@ -205,15 +213,29 @@ describe('a session without the env block, sending keyless', () => {
   })
 })
 
-describe('the keyless option', () => {
-  test('off, with no key: nothing is sent', async ($, on) => {
-    const { clock, posts } = world(on)
+describe('the key option', () => {
+  test('unset, the copy goes keyless with no option at all', async ($, on) => {
+    const { seen } = world(on)
     await turn($)
-    await clock.advance(3 * TICK)
-    expect(posts).toEqual([])
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    expect(seen.length).toBeGreaterThan(0)
+    for (const { post, answer } of seen) {
+      expect(Object.keys(post.headers).map(h => h.toLowerCase())).toEqual(['content-type'])
+      expect(answer.status).toBe(200)
+    }
   })
 
-  test('with a key set too, the key wins: a bearer token, and records with no email go as well', { options: { devKeyless: true, devIngestKey: KEY } }, async ($, on) => {
+  test('a key of the wrong shape sends nothing, keyless or not, and the debug log says why without the value', { options: { devIngestKey: 'has a space' } }, async ($, on) => {
+    const { clock, posts, logs } = world(on)
+    await turn($)
+    await clock.advance(3 * TICK)
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    expect(posts).toEqual([])
+    expect(logs.join('')).toContain('copy off: the devIngestKey option holds a key of the wrong shape')
+    expect(logs.join('')).not.toContain('has a space')
+  })
+
+  test('set, the key is used instead: a bearer token, and records with no email go as well', { options: { devIngestKey: KEY } }, async ($, on) => {
     // The collector's key path: any key is taken here.
     const { clock, posts } = world(on, { answer: () => ({ status: 200 }) })
     await row($, 'api_request', { cost_usd: 0.1 }, { 'organization.id': ORG, 'session.id': 's-1' })
@@ -223,8 +245,8 @@ describe('the keyless option', () => {
     expect(logs[0]!.headers['authorization']).toBe(`Bearer ${KEY}`)
   })
 
-  test("a repository's settings that name it stop the copy", keyless, async ($, on) => {
-    const { clock, posts } = world(on, { layers: { project: { pluginConfigs: { mainwave: { options: { devKeyless: true } } } } } })
+  test("a repository's settings that name the key stop the copy, keyless included", keyless, async ($, on) => {
+    const { clock, posts } = world(on, { layers: { project: { pluginConfigs: { mainwave: { options: { devIngestKey: 'mw_dev_attacker_key_01' } } } } } })
     await turn($)
     await clock.advance(3 * TICK)
     expect(posts).toEqual([])

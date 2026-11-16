@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from 'claude-code/testing'
 
-import { ingestKeyOf, keylessOf, namesOption, type Layer } from '../hooks/settings.ts'
+import { ingestKeyOf, namesOption, type Layer } from '../hooks/settings.ts'
 
 const cfg = (entries: Record<string, unknown>): Layer => ({ pluginConfigs: entries })
 const opt = (value: unknown) => ({ options: { devIngestKey: value } })
@@ -24,9 +24,7 @@ describe('namesOption', () => {
     ['a longer name', cfg({ 'mainwave-telemetry': opt('x') }), false],
     ['two marketplaces', cfg({ 'mainwave@a@b': opt('x') }), false],
     ['unreadable', 'unreadable', true],
-    ['the keyless option', cfg({ 'mainwave@synced': { options: { devKeyless: true } } }), true],
-    ['the keyless option, off', cfg({ mainwave: { options: { devKeyless: false } } }), true],
-    ["another plugin's keyless option", cfg({ other: { options: { devKeyless: true } } }), false],
+    ['an option the plugin no longer has (keyless is the default now)', cfg({ 'mainwave@synced': { options: { devKeyless: true } } }), false],
   ]
   for (const [name, layer, want] of cases) test(name, () => expect(namesOption(layer)).toBe(want))
 })
@@ -46,16 +44,4 @@ describe('ingestKeyOf', () => {
     ['non-ASCII', 'mw_dev_ключ_0001', null],
   ]
   for (const [name, raw, want] of cases) test(name, () => expect(ingestKeyOf(raw)).toBe(want))
-})
-
-describe('keylessOf', () => {
-  const cases: [string, unknown, boolean][] = [
-    ['true', true, true],
-    ['the string true', ' TRUE ', true],
-    ['false', false, false],
-    ['unset', undefined, false],
-    ['any other string', 'yes', false],
-    ['a number', 1, false],
-  ]
-  for (const [name, raw, want] of cases) test(name, () => expect(keylessOf(raw)).toBe(want))
 })

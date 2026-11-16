@@ -10,8 +10,8 @@
 // collector busy) goes back to the head of the queue and the timer waits longer before the next try. A batch the collector refuses
 // as malformed is dropped. A refused key stops sending until the plugin loads again, keeping the queue.
 //
-// Two ways to send: with the person's dev ingest key as a bearer token, or, where the person turned keyless sending on instead, with
-// no `Authorization` header at all. Keyless ingest routes each request by the `organization.id` and `user.email` on every record,
+// Two ways to send: keyless, with no `Authorization` header at all, or, where the person set a dev ingest key, with that key as a
+// bearer token. Keyless ingest routes each request by the `organization.id` and `user.email` on every record,
 // span and data point in it, and takes one pair per request. So without a key the plugin queues only records that carry both (a
 // session on an API key or a cloud provider names no organization: its records are held back, never sent), and each batch holds one
 // pair's records alone, so a batch the collector refuses holds back or drops no other person's. A refusal of the pair (403
@@ -28,7 +28,7 @@ import type { EngineInterface, PluginOptions, Timer } from 'claude-code'
 import { fetchWithin, type FetchOutcome } from './http.ts'
 import { logsBody, metricsBody, resourceOf, tracesBody, type BuiltSpan, type CopiedRow, type MetricPoint } from './otlp.ts'
 import { routingIdentityOf } from './identity.ts'
-import { ingestKeyOf, KEY_OPTION, KEYLESS_OPTION, keylessOf, namesOption, type Layer } from './settings.ts'
+import { ingestKeyOf, KEY_OPTION, namesOption, type Layer } from './settings.ts'
 
 /** The one place the copy goes, a path per signal. Nothing reads another URL from settings or the environment. */
 export const DEV_COLLECTOR = 'https://collector.dev.mainwave.com'
@@ -109,8 +109,8 @@ const mayHaveLanded = (outcome: FetchOutcome) => !outcome.ok && (outcome.reason 
 
 // Per load of the module; `configure` starts them over.
 let key: string | null = null
-/** How the copy is sent: with the key, keyless, or not at all. */
-let mode: 'key' | 'keyless' | null = null
+/** How the copy is sent: with the key, keyless, or (a key set but of the wrong shape) not at all. */
+let mode: 'key' | 'keyless' | 'off' = 'keyless'
 /** The organizations and emails keyless ingest refused this load: their records are kept, not sent. */
 let refusedWho = new Set<string>()
 let outboxKey = ''
@@ -144,11 +144,13 @@ function newId(): string {
   }
 }
 
-/** Starts the sender over for a load of the module: with the key from the plugin's options, else keyless if they turn it on. */
+/** Starts the sender over for a load of the module: with the key from the plugin's options where one is set, else keyless. */
 export function configure(options: PluginOptions | undefined): void {
   timer?.cancel()
   key = ingestKeyOf(options?.[KEY_OPTION])
-  mode = key !== null ? 'key' : keylessOf(options?.[KEYLESS_OPTION]) ? 'keyless' : null
+  const raw = options?.[KEY_OPTION]
+  // No key set: keyless. A key set but of the wrong shape: the person meant the key path, so nothing is sent rather than guessed.
+  mode = key !== null ? 'key' : raw === undefined || raw === null || (typeof raw === 'string' && raw.trim() === '') ? 'keyless' : 'off'
   refusedWho = new Set()
   outboxKey = `${OUTBOX_PREFIX}${newId()}`
   queue = []
@@ -169,8 +171,11 @@ export function configure(options: PluginOptions | undefined): void {
   counts = { sent: 0, dropped: 0, withheld: 0 }
 }
 
-/** Whether rows are copied at all: a key of the right shape or keyless sending on, and no repository naming either. */
-export const isCopying = (): boolean => mode !== null && !refused
+/** Whether the key option holds a key of the wrong shape, which turns the copy off. */
+export const keyMalformed = (): boolean => mode === 'off'
+
+/** Whether rows are copied at all: unless a key of the wrong shape is set, or a repository named the key option. */
+export const isCopying = (): boolean => mode !== 'off' && !refused
 
 /** Who a record is routed to without a key: the `organization.id` and `user.email` on the record itself. */
 const whoOf = (d: unknown): string | undefined => {
@@ -222,6 +227,12 @@ export async function enqueue($: EngineInterface, item: Item): Promise<void> {
   // Without a key, a record that names no organization and email has nowhere to go: it is held back, never queued.
   const who = mode === 'keyless' ? whoOf(item.d) : undefined
   if (mode === 'keyless' && who === undefined) {
+    counts.withheld += 1
+    return
+  }
+  // An organization and email keyless ingest refused this load: what is queued for it is kept, but nothing more is added, so a
+  // session whose organization nobody has claimed does not grow and rewrite its outbox for nothing. A later load tries again.
+  if (who !== undefined && refusedWho.has(who)) {
     counts.withheld += 1
     return
   }
@@ -517,12 +528,14 @@ export async function persist($: EngineInterface, force = false): Promise<void> 
 export async function adopt($: EngineInterface): Promise<void> {
   if (!isCopying()) return
   try {
-    // A load a repository refuses takes over nothing: other sessions' rows stay where they are for a load that may send them.
-    if (await repositoryNamesKey($)) return
     const now = await $.clock.now()
     adoptedAt = now
-    for (const k of await $.store.keys()) {
-      if (!k.startsWith(OUTBOX_PREFIX) || k === outboxKey) continue
+    const keys = (await $.store.keys()).filter(k => k.startsWith(OUTBOX_PREFIX) && k !== outboxKey)
+    // Nothing to take over: no settings read.
+    if (keys.length === 0) return
+    // A load a repository refuses takes over nothing: other sessions' rows stay where they are for a load that may send them.
+    if (await repositoryNamesKey($)) return
+    for (const k of keys) {
       const raw = await $.store.get(k)
       // An outbox a later version wrote is left for that version to send.
       if (isObject(raw) && typeof raw['v'] === 'number' && raw['v'] > OUTBOX_VERSION) continue

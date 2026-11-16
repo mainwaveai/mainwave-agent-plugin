@@ -1,10 +1,10 @@
-// Where the plugin's sending options may come from, and the shape each must have. Pure: tests call it directly.
+// Where the plugin's dev ingest key may come from, and the shape it must have. Pure: tests call it directly.
 //
-// Two options turn the copy on: the dev ingest key (`devIngestKey`), or sending without one (`devKeyless`). Both are the person's
-// own: `claude plugin configure` keeps a sensitive option in secure storage, and the engine hands the options to `register` as
-// `options`. A repository's settings (`project`, `local`) are not the person's. A repository that names either option under any of
-// the plugin's ids could be trying to send the person's rows somewhere they did not choose, so the plugin then sends nothing. A
-// repository layer that cannot be read counts as naming them.
+// Without a key the copy goes keyless; the key, where the person sets one, sends it with that key instead. The key is the person's
+// own: `claude plugin configure` keeps a sensitive option in secure storage, and the engine hands it to `register` as `options`. A
+// repository's settings (`project`, `local`) are not the person's. A repository that names the option under any of the plugin's ids
+// could be trying to send the person's rows somewhere they did not choose, so the plugin then sends nothing. A repository layer that
+// cannot be read counts as naming it.
 //
 // This guards against settings only. Another plugin the person has installed runs beside this one and can read or rewrite its
 // requests (`http.fetch` hooks see every plugin's) and the settings it reads; nothing a plugin does can keep its key from those.
@@ -20,10 +20,8 @@ export const PLUGIN_ID = /^mainwave(@[^@\s]+)?$/
 
 /** The option that holds the dev ingest key. */
 export const KEY_OPTION = 'devIngestKey'
-/** The option that sends to the dev collector without a key. */
-export const KEYLESS_OPTION = 'devKeyless'
 /** The options only the person's own settings may set. */
-export const SENDING_OPTIONS: readonly string[] = [KEY_OPTION, KEYLESS_OPTION]
+export const SENDING_OPTIONS: readonly string[] = [KEY_OPTION]
 
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v)
 const has = (o: Record<string, unknown>, k: string) => Object.prototype.hasOwnProperty.call(o, k)
@@ -51,6 +49,3 @@ export function ingestKeyOf(raw: unknown): string | null {
   const key = raw.trim().replace(/^bearer\s+/i, '')
   return KEY_SHAPE.test(key) ? key : null
 }
-
-/** Whether the keyless option is on: `true` as the option holds it (a boolean field), or the string `true`. */
-export const keylessOf = (raw: unknown): boolean => raw === true || (typeof raw === 'string' && raw.trim().toLowerCase() === 'true')
