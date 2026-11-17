@@ -469,7 +469,7 @@ function compare(pass, details, auto, { captured, run }) {
   for (const k of onlyExporter) if (!beforePlugin.includes(k)) problems.push(`the exporter sent ${k}, which the plugin did not`)
   if (beforePlugin.length) noteKnown(`logs: startup rows raised before any plugin loads (${[...new Set(beforePlugin.map(k => k.split('|')[1]))].join(', ')})`, beforePlugin.length)
   const matched = [...ex.values()].filter(r => pl.has(r.key))
-  if (!matched.some(r => r.attributes['mainwave.mod.name']?.v === 'mainwave')) problems.push("no matched row carries the plugin's stamps")
+  if (!matched.some(r => r.attributes['mainwave.plugin.name']?.v === 'mainwave')) problems.push("no matched row carries the plugin's stamps")
   if (!matched.some(r => /^[0-9a-f]{32}$/.test(r.traceId) && /^[0-9a-f]{16}$/.test(r.spanId))) problems.push('no matched row carries a trace and span id')
   if (!matched.some(r => r.attributes['event.name']?.v === 'api_request')) problems.push('no api_request row was matched')
   for (const [k, e] of ex) {

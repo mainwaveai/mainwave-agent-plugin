@@ -4,6 +4,9 @@ The Mainwave plugin for Claude Code and Cowork. It reports Claude sessions to [M
 
 It is a Claude Code mod: TypeScript that runs inside Claude Code and Cowork. Nothing needs installing on the machine: no Node, Python or CLI.
 
+> [!IMPORTANT]
+> Requires Claude Code 2.1.317 or later, in every place a session runs: a remote machine, a script, an IDE extension or the desktop app can run an older copy than the terminal does. `claude --version` shows the version; `claude update` updates a native install, and other installs update through their package manager. Older versions send less or nothing; see [Install](#install).
+
 ## What it does today
 
 The plugin does two things.
@@ -12,9 +15,9 @@ The plugin does two things.
 
 | Attribute | Value |
 | --- | --- |
-| `mainwave.mod.name` | `mainwave` |
-| `mainwave.mod.version` | the plugin's version, such as `0.1.0` |
-| `mainwave.mod.entrypoint` | where the session runs, from `CLAUDE_CODE_ENTRYPOINT` (`cli`, `claude-vscode`, `remote_cowork` and so on); `other` for anything else |
+| `mainwave.plugin.name` | `mainwave` |
+| `mainwave.plugin.version` | the plugin's version, such as `0.1.0` |
+| `mainwave.plugin.entrypoint` | where the session runs, from `CLAUDE_CODE_ENTRYPOINT` (`cli`, `claude-vscode`, `remote_cowork` and so on); `other` for anything else |
 | `mainwave.telemetry.route` | which path the row took: `exporter` on the row Claude Code's exporter sends, `plugin` on the plugin's own copy |
 
 Mainwave can then tell which sessions run the plugin, which version, and where.
@@ -89,7 +92,7 @@ Every span and data point starts with the attributes Claude Code puts first on a
 Rules it keeps:
 
 - **It never holds anything up.** The exporter's row always goes on, whether or not the copy could be queued. If stamping fails, the row goes on as Claude Code wrote it, minus any key the plugin owns. The hooks on turns, model requests, tool calls, slash commands, subagents and skill prompts only watch: each passes its event and its result on unchanged, and a fault in one is caught.
-- **Nothing else can pose as it.** Any key under `mainwave.mod.` or `mainwave.telemetry.` already on a row is removed before the plugin adds its own, and each value it adds must fit a fixed shape.
+- **Nothing else can pose as it.** Any key under `mainwave.plugin.`, `mainwave.telemetry.` or `mainwave.redaction.` already on a row is removed before the plugin adds its own. So is any key under `mainwave.mod.`, where earlier Mainwave plugins put their stamps. Each value it adds must fit a fixed shape.
 - **Its key goes to one place.** The plugin sends the dev ingest key only to the dev collector, as a bearer token, and never writes it to a row, a file or a log. Keyless, it sends no key at all. The plugin never reads the organization's collector URL or key. This holds against settings, not against other plugins: any plugin the person installs can see and rewrite every plugin's requests, this one's included, so a dev key is only as safe as the person's other plugins.
 - **It sends what its data points allow, and nothing else.** What each data point is, and when it goes, is in What it sends, below. It adds no commands, panes or tools.
 
@@ -168,7 +171,25 @@ In rough order, each in a later version:
 
 ## Install
 
-Needs Claude Code 2.1.317 or later. On an older version the session is unaffected, as the plugin fails open, but the plugin sends less or nothing: below 2.1.299 its hooks module does not load, so it stamps and sends nothing; from 2.1.299 to 2.1.316 its copy's spans lack `gen_ai.provider.name`, and on early versions of that range its keyless copy has gaps too (rows that name the wrong parent span, subagents' requests missing). `plugin.json` states the floor as `engines`, which Claude Code reads only from 2.1.323 on, so today it turns no version away: every version that reads it is above the floor.
+Needs Claude Code 2.1.317 or later.
+
+`claude --version` shows the version, and `claude update` updates a native install. Other installs update through their package manager: `brew upgrade claude-code`, `winget upgrade Anthropic.ClaudeCode`, `sudo apt update && sudo apt upgrade claude-code` (dnf and apk alike) or `npm install -g @anthropic-ai/claude-code@latest`. Homebrew, WinGet and Linux package installs do not update by themselves by default.
+
+On an older version the session is unaffected, as the plugin fails open, but the plugin sends less or nothing:
+
+- Below 2.1.299, its hooks module does not load, so it stamps and sends nothing.
+- From 2.1.299 to 2.1.316, its copy's spans lack `gen_ai.provider.name`, and on early versions of that range its keyless copy has gaps too (rows that name the wrong parent span, subagents' requests missing).
+
+The version that counts is the one each session runs, and a person who has updated Claude Code in their terminal may still run older copies elsewhere:
+
+- **Remote machines.** A session over SSH, or in a container or VM, runs the Claude Code on that machine, not the local one: update it there. The desktop app's SSH sessions are the exception: they run a copy the app installs on that machine, not its `claude`.
+- **Scripts and CI.** A `claude -p` run uses the binary its job installs, often a pinned version. Raise the pin.
+- **IDE extensions.** The VS Code extension runs the copy of Claude Code it bundles, and its version number is that copy's: update the extension. If its `claudeProcessWrapper` setting names another `claude`, that one runs instead: update it. The JetBrains plugin runs the `claude` on the machine's `PATH`, or the one its settings name: update that.
+- **The desktop app.** In a local session, its Code tab runs its own copy of Claude Code, which the app downloads and updates, so it can differ from the terminal's `claude`, and updating one does not update the other. `/status` in a session there shows its version. Update the app (**Claude › Check for Updates…** on macOS, **Help › Check for Updates…** on Windows), then start a new session.
+
+An organization can turn older versions away: the managed setting `requiredMinimumVersion`, set to the floor, makes Claude Code below it exit at startup (it is read from Claude Code 2.1.163 on).
+
+`plugin.json` states the floor too, as `engines`. Claude Code reads `engines` only from 2.1.323 on, so today it turns no version away: every version that reads it is above the floor.
 
 ### For a whole organization (org sync)
 
@@ -180,7 +201,7 @@ An owner or admin of the Claude organization, on claude.ai:
 
 Each re-sync picks up the repository's `main` branch. For the stamps to reach Mainwave, the organization also needs Mainwave's managed `env` block (from Mainwave's org-wide setup); without it the plugin loads and stamps nothing.
 
-To check it works: run a session, then look for rows with `mainwave.mod.name = mainwave` in Mainwave.
+To check it works: run a session, then look for rows with `mainwave.plugin.name = mainwave` in Mainwave.
 
 ### For yourself
 
@@ -230,7 +251,7 @@ node tests/e2e/compare.mjs      # real sessions, model mocked: the plugin's copy
 claude --plugin-dir .           # a session with the plugin loaded from this folder
 ```
 
-CI runs all but the last on every pull request, on two Claude Code versions: the latest, pinned in `.github/claude-code/package.json`, and the floor, the oldest version the plugin supports, pinned in `.github/claude-code-floor/package.json`. Dependabot opens a pull request for each new Claude Code release, so a release that breaks the comparison fails that pull request alone. Dependabot's version updates don't watch the floor, so it changes only by hand: raising it is a pull request of its own, which changes the pin, `engines` in `plugin.json` and the Install section together (`scripts/check-version.sh` fails where they differ). To run the checks on another version, install it in a scratch folder (`npm i @anthropic-ai/claude-code@<version>`) and put it first on `PATH`, with `DISABLE_AUTOUPDATER=1`.
+CI runs all but the last on every pull request, on two Claude Code versions: the latest, pinned in `.github/claude-code/package.json`, and the floor, the oldest version the plugin supports, pinned in `.github/claude-code-floor/package.json`. Dependabot opens a pull request for each new Claude Code release, so a release that breaks the comparison fails that pull request alone. Dependabot's version updates don't watch the floor, so it changes only by hand: raising it is a pull request of its own, which changes the pin, `engines` in `plugin.json`, the Install section and the note at the README's top together (`scripts/check-version.sh` fails where they differ). To run the checks on another version, install it in a scratch folder (`npm i @anthropic-ai/claude-code@<version>`) and put it first on `PATH`, with `DISABLE_AUTOUPDATER=1`.
 
 The end-to-end comparison runs `claude -p` in a fresh config folder and a scratch git repository, with an API key and a local mock of the Anthropic API, so no login and no organization's settings reach it, and nothing leaves the machine. The mock model scripts a turn that runs Bash, writes and edits a file, commits, has a command fail, is refused a command and starts a background subagent; it answers each request after a different delay, and refuses one request once as overloaded, so Claude Code retries it. The session runs three times: with the env block, once with Mainwave's org-wide setup captures on and once with each set to `0`, and then without it. With it, Claude Code's exporter sends all three signals to a local receiver, and a test-only plugin, built in a temporary folder from `tests/e2e/redirect.ts`, sends the plugin's copy there too. The script pairs every log row by session, event name and sequence; every span by what identifies it (its ID where the rows name it, else its request ID or tool call ID); and every metric series by its name and attributes, summing its points. It compares each pair field by field, attribute keys in order and value types included, and fails on any difference but the known ones in the table above, which it lists with their counts. The first runs in auto mode: the mock answers auto mode's classifier, blocking the refused command and allowing the rest, and it counts the exporter's spans of the classifier's requests as the known gap above, and, where the exporter counts those requests in `cost.usage` and `token.usage` (as through the mock, which stands where a gateway would), that share too, each token type's exactly the tokens on those spans; it fails unless the classifier was asked about that command and refused it. Without the env block, the exporter sends nothing and the plugin sends keyless; the receiver applies keyless ingest's rules (no `Authorization` header; an `idempotency-key` header of the collector's shape, which the plugin sends on every request; one `organization.id` and one `user.email` on every item, the same pair across a request) and the script fails on any request it refuses, on any span out of its place in the interaction's trace, on any row that names a kind of span other than the exporter's rows of the same event named with the env block, and when the copy lacks the commands, file paths, subagent types, tool output, prompts or responses its defaults send. As the session runs on an API key, its rows carry an organization and an email there only through `OTEL_RESOURCE_ATTRIBUTES`, standing in for what a login puts on them. `--keep` keeps what was received. The type check runs locally: start one interactive session with `claude --plugin-dir .`, which writes Claude Code's declarations to `.claude-plugin/types/` (gitignored), then run `npx -p typescript@5.6.3 tsc -p .`.
 

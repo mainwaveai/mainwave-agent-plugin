@@ -8,11 +8,15 @@
 /** The plugin's name on every row it stamps. */
 export const PLUGIN_NAME = 'mainwave'
 
-/** Key prefixes the plugin owns. Any key under one of them that the plugin did not write this time is removed from the row. */
-export const OWNED_PREFIXES: readonly string[] = ['mainwave.mod.', 'mainwave.telemetry.', 'mainwave.redaction.']
+/**
+ * Key prefixes the plugin owns. Any key under one of them that the plugin did not write this time is removed from the row.
+ * `mainwave.mod.` is where earlier Mainwave plugins, and this one before it named its stamps `mainwave.plugin.*`, put theirs: the
+ * plugin writes nothing there, and strips it so no row carries an old-named stamp beside its own.
+ */
+export const OWNED_PREFIXES: readonly string[] = ['mainwave.plugin.', 'mainwave.telemetry.', 'mainwave.redaction.', 'mainwave.mod.']
 
 /** Every key the plugin stamps. */
-export type StampKey = 'mainwave.mod.name' | 'mainwave.mod.version' | 'mainwave.mod.entrypoint' | 'mainwave.telemetry.route'
+export type StampKey = 'mainwave.plugin.name' | 'mainwave.plugin.version' | 'mainwave.plugin.entrypoint' | 'mainwave.telemetry.route'
 
 /** `CLAUDE_CODE_ENTRYPOINT` values the plugin reports as they are; anything else is reported as `other`. */
 export const ENTRYPOINTS: readonly string[] = [
@@ -29,9 +33,9 @@ const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z-]+(?:\.[
 
 /** One rule per key: the value the key may carry. */
 export const STAMP_RULES: Readonly<Record<StampKey, (value: string) => boolean>> = {
-  'mainwave.mod.name': v => v === PLUGIN_NAME,
-  'mainwave.mod.version': v => v.length <= 64 && SEMVER.test(v),
-  'mainwave.mod.entrypoint': v => ENTRYPOINTS.includes(v),
+  'mainwave.plugin.name': v => v === PLUGIN_NAME,
+  'mainwave.plugin.version': v => v.length <= 64 && SEMVER.test(v),
+  'mainwave.plugin.entrypoint': v => ENTRYPOINTS.includes(v),
   'mainwave.telemetry.route': v => ROUTES.includes(v),
 }
 

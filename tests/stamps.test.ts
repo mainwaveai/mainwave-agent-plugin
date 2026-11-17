@@ -6,8 +6,11 @@ import { applyStamps, entrypointOf, filterStamps, stripOwned } from '../hooks/st
 
 describe('stripOwned', () => {
   test('removes every key under an owned prefix and keeps the rest in order', () => {
-    const out = stripOwned({ a: 1, 'mainwave.mod.name': 'x', b: 'two', 'mainwave.telemetry.anything': 'y', 'mainwave.redaction.count': 3, 'mainwave.attr.k': 'v' })
-    expect(Object.keys(out)).toEqual(['a', 'b', 'mainwave.attr.k'])
+    const out = stripOwned({
+      a: 1, 'mainwave.plugin.name': 'x', b: 'two', 'mainwave.telemetry.anything': 'y', 'mainwave.redaction.count': 3, 'mainwave.attr.k': 'v',
+      'mainwave.mod.name': 'old', 'mainwave.pluginx': 'kept',
+    })
+    expect(Object.keys(out)).toEqual(['a', 'b', 'mainwave.attr.k', 'mainwave.pluginx'])
   })
 
   test('a key named __proto__ stays a plain key and changes no prototype', () => {
@@ -22,9 +25,9 @@ describe('stripOwned', () => {
 describe('filterStamps', () => {
   test('keeps the stamps that fit their rule', () => {
     const { kept, dropped } = filterStamps({
-      'mainwave.mod.name': 'mainwave',
-      'mainwave.mod.version': '1.2.3-rc.1+build.5',
-      'mainwave.mod.entrypoint': 'remote_cowork',
+      'mainwave.plugin.name': 'mainwave',
+      'mainwave.plugin.version': '1.2.3-rc.1+build.5',
+      'mainwave.plugin.entrypoint': 'remote_cowork',
       'mainwave.telemetry.route': 'plugin',
     })
     expect(dropped).toEqual([])
@@ -32,17 +35,20 @@ describe('filterStamps', () => {
   })
 
   const bad: [string, unknown][] = [
-    ['mainwave.mod.name', 'mainwave-telemetry'],
-    ['mainwave.mod.version', '1.2'],
-    ['mainwave.mod.version', `1.2.3-${'a'.repeat(70)}`],
-    ['mainwave.mod.entrypoint', 'made-up'],
+    ['mainwave.plugin.name', 'mainwave-other'],
+    ['mainwave.plugin.version', '1.2'],
+    ['mainwave.plugin.version', `1.2.3-${'a'.repeat(70)}`],
+    ['mainwave.plugin.entrypoint', 'made-up'],
     ['mainwave.telemetry.route', 'collector'],
     ['mainwave.telemetry.route', ''],
     ['mainwave.telemetry.source', 'policy'],
-    ['mainwave.mod.unknown', 'x'],
+    ['mainwave.plugin.unknown', 'x'],
+    ['mainwave.mod.name', 'mainwave'],
+    ['mainwave.mod.version', '0.1.0'],
+    ['mainwave.mod.entrypoint', 'cli'],
     ['user.email', 'dev@example.com'],
-    ['mainwave.mod.name', 7],
-    ['mainwave.mod.name', 'x'.repeat(300)],
+    ['mainwave.plugin.name', 7],
+    ['mainwave.plugin.name', 'x'.repeat(300)],
   ]
   for (const [key, value] of bad) {
     test(`drops ${key}=${JSON.stringify(value).slice(0, 30)}`, () => {
@@ -53,8 +59,8 @@ describe('filterStamps', () => {
 
 describe('applyStamps', () => {
   test('strips first, then adds only what passes', () => {
-    const out = applyStamps({ 'mainwave.mod.name': 'forged', keep: 'me' }, { 'mainwave.mod.name': 'mainwave', 'mainwave.mod.bogus': 'no' })
-    expect(out).toEqual({ keep: 'me', 'mainwave.mod.name': 'mainwave' })
+    const out = applyStamps({ 'mainwave.plugin.name': 'forged', 'mainwave.mod.name': 'old', keep: 'me' }, { 'mainwave.plugin.name': 'mainwave', 'mainwave.plugin.bogus': 'no' })
+    expect(out).toEqual({ keep: 'me', 'mainwave.plugin.name': 'mainwave' })
   })
 })
 

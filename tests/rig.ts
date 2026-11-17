@@ -14,16 +14,18 @@ export const LOGGED_AT = '2026-11-12T00:00:00.000Z'
 
 /** Every key the plugin may put on a row, with the shape its value must have. */
 export const CONTRACT: Record<string, (v: unknown) => boolean> = {
-  'mainwave.mod.name': v => v === 'mainwave',
-  'mainwave.mod.version': v => typeof v === 'string' && /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(v),
-  'mainwave.mod.entrypoint': v => typeof v === 'string' && /^[a-z0-9_-]+$/.test(v),
+  'mainwave.plugin.name': v => v === 'mainwave',
+  'mainwave.plugin.version': v => typeof v === 'string' && /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(v),
+  'mainwave.plugin.entrypoint': v => typeof v === 'string' && /^[a-z0-9_-]+$/.test(v),
   'mainwave.telemetry.route': v => v === 'exporter' || v === 'plugin',
   // On the plugin's own copy only, where the protections replaced a secret: how many.
   'mainwave.redaction.count': v => typeof v === 'number' && Number.isInteger(v) && v >= 1,
 }
 /** The keys every stamped row carries. */
-export const STAMPED = ['mainwave.mod.entrypoint', 'mainwave.mod.name', 'mainwave.mod.version', 'mainwave.telemetry.route']
-export const isOwned = (k: string) => k.startsWith('mainwave.mod.') || k.startsWith('mainwave.telemetry.') || k.startsWith('mainwave.redaction.')
+export const STAMPED = ['mainwave.plugin.entrypoint', 'mainwave.plugin.name', 'mainwave.plugin.version', 'mainwave.telemetry.route']
+// mainwave.mod. is the old prefix: the plugin writes nothing there, so a key under it on a row is a violation.
+export const isOwned = (k: string) =>
+  k.startsWith('mainwave.plugin.') || k.startsWith('mainwave.telemetry.') || k.startsWith('mainwave.redaction.') || k.startsWith('mainwave.mod.')
 
 /** A settings layer as the test answers it: an object, or `reject` for a read that fails. */
 export type Answer = Record<string, unknown> | 'reject'

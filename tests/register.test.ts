@@ -13,9 +13,9 @@ describe('stamping', () => {
     const rig = boot(on, { entrypoint: 'cli' })
     const a = await log(rig, $, inOrg)
     expect(ownedKeys(a)).toEqual(STAMPED)
-    expect(a['mainwave.mod.name']).toBe('mainwave')
-    expect(a['mainwave.mod.version']).toBe(VERSION)
-    expect(a['mainwave.mod.entrypoint']).toBe('cli')
+    expect(a['mainwave.plugin.name']).toBe('mainwave')
+    expect(a['mainwave.plugin.version']).toBe(VERSION)
+    expect(a['mainwave.plugin.entrypoint']).toBe('cli')
     expect(a['mainwave.telemetry.route']).toBe('exporter')
     expect(contractViolations(a)).toEqual([])
   })
@@ -30,7 +30,7 @@ describe('stamping', () => {
 
   test('an unknown entry point reads as other; none set reads as other', async ($, on) => {
     const rig = boot(on, { entrypoint: 'something-new' })
-    expect((await log(rig, $, inOrg))['mainwave.mod.entrypoint']).toBe('other')
+    expect((await log(rig, $, inOrg))['mainwave.plugin.entrypoint']).toBe('other')
   })
 
   test('a row with no organization carries no stamp', async ($, on) => {
@@ -41,25 +41,36 @@ describe('stamping', () => {
 
   test('forged keys under the owned prefixes are removed and replaced by the real ones', async ($, on) => {
     const rig = boot(on, { entrypoint: 'cli' })
-    const a = await log(rig, $, { ...inOrg, 'mainwave.mod.name': 'evil', 'mainwave.mod.extra': 'x', 'mainwave.telemetry.route': 'plugin' })
+    const a = await log(rig, $, { ...inOrg, 'mainwave.plugin.name': 'evil', 'mainwave.plugin.extra': 'x', 'mainwave.telemetry.route': 'plugin' })
     expect(ownedKeys(a)).toEqual(STAMPED)
-    expect(a['mainwave.mod.name']).toBe('mainwave')
+    expect(a['mainwave.plugin.name']).toBe('mainwave')
     expect(a['mainwave.telemetry.route']).toBe('exporter')
     expect(contractViolations(a)).toEqual([])
   })
 
+  test('keys under the old mainwave.mod. prefix are removed, on a row with an organization or without', async ($, on) => {
+    const rig = boot(on, { entrypoint: 'cli' })
+    const old = { 'mainwave.mod.name': 'old-plugin', 'mainwave.mod.version': '0.9.0', 'mainwave.mod.entrypoint': 'cli' }
+    const a = await log(rig, $, { ...inOrg, ...old })
+    expect(ownedKeys(a)).toEqual(STAMPED)
+    expect(contractViolations(a)).toEqual([])
+    expect(ownedKeys(await log(rig, $, { 'session.id': 's-1', ...old }))).toEqual([])
+  })
+
   test('forged keys are removed from a row with no organization too', async ($, on) => {
     const rig = boot(on)
-    const a = await log(rig, $, { 'session.id': 's-1', 'mainwave.mod.name': 'evil', 'mainwave.telemetry.source': 'policy' })
+    const a = await log(rig, $, { 'session.id': 's-1', 'mainwave.plugin.name': 'evil', 'mainwave.telemetry.source': 'policy' })
     expect(ownedKeys(a)).toEqual([])
     expect(a['session.id']).toBe('s-1')
   })
 
   test("keys outside the owned prefixes, Mainwave's included, are left alone", async ($, on) => {
     const rig = boot(on)
-    const a = await log(rig, $, { ...inOrg, 'mainwave.attr.project': 'p1', 'mainwave.modx': 'kept' })
+    const a = await log(rig, $, { ...inOrg, 'mainwave.attr.project': 'p1', 'mainwave.modx': 'kept', 'mainwave.pluginx': 'kept', 'mainwave.mod': 'kept' })
     expect(a['mainwave.attr.project']).toBe('p1')
     expect(a['mainwave.modx']).toBe('kept')
+    expect(a['mainwave.pluginx']).toBe('kept')
+    expect(a['mainwave.mod']).toBe('kept')
   })
 
   test('no settings layer is read for a row, and no option turns stamping off', async ($, on) => {
@@ -134,7 +145,7 @@ describe('identity from rows', () => {
 })
 
 describe('fail open', () => {
-  const row = { to: 'collector', event: 'api_request', loggedAt: '2026-11-12T00:00:00.000Z', attributes: { 'organization.id': ORG, 'mainwave.mod.name': 'evil' } } as const
+  const row = { to: 'collector', event: 'api_request', loggedAt: '2026-11-12T00:00:00.000Z', attributes: { 'organization.id': ORG, 'mainwave.plugin.name': 'evil' } } as const
 
   test('a failure before the row went on sends it without any owned key', async () => {
     const sent: unknown[] = []

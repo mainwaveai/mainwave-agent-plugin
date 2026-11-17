@@ -7,7 +7,7 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
 import type { Overrides } from '../hooks/gate.ts'
-import { boot, EMAIL, LOGGED_AT, memoryStore, network, ORG, type Post } from './rig.ts'
+import { boot, contractViolations, EMAIL, LOGGED_AT, memoryStore, network, ORG, STAMPED, type Post } from './rig.ts'
 
 const keyless = { options: {} }
 const START = 1_800_000_000_000
@@ -230,6 +230,11 @@ describe("the MCP servers set up, and each skill's text: data points no Claude C
     ])
     // Routed as the session's other rows are, and nothing else in the files read is sent.
     expect(servers[0]).toEqual(expect.objectContaining({ 'organization.id': ORG, 'user.email': EMAIL, 'mainwave.telemetry.route': 'plugin' }))
+    // The plugin's own rows carry its full stamp, each key in its contracted shape.
+    for (const r of servers) {
+      expect(STAMPED.filter(k => !(k in r))).toEqual([])
+      expect(contractViolations(r)).toEqual([])
+    }
     const all = posts.map(p => p.body).join('\n')
     for (const secret of ['hun@ter2', 'ter2', 'Bearer abc', 'DB_PASSWORD', 'oauthAccount', 'team=acme', 'sk_live', 'declined']) expect(all).not.toContain(secret)
   })
