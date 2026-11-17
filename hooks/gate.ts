@@ -17,10 +17,10 @@
 
 import type { TelemetryAttribute } from 'claude-code'
 
-import { CATALOG, DATA_POINTS, DEFAULTS, OUTPUT_OWNERS, OWN_ROWS, ownerOf, PARAMETER_OWNERS, sensitive, SKILL_PROMPT_ROW, TOOL_OUTPUT_EVENT, type DataPointId, type Switch } from './catalog.ts'
+import { CATALOG, DATA_POINTS, DEFAULTS, METRIC_OWNERS, OUTPUT_OWNERS, OWN_ROWS, ownerOf, PARAMETER_OWNERS, sensitive, SKILL_PROMPT_ROW, TOOL_OUTPUT_EVENT, type DataPointId, type Switch } from './catalog.ts'
 import type { BuiltSpan, CopiedRow, MetricPoint } from './otlp.ts'
 import { CONTENT_MAX_LENGTH, cut, redact } from './protect.ts'
-import { COUNT_RULES, filterStamps, OPT_IN_STAMP, REDACTION_COUNT } from './stamps.ts'
+import { COMMAND_PREFIX, COMMAND_REF_KEYS, COUNT_RULES, filterStamps, OPT_IN_STAMP, REDACTION_COUNT } from './stamps.ts'
 
 export type Setting = 'on' | 'off' | 'claude'
 /** `optedIn`: the data points that are `on` because the person opted in, in catalog order. */
@@ -200,8 +200,10 @@ export function protect(gate: Gate, record: string, attributes: Attrs, all = fal
       put(out, key, value)
       continue
     }
-    // Cut first, so the secret rules read a value of bounded length.
+    // Cut first, so the secret rules read a value of bounded length. A command stamp (a ref) goes whole or not at all: a ref cut short
+    // names another ref.
     const c = cut(value, gate.limit)
+    if (c.truncated && key.startsWith(COMMAND_PREFIX)) continue
     const r = redact(c.text)
     count += r.count
     put(out, key, r.text)
@@ -250,7 +252,8 @@ export function gateAttributes(gate: Gate, record: string, attributes: Readonly<
       continue
     }
     const owner = ownerOf(record, key)
-    if (owner === undefined || allows(gate, owner.id, sent)) put(out, key, value)
+    // Claude Code writes no command stamp, so one goes only where its data point is on.
+    if (owner === undefined || allows(gate, owner.id, sent && !key.startsWith(COMMAND_PREFIX))) put(out, key, value)
     else if (owner.redact) put(out, key, '<REDACTED>')
   }
   // What the plugin read, where Claude Code left it out or withheld it, and its data point is on.
@@ -267,6 +270,8 @@ export function gateAttributes(gate: Gate, record: string, attributes: Readonly<
     const p = gateParameters(gate, undefined, fill.parameters)
     if (p !== undefined) put(out, 'tool_parameters', p)
   }
+  // A command's ref goes only beside its count: with `bash.outcome` off, the ref goes too.
+  for (const [ref, count] of COMMAND_REF_KEYS) if (ref in out && !(count in out)) delete out[ref]
   // A skill's text with its arguments filled in holds words the person typed: it goes only where prompts do, else it is held back.
   if (record === SKILL_PROMPT_ROW && out['skill.has_arguments'] === true && out['skill.text'] !== undefined && !allows(gate, 'prompt.text', false)) {
     delete out['skill.text']
@@ -290,11 +295,8 @@ export function gateEvent(gate: Gate, event: { name: string; timeMs: number; att
   return { event: { ...event, attributes }, count }
 }
 
-/** Metric points a data point counts: none of them is sent while it is off. */
-const COUNTED_BY: Readonly<Record<string, DataPointId>> = { 'claude_code.commit.count': 'bash.outcome', 'claude_code.pull_request.count': 'bash.outcome' }
-
-/** Whether a metric's points may go at all. */
-export const metricAllowed = (gate: Gate, name: string, strict = false): boolean => COUNTED_BY[name] === undefined || allows(gate, COUNTED_BY[name]!, !strict)
+/** Whether a metric's points may go at all: none of a metric's a data point counts (catalog.ts, `METRIC_OWNERS`) while it is off. */
+export const metricAllowed = (gate: Gate, name: string, strict = false): boolean => METRIC_OWNERS[name] === undefined || allows(gate, METRIC_OWNERS[name]!, !strict)
 
 /**
  * A record's attributes stamped with the gate it went through: `mainwave.telemetry.opt_in` lists the data points the person's opt-in

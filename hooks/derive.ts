@@ -208,6 +208,271 @@ export function mcpCreatesPr(toolName: string): boolean {
   return /^create[_-]?(pull[_-]?request|merge[_-]?request)$|^(pull[_-]?request|merge[_-]?request)[_-]?create$/i.test(toolName)
 }
 
+// ── Command outcomes ──────────────────────────────────────────────────────────
+//
+// What Mainwave counts from a shell command: commits, pushes, pull requests and the like, and the refs a command names. Mainwave counts
+// them from the command's text where it has it; where it does not (the text is content, and an organization may keep it), it counts
+// what the plugin stamps on the command's span from these rules. So these are Mainwave's own rules, ported as they are: the patterns
+// below are its regular expressions, and `tests/fixtures/command-outcomes.json` holds the cases both must agree on.
+//
+// Mainwave evaluates them in ClickHouse, whose regular expressions are RE2's. What differs in JavaScript, and how the port keeps RE2's
+// results:
+// - RE2's `[[:space:]]` is the six ASCII spaces; JavaScript's `\s` is wider, so the class is written out.
+// - Counting and listing matches (ClickHouse's `countMatches`, `extractAll`) start each search after the last match as a new string,
+//   so `^` matches there again: `count` and `matchesOf` do the same. A replacement (`replaceRegexpAll`) searches the whole string,
+//   as `String.replace` does.
+// - In a replacement `.` does not match a newline unless the pattern says `(?s)`; in a match, count or extraction it does.
+// - RE2 runs in time linear in the input, a backtracking engine need not. Where a pattern could backtrack without bound in JavaScript,
+//   the port reads what RE2 reads another way: the heredoc pass is a scanner that finds the match RE2 finds (`cutHeredocs`), a branch
+//   sync is read word by word (`isSyncMerge`), and two alternatives of the quoted-string pass are rewritten to match the same text
+//   without backtracking over it.
+
+/** The outcomes Mainwave counts from a command, each sent as `mainwave.command.<column>` when above 0. */
+export const COMMAND_COUNTS = ['commits', 'reverts', 'pushes', 'prs_opened', 'prs_merged', 'prs_updated', 'merges', 'tags', 'workflow_runs', 'branches_opened'] as const
+export type CommandCount = (typeof COMMAND_COUNTS)[number]
+/** The refs a command names, each with the count it goes beside, sent as `mainwave.command.<name>`. */
+export const COMMAND_REFS = { branch_opened: 'branches_opened', push_ref: 'pushes', merge_ref: 'merges', tag_name: 'tags' } as const satisfies Record<string, CommandCount>
+export type CommandRef = keyof typeof COMMAND_REFS
+
+/** RE2's `[[:space:]]`, and its complement. */
+const SP = String.raw`[\t\n\v\f\r ]`
+const NSP = String.raw`[^\t\n\v\f\r ]`
+/** Words that may stand between a command position and the command: the `rtk` wrapper, and the shell keywords that open a body. */
+const CMD_PREFIX = String.raw`(?:(?:rtk(?:${SP}+proxy)?|do|then|else|if|until|while)${SP}+)*`
+/** A command position: the start, or past `&&`, `;`, `|` or a newline. */
+const CMD_POS = String.raw`(^|&&|;|[|]|\n)${SP}*${CMD_PREFIX}`
+const CMD_POS_NC = String.raw`(?:^|&&|;|[|]|\n)${SP}*${CMD_PREFIX}`
+const GIT = String.raw`git(${SP}+-C${SP}+${NSP}+)?${SP}+`
+const GIT_NC = String.raw`git(?:${SP}+-C${SP}+${NSP}+)?${SP}+`
+const SUB_END = String.raw`(${SP}|$)`
+const OPEN_ARGS = String.raw`(?:${SP}+[^\t\n\v\f\r &|;]+)*?`
+const BRANCH_OPENER = String.raw`${GIT_NC}(?:checkout${OPEN_ARGS}${SP}+-[bB]|switch${OPEN_ARGS}${SP}+(?:-[cC]|--create|--force-create)|worktree${SP}+add${OPEN_ARGS}${SP}+-[bB])${SP}+`
+const REMOTE_REF = String.raw`(?:(?:origin|upstream)/${NSP}+|refs/remotes/${NSP}+|${NSP}*@[{](?:u|upstream)[}]|FETCH_HEAD)`
+const REF = String.raw`([^-\t\n\v\f\r ][^\t\n\v\f\r &|;]*)`
+
+const COUNTED: Readonly<Record<Exclude<CommandCount, 'merges' | 'branches_opened'>, RegExp>> = {
+  commits: new RegExp(String.raw`${CMD_POS}${GIT}(commit|cherry-pick)${SUB_END}`),
+  reverts: new RegExp(String.raw`${CMD_POS}${GIT}revert${SUB_END}`),
+  pushes: new RegExp(String.raw`${CMD_POS}${GIT}push${SUB_END}`),
+  prs_opened: new RegExp(String.raw`${CMD_POS}(gh pr create|glab mr create)`),
+  prs_merged: new RegExp(String.raw`${CMD_POS}(gh${SP}+pr|glab${SP}+mr)${SP}+merge`),
+  prs_updated: new RegExp(String.raw`${CMD_POS}(gh${SP}+pr${SP}+(edit|ready|comment|review)|gh${SP}+stack${SP}+(submit|push)|glab${SP}+mr${SP}+(update|note|approve))`),
+  tags: new RegExp(String.raw`${CMD_POS}${GIT}tag${SP}+(-[as]${SP}+)?[^-\t\n\v\f\r ]|${CMD_POS}(gh|glab)${SP}+release${SP}+create`),
+  workflow_runs: new RegExp(String.raw`${CMD_POS}(gh${SP}+workflow${SP}+run|glab${SP}+ci${SP}+run)`),
+}
+const BRANCH_OPEN = new RegExp(String.raw`${CMD_POS}${BRANCH_OPENER}`)
+const BRANCH_NAME = new RegExp(String.raw`${CMD_POS_NC}${BRANCH_OPENER}["']?([^-\t\n\v\f\r &|;"'${'`'}][^\t\n\v\f\r &|;"'${'`'}]*)`)
+/** The ref a push, a merge invocation or a tag names: the pattern's first group, as written. */
+const PUSH_REF = new RegExp(String.raw`${GIT_NC}push(?:${SP}+-${NSP}+)*${SP}+[^-\t\n\v\f\r ]${NSP}*${SP}+${REF}`)
+const MERGE_REF = new RegExp(String.raw`${GIT_NC}merge(?:${SP}+-${NSP}+)*${SP}+${REF}`)
+const TAG_NAME = new RegExp(String.raw`${GIT_NC}tag${SP}+(?:-[as]${SP}+)?${REF}`)
+/** Each `git merge` from its command position to the next separator; `merge-base` and `merge-tree` are not one. */
+const MERGE_INVOCATION = new RegExp(String.raw`${CMD_POS_NC}${GIT_NC}merge(?:${SP}[^&|;\n]*|$)`)
+/** A merge invocation up to its subcommand, from its start. */
+const MERGE_HEAD = new RegExp(String.raw`^${CMD_POS_NC}${GIT_NC}merge`)
+/** A word a branch sync may hold besides `--ff-only`: a flag, a redirect with its target in the word, or a remote-tracking ref. */
+const SYNC_WORD = new RegExp(String.raw`^(?:-${NSP}*|[0-9]*>${NSP}*|${REMOTE_REF})$`)
+/** A redirect whose target is the next word. */
+const REDIRECT = /^[0-9]*>>?$/
+const LEADING_SPACE = new RegExp(String.raw`^${SP}`)
+const SPACES = new RegExp(String.raw`${SP}+`)
+
+/**
+ * Whether a `git merge` invocation is a branch sync, as Mainwave's pattern reads it:
+ *
+ *   ^CMD_POS GIT merge(?:SP+WORD)*SP+--ff-only(?:SP+WORD)*SP*$   where WORD is -NSP*|[0-9]*>>?(?:SP*NSP+)?|REMOTE_REF
+ *
+ * Read word by word, which matches the same invocations: a backtracking engine tries every way a run of bare redirects can take
+ * their targets, which grows exponentially with the run.
+ */
+function isSyncMerge(invocation: string): boolean {
+  const head = MERGE_HEAD.exec(invocation)
+  if (head === null) return false
+  const rest = invocation.slice(head[0].length)
+  if (!LEADING_SPACE.test(rest)) return false
+  const words = rest.split(SPACES).filter(w => w !== '')
+  // Positions reachable before (0) and after (1) the `--ff-only` the pattern names.
+  const reach = [new Uint8Array(words.length + 1), new Uint8Array(words.length + 1)]
+  reach[0]![0] = 1
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i]!
+    for (const phase of [0, 1] as const) {
+      if (!reach[phase]![i]) continue
+      if (SYNC_WORD.test(w)) reach[phase]![i + 1] = 1
+      if (REDIRECT.test(w) && i + 1 < words.length) reach[phase]![i + 2] = 1
+      if (phase === 0 && w === '--ff-only') reach[1]![i + 1] = 1
+    }
+  }
+  return reach[1]![words.length] === 1
+}
+
+/**
+ * The quoted-string pass, in RE2's order: a single-quoted string holding a separator or a newline (cut to its opening quote), one
+ * without (kept), the same two double-quoted, a backslash and the character it escapes (kept), and a comment (cut, the space before
+ * it kept). The first and third alternatives read up to their first separator without backtracking over it, which matches the same
+ * strings as `[^']*SEP[^']*'`: a string holds a separator exactly when it holds a first one.
+ */
+const QUOTED_TEXT = new RegExp(
+  String.raw`(')[^';&|\n]*[;&|\n][^']*'|('[^']*')|(")(?:[^"\;&|\n]|\\.)*[;&|\n](?:[^"\\]|\\.)*"|("(?:[^"\\]|\\.)*")|(\\.)|(^|[\t\n\v\f\r ])#[^\n]*`,
+  'gs',
+)
+
+/** How many times `re` matches, each search starting after the last match as a new string (ClickHouse's `countMatches`). */
+function count(re: RegExp, text: string): number {
+  let n = 0
+  let rest = text
+  for (let m = re.exec(rest); m !== null && m[0] !== ''; m = re.exec(rest)) {
+    n++
+    rest = rest.slice(m.index + m[0].length)
+  }
+  return n
+}
+
+/** Every match of `re`, each search starting after the last match as a new string (ClickHouse's `extractAll`, for a pattern with no group). */
+function matchesOf(re: RegExp, text: string): string[] {
+  const out: string[] = []
+  let rest = text
+  for (let m = re.exec(rest); m !== null && m[0] !== ''; m = re.exec(rest)) {
+    out.push(m[0])
+    rest = rest.slice(m.index + m[0].length)
+  }
+  return out
+}
+
+/** The first group of `re`'s first match, or `''` (ClickHouse's `extract`). */
+const extract = (re: RegExp, text: string): string => re.exec(text)?.[1] ?? ''
+
+const isTagStart = (c: string | undefined) => c !== undefined && ((c >= 'A' && c <= 'Z') || c === '_')
+const isTagRest = (c: string | undefined) => isTagStart(c) || (c !== undefined && c >= '0' && c <= '9')
+const isQuote = (c: string | undefined) => c === '"' || c === "'"
+
+/**
+ * One heredoc pass of Mainwave's rules: each heredoc whose opener names `EOF` (`anyTag` false) or any upper-case word (`anyTag` true)
+ * replaced by the character before its `<<`, `_` and the rest of its opener's line, its body and terminator line cut. The pattern is
+ *
+ *   (^|[^<])<<-?[ \t]*["']?TAG["']?((?:[^A-Za-z0-9_\n"'](?:[^\n"']|'[^']*'|"(?:[^"\\]|\\.)*"|["'])*)?)(?s:\n.*?)??\n[ \t]*TAG[ \t\r]*(\n|$)
+ *
+ * applied as `replaceRegexpAll` applies it (`.` outside `(?s:)` does not match a newline there). Up to the rest of the opener's line,
+ * each step has one way to match. The rest of the line can end at any newline its quoted strings do not hold, and RE2 takes the first
+ * end, in the order a backtracking engine tries them, after which a terminator line comes; the body is then up to the first one. The
+ * scanner computes, from the right, the end that order finds from each position (`tail`), so each heredoc costs constant time once
+ * the tables are built, where the pattern itself could backtrack without bound.
+ */
+function cutHeredocs(text: string, anyTag: boolean): string {
+  if (!text.includes('<<')) return text
+  const n = text.length
+  /** The end of a tag at `i`, or -1. */
+  const tagEnd = (i: number): number => {
+    if (!anyTag) return text.startsWith('EOF', i) ? i + 3 : -1
+    if (!isTagStart(text[i])) return -1
+    let j = i + 1
+    while (isTagRest(text[j])) j++
+    return j
+  }
+  /** Where a terminator line starting with the newline at `q` ends, past its own newline; -1 when the line is not one. */
+  const terminatorEnd = (q: number): number => {
+    let i = q + 1
+    while (text[i] === ' ' || text[i] === '\t') i++
+    i = tagEnd(i)
+    if (i < 0) return -1
+    while (text[i] === ' ' || text[i] === '\t' || text[i] === '\r') i++
+    return i === n ? n : text[i] === '\n' ? i + 1 : -1
+  }
+  // From the right: the first terminator line at or after each position; the close of a double-quoted string opened just before each
+  // position (`\\.` takes no newline here); the next single quote; and where the rest of an opener's line, read from each position,
+  // ends in the first end a terminator follows.
+  const term = new Int32Array(n + 1).fill(-1)
+  const dq = new Int32Array(n + 2).fill(-1)
+  const sq = new Int32Array(n + 2).fill(-1)
+  const tail = new Int32Array(n + 1).fill(-1)
+  for (let i = n - 1; i >= 0; i--) {
+    const c = text[i]
+    term[i] = c === '\n' && terminatorEnd(i) >= 0 ? i : term[i + 1]!
+    dq[i] = c === '"' ? i : c === '\\' ? (i + 1 < n && text[i + 1] !== '\n' ? dq[i + 2]! : -1) : dq[i + 1]!
+    sq[i] = c === "'" ? i : sq[i + 1]!
+  }
+  const bodyFrom = (e: number): boolean => text[e] === '\n' && term[e]! >= 0
+  for (let i = n - 1; i >= 0; i--) {
+    const c = text[i]
+    if (c === '\n') tail[i] = bodyFrom(i) ? i : -1
+    else if (c === "'" || c === '"') {
+      const close = c === "'" ? sq[i + 1]! : dq[i + 1]!
+      const whole = close >= 0 ? tail[close + 1]! : -1
+      tail[i] = whole >= 0 ? whole : tail[i + 1]!
+    } else tail[i] = tail[i + 1]!
+  }
+  let out = ''
+  let copied = 0
+  let from = 0
+  for (let a = text.indexOf('<<'); a >= 0; a = text.indexOf('<<', a + 1)) {
+    const at = a === 0 && from === 0 ? 0 : a - 1
+    if (at < from || (at !== a && text[at] === '<')) continue
+    let p = a + 2
+    if (text[p] === '-') p++
+    while (text[p] === ' ' || text[p] === '\t') p++
+    if (isQuote(text[p])) p++
+    p = tagEnd(p)
+    if (p < 0) continue
+    if (isQuote(text[p])) p++
+    let rest = ''
+    let e = -1
+    const c = text[p]
+    if (c !== undefined && !/[A-Za-z0-9_\n"']/.test(c) && tail[p + 1]! >= 0) {
+      e = tail[p + 1]!
+      rest = text.slice(p, e)
+    } else if (bodyFrom(p)) e = p
+    if (e < 0) continue
+    const end = terminatorEnd(term[e]!)
+    out += text.slice(copied, at) + (at === a ? '' : text[at]) + '_' + rest + (text[end - 1] === '\n' ? '\n' : '')
+    copied = from = end
+    if (end >= n) break
+    a = end - 1
+  }
+  return out + text.slice(copied)
+}
+
+/** A command's executable text, as Mainwave reads it: heredoc bodies, quoted strings holding a separator or a newline, and comments cut. */
+export function executableText(command: string): string {
+  const text = command.includes('<<') ? cutHeredocs(cutHeredocs(command, false), true) : command
+  return text.replace(QUOTED_TEXT, (_m, ...g: unknown[]) => g.slice(0, 6).map(v => (typeof v === 'string' ? v : '')).join(''))
+}
+
+/**
+ * What a shell command did, by Mainwave's rules: each count above 0, and each ref the command names where its count is above 0. Only
+ * a command position counts, so a commit message or an `echo` that quotes `git push` counts nothing.
+ */
+export function commandOutcomes(command: string): { counts: Partial<Record<CommandCount, number>>; refs: Partial<Record<CommandRef, string>> } {
+  const x = executableText(command)
+  const merges = matchesOf(MERGE_INVOCATION, x).filter(m => !isSyncMerge(m))
+  const all: Record<CommandCount, number> = {
+    commits: count(COUNTED.commits, x),
+    reverts: count(COUNTED.reverts, x),
+    pushes: count(COUNTED.pushes, x),
+    prs_opened: count(COUNTED.prs_opened, x),
+    prs_merged: count(COUNTED.prs_merged, x),
+    prs_updated: count(COUNTED.prs_updated, x),
+    merges: merges.length,
+    tags: count(COUNTED.tags, x),
+    workflow_runs: count(COUNTED.workflow_runs, x),
+    branches_opened: BRANCH_OPEN.test(x) ? 1 : 0,
+  }
+  const named: Record<CommandRef, () => string> = {
+    branch_opened: () => extract(BRANCH_NAME, x),
+    push_ref: () => extract(PUSH_REF, x),
+    merge_ref: () => extract(MERGE_REF, merges[merges.length - 1] ?? ''),
+    tag_name: () => extract(TAG_NAME, x),
+  }
+  const counts: Partial<Record<CommandCount, number>> = {}
+  for (const c of COMMAND_COUNTS) if (all[c] > 0) counts[c] = all[c]
+  const refs: Partial<Record<CommandRef, string>> = {}
+  for (const [ref, c] of Object.entries(COMMAND_REFS) as [CommandRef, CommandCount][]) {
+    if (all[c] === 0) continue
+    const value = named[ref]()
+    if (value !== '') refs[ref] = value
+  }
+  return { counts, refs }
+}
+
 // ── File edits ────────────────────────────────────────────────────────────────
 
 /** The file tools whose permission decisions `code_edit_tool.decision` counts. */

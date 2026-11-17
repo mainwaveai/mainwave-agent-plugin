@@ -1,7 +1,12 @@
 // The data-point catalog: every kind of information the plugin can send from a Claude Code or Cowork session, by ID, with its
 // sensitivity class, the Claude Code switch that governs it, and the attributes it owns on the records the plugin sends. Pure.
 //
+// Mainwave keeps the catalog; `data-points.json`, beside this file, is a copy of it, and a test holds this file to that copy field by
+// field (tests/catalog.test.ts). A change to a data point is made in Mainwave's catalog first, then copied here.
+//
 // The default each data point takes with no organization settings is in one table, `DEFAULTS`, below. The gate (gate.ts) reads it.
+
+import { COMMAND_COUNTS, COMMAND_REFS } from './derive.ts'
 
 /** A data point's ID: the contract the gate, Mainwave's settings and its readers share. */
 export type DataPointId =
@@ -50,10 +55,10 @@ export const CATALOG: readonly DataPoint[] = [
   { id: 'agent.type', class: 'metadata', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The type of each subagent started, custom ones included', example: 'Explore' },
   { id: 'command.name', class: 'metadata', description: 'The slash command run, not its arguments', example: 'compact' },
   { id: 'bash.class', class: 'metadata', description: 'The kind and program of each shell command, in Bash or an MCP shell tool such as Cowork\'s device_bash', example: 'vcs / git' },
-  { id: 'bash.outcome', class: 'metadata', description: 'Commits and pull requests made by shell commands that succeeded, as counts', example: '1 commit' },
+  { id: 'bash.outcome', class: 'metadata', description: 'Commits, reverts, pushes, branches opened, merges, tags, workflow runs and pull requests opened, merged or updated by shell commands that succeeded, as counts', example: '1 commit, 1 push' },
   { id: 'file.kind', class: 'metadata', description: 'The language of each file edited or written, from its extension', example: 'TypeScript' },
   { id: 'web.domain', class: 'metadata', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The site of each page fetched', example: 'docs.python.org' },
-  { id: 'repo', class: 'identifiers', switch: 'OTEL_METRICS_INCLUDE_REPOSITORY', description: "The Git remote's address, owner and name, the branch and the commit", example: 'github.com/acme/api' },
+  { id: 'repo', class: 'identifiers', switch: 'OTEL_METRICS_INCLUDE_REPOSITORY', description: "The Git remote's address, owner and name, the branch and the commit, and the branch, ref or tag a shell command opened, pushed, merged or tagged", example: 'github.com/acme/api' },
   { id: 'file.path', class: 'identifiers', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The path of each file read, edited or written', example: '/Users/ana/acme/api/src/login.ts' },
   { id: 'web.url', class: 'identifiers', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The full address of each page fetched', example: 'https://docs.python.org/3/library/re.html' },
   {
@@ -116,7 +121,7 @@ export const DEFAULTS: Readonly<Record<Exclude<DataPointId, 'session.identity' |
  * metric's name) where the same key means something else elsewhere. A key not listed belongs to a required data point. `redact`:
  * the value is `<REDACTED>` when the data point is off, as Claude Code writes withheld text, rather than left out.
  */
-type Owned = { key: string; id: DataPointId; in?: readonly string[]; redact?: true }
+export type Owned = { key: string; id: DataPointId; in?: readonly string[]; redact?: true }
 
 /** The plugin's row for one MCP server set up for the session (`mcp.url`). */
 export const MCP_SERVER_ROW = 'mcp_server_configured'
@@ -125,7 +130,10 @@ export const SKILL_PROMPT_ROW = 'skill_prompt'
 
 const TOOL_RECORDS = ['tool_decision', 'tool_result', 'claude_code.tool', 'claude_code.tool.blocked_on_user', 'claude_code.tool.execution', 'claude_code.code_edit_tool.decision']
 
-const OWNED: readonly Owned[] = [
+/** What a shell command did, stamped by the plugin on the command's tool span: its counts, and the refs it names (stamps.ts). */
+const COMMAND_STAMP = 'mainwave.command.'
+
+export const ATTRIBUTE_OWNERS: readonly Owned[] = [
   ...['tool_name', 'tool_name_safe', 'gen_ai.tool.name', 'decision', 'source', 'decision_source', 'decision_type', 'success', 'error_type', 'error_class', 'error.type', 'classifier_verdict', 'tool_source']
     .map(key => ({ key, id: 'tool.call' as const, in: TOOL_RECORDS })),
   ...['mcp_server.name', 'mcp_tool.name', 'anthropic.mcp.server.name', 'mcp_server_scope'].map(key => ({ key, id: 'tool.mcp' as const })),
@@ -134,6 +142,8 @@ const OWNED: readonly Owned[] = [
   { key: 'agent_type', id: 'agent.type', in: ['subagent_completed'] },
   { key: 'command_name', id: 'command.name' },
   ...['bash_command_class', 'bash_argv0', 'bash_subcommand', 'has_pipe'].map(key => ({ key, id: 'bash.class' as const })),
+  ...['counted', ...COMMAND_COUNTS].map(c => ({ key: `${COMMAND_STAMP}${c}`, id: 'bash.outcome' as const, in: ['claude_code.tool'] })),
+  ...Object.keys(COMMAND_REFS).map(r => ({ key: `${COMMAND_STAMP}${r}`, id: 'repo' as const, in: ['claude_code.tool'] })),
   { key: 'language', id: 'file.kind', in: ['claude_code.code_edit_tool.decision'] },
   { key: 'url.domain', id: 'web.domain' },
   { key: 'url.full', id: 'web.url' },
@@ -159,8 +169,11 @@ const OWNED: readonly Owned[] = [
 /** The rows the plugin makes itself, each the data point it carries: none is sent while that data point is off. */
 export const OWN_ROWS: Readonly<Record<string, DataPointId>> = { [MCP_SERVER_ROW]: 'mcp.url', [SKILL_PROMPT_ROW]: 'skill.text' }
 
-/** Repository keys: every key under `vcs.`, as Claude Code names the Git remote, branch and commit. */
-const REPO_PREFIX = 'vcs.'
+/** Keys owned by their prefix: every key under `vcs.` is a repository's, as Claude Code names the Git remote, branch and commit. */
+export const KEY_PREFIXES: Readonly<Record<string, DataPointId>> = { 'vcs.': 'repo' }
+
+/** Metrics a data point counts: none of their points is sent while it is off. */
+export const METRIC_OWNERS: Readonly<Record<string, DataPointId>> = { 'claude_code.commit.count': 'bash.outcome', 'claude_code.pull_request.count': 'bash.outcome' }
 
 /** The keys inside Claude Code's `tool_parameters`, each one data point's. */
 export const PARAMETER_OWNERS: Readonly<Record<string, DataPointId>> = {
@@ -182,11 +195,11 @@ export const TOOL_OUTPUT_EVENT = 'tool.output'
 export const OUTPUT_OWNERS: Readonly<Record<string, DataPointId>> = { file_path: 'file.path', bash_command: 'bash.command', diff: 'tool.input' }
 
 const byKey = new Map<string, Owned[]>()
-for (const o of OWNED) byKey.set(o.key, [...(byKey.get(o.key) ?? []), o])
+for (const o of ATTRIBUTE_OWNERS) byKey.set(o.key, [...(byKey.get(o.key) ?? []), o])
 
 /** The data point an attribute belongs to on a record (a row's event, a span's or a metric's name); undefined for a required one. */
 export function ownerOf(record: string, key: string): { id: DataPointId; redact?: true } | undefined {
-  if (key.startsWith(REPO_PREFIX)) return { id: 'repo' }
+  for (const [prefix, id] of Object.entries(KEY_PREFIXES)) if (key.startsWith(prefix)) return { id }
   for (const o of byKey.get(key) ?? []) if (o.in === undefined || o.in.includes(record)) return o.redact ? { id: o.id, redact: true } : { id: o.id }
   return undefined
 }

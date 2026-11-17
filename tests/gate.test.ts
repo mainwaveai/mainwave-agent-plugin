@@ -368,6 +368,45 @@ describe('gateSpan, gateEvent and gatePoint', () => {
   })
 })
 
+describe("a shell command's outcome stamps", () => {
+  const stamped = {
+    tool_name: 'Bash', 'mainwave.command.counted': 1, 'mainwave.command.commits': 1, 'mainwave.command.pushes': 1, 'mainwave.command.push_ref': 'feat/x',
+    'mainwave.command.branches_opened': 1, 'mainwave.command.branch_opened': 'feat/x',
+  }
+  const stamps = (a: Record<string, unknown>) => Object.keys(a).filter(k => k.startsWith('mainwave.command.'))
+
+  test('belong to command outcomes, and their refs to the repository, on the tool span alone', () => {
+    expect(ownerOf('claude_code.tool', 'mainwave.command.commits')?.id).toBe('bash.outcome')
+    expect(ownerOf('claude_code.tool', 'mainwave.command.counted')?.id).toBe('bash.outcome')
+    expect(ownerOf('claude_code.tool', 'mainwave.command.push_ref')?.id).toBe('repo')
+    expect(ownerOf('claude_code.tool.execution', 'mainwave.command.commits')).toBeUndefined()
+  })
+
+  test('go with the defaults; the refs only where the repository goes too', () => {
+    expect(gateAttributes(resolveGate({}), 'claude_code.tool', stamped)).toEqual(stamped)
+    expect(stamps(gateAttributes(resolveGate({}, { repo: 'off' }), 'claude_code.tool', stamped))).toEqual(['mainwave.command.counted', 'mainwave.command.commits', 'mainwave.command.pushes', 'mainwave.command.branches_opened'])
+  })
+
+  test('none goes with command outcomes off, the refs included, though the repository is on', () => {
+    expect(stamps(gateAttributes(resolveGate({}, { 'bash.outcome': 'off' }), 'claude_code.tool', stamped))).toEqual([])
+  })
+
+  test('none goes as Claude Code sends it: Claude Code sends none of them', () => {
+    expect(stamps(gateAttributes(resolveGate({}, { 'bash.outcome': 'claude', repo: 'claude' }), 'claude_code.tool', stamped))).toEqual([])
+    expect(stamps(gateAttributes(resolveGate({}, { repo: 'claude' }), 'claude_code.tool', stamped))).toEqual(['mainwave.command.counted', 'mainwave.command.commits', 'mainwave.command.pushes', 'mainwave.command.branches_opened'])
+  })
+
+  test('a ref goes through the protections, and one the limit would cut is left off, not cut', () => {
+    const secret = `ghp_${'a'.repeat(36)}`
+    const out = gateAttributes(resolveGate({}), 'claude_code.tool', { ...stamped, 'mainwave.command.push_ref': secret })
+    expect(out['mainwave.command.push_ref']).toBe('[REDACTED:github_token]')
+    expect(out['mainwave.redaction.count']).toBe(1)
+    const short = gateAttributes(resolveGate({}, {}, 4), 'claude_code.tool', stamped)
+    expect(stamps(short)).toEqual(['mainwave.command.counted', 'mainwave.command.commits', 'mainwave.command.pushes', 'mainwave.command.branches_opened'])
+    expect(Object.keys(short).filter(k => k.endsWith('_truncated'))).toEqual([])
+  })
+})
+
 describe('protections', () => {
   test("Mainwave's secret rules and the plugin's own", () => {
     const cases: [string, string][] = [

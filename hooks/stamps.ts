@@ -6,16 +6,20 @@
 // that fails its rule, is dropped, never sent.
 
 import { DEFAULTS } from './catalog.ts'
+import { COMMAND_COUNTS, COMMAND_REFS, type CommandCount, type CommandRef } from './derive.ts'
 
 /** The plugin's name on every row it stamps. */
 export const PLUGIN_NAME = 'mainwave'
+
+/** Where the plugin stamps what a shell command did on the command's `claude_code.tool` span (`commandStamps`). */
+export const COMMAND_PREFIX = 'mainwave.command.'
 
 /**
  * Key prefixes the plugin owns. Any key under one of them that the plugin did not write this time is removed from the row.
  * `mainwave.mod.` is where earlier Mainwave plugins, and this one before it named its stamps `mainwave.plugin.*`, put theirs: the
  * plugin writes nothing there, and strips it so no row carries an old-named stamp beside its own.
  */
-export const OWNED_PREFIXES: readonly string[] = ['mainwave.plugin.', 'mainwave.telemetry.', 'mainwave.redaction.', 'mainwave.mod.']
+export const OWNED_PREFIXES: readonly string[] = ['mainwave.plugin.', 'mainwave.telemetry.', 'mainwave.redaction.', 'mainwave.mod.', COMMAND_PREFIX]
 
 /** Every key the plugin stamps. */
 export type StampKey = 'mainwave.plugin.name' | 'mainwave.plugin.version' | 'mainwave.plugin.entrypoint' | 'mainwave.telemetry.route' | 'mainwave.telemetry.opt_in'
@@ -59,6 +63,39 @@ export const REDACTION_COUNT = 'mainwave.redaction.count'
 /** The keys the plugin writes with a number, and the value each may carry. */
 export const COUNT_RULES: Readonly<Record<typeof REDACTION_COUNT, (value: number) => boolean>> = {
   [REDACTION_COUNT]: v => Number.isInteger(v) && v >= 1 && v <= 1_000_000,
+}
+
+/** On every shell command's span while its outcomes go: the plugin read the command, so a span with no count made none. */
+export const COMMAND_COUNTED = `${COMMAND_PREFIX}counted`
+/** A count's key, and a ref's. */
+export const commandKey = (name: CommandCount | CommandRef): string => `${COMMAND_PREFIX}${name}`
+/** Each ref's key, with the key of the count it goes beside: a ref goes only where its count does. */
+export const COMMAND_REF_KEYS: ReadonlyMap<string, string> = new Map(Object.entries(COMMAND_REFS).map(([ref, count]) => [commandKey(ref as CommandRef), commandKey(count)]))
+/** Every key under the command prefix the plugin writes. */
+export const COMMAND_KEYS: readonly string[] = [COMMAND_COUNTED, ...COMMAND_COUNTS.map(commandKey), ...COMMAND_REF_KEYS.keys()]
+
+/** A ref as the plugin sends it: what Mainwave's pattern captured, at most 256 characters, no space or control character. */
+const REF_SHAPE = /^[^\x00-\x20\x7f]{1,256}$/
+
+/** The value each command key may carry: `counted` and `branches_opened` 1, the other counts a positive integer Mainwave reads (16 bits), a ref its shape. */
+export const COMMAND_RULES: Readonly<Record<string, (value: unknown) => boolean>> = Object.fromEntries([
+  [COMMAND_COUNTED, (v: unknown) => v === 1],
+  ...COMMAND_COUNTS.map(c => [commandKey(c), c === 'branches_opened' ? (v: unknown) => v === 1 : (v: unknown) => Number.isInteger(v) && (v as number) >= 1 && (v as number) <= 65_535] as const),
+  ...[...COMMAND_REF_KEYS.keys()].map(k => [k, (v: unknown) => typeof v === 'string' && REF_SHAPE.test(v)] as const),
+])
+
+/**
+ * The stamps for one shell command's span: `counted`, and for a command that succeeded (`found`), each count above 0, and with
+ * `refs` each ref beside its count. A value that fails its rule is dropped, and a ref whose count is not sent with it.
+ */
+export function commandStamps(found: { counts: Partial<Record<CommandCount, number>>; refs: Partial<Record<CommandRef, string>> } | undefined, refs: boolean): Record<string, number | string> {
+  const out: Record<string, number | string> = { [COMMAND_COUNTED]: 1 }
+  const put = (key: string, value: unknown) => {
+    if (COMMAND_RULES[key]?.(value)) out[key] = value as number | string
+  }
+  for (const c of COMMAND_COUNTS) put(commandKey(c), found?.counts[c])
+  if (refs) for (const [key, count] of COMMAND_REF_KEYS) if (out[count] !== undefined) put(key, found?.refs[key.slice(COMMAND_PREFIX.length) as CommandRef])
+  return out
 }
 
 /** `CLAUDE_CODE_ENTRYPOINT`, normalized to the list above. */

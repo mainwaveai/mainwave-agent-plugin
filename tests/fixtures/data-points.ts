@@ -1,0 +1,479 @@
+// Generated from hooks/data-points.json by scripts/check-vendored.sh --write. Do not edit: the test engine loads no JSON file, so tests read this.
+export default {
+  "catalog_version": 1,
+  "tool_output_event": "tool.output",
+  "data_points": [
+    {
+      "id": "session.identity",
+      "class": "identifiers",
+      "required": true,
+      "description": "Who sent the record: Claude organization, account, email, and the ID Claude Code keeps per installation",
+      "example": "ana@example.com"
+    },
+    {
+      "id": "session.links",
+      "class": "metadata",
+      "required": true,
+      "description": "IDs that tie records together: session, prompt, request, tool call, trace and span",
+      "example": "prompt.id 4f1c…"
+    },
+    {
+      "id": "session.client",
+      "class": "metadata",
+      "required": true,
+      "description": "What ran the session (Claude Code version, entry point, Cowork surface, terminal, plan, provider, the plugin's version), and Claude Code's own event rows",
+      "example": "remote_cowork, 2.1.322"
+    },
+    {
+      "id": "usage",
+      "class": "metadata",
+      "required": true,
+      "description": "Model, tokens, cost, request time, time to first token, effort, stop reason, query source; prompt, response, tool input and result sizes",
+      "example": "claude-opus-5-5, 2,914 output tokens, $0.04"
+    },
+    {
+      "id": "tool.call",
+      "class": "metadata",
+      "default": "on",
+      "description": "Each tool call: its name, duration, success and error class, and the permission decision and what made it",
+      "example": "Edit, 412 ms, accepted by rule",
+      "attributes": [
+        {
+          "keys": [
+            "tool_name",
+            "tool_name_safe",
+            "gen_ai.tool.name",
+            "decision",
+            "source",
+            "decision_source",
+            "decision_type",
+            "success",
+            "error_type",
+            "error_class",
+            "error.type",
+            "classifier_verdict",
+            "tool_source"
+          ],
+          "records": [
+            "tool_decision",
+            "tool_result",
+            "claude_code.tool",
+            "claude_code.tool.blocked_on_user",
+            "claude_code.tool.execution",
+            "claude_code.code_edit_tool.decision"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tool.mcp",
+      "class": "metadata",
+      "default": "on",
+      "switch": "OTEL_LOG_TOOL_DETAILS",
+      "description": "The MCP server and tool of each MCP call, and where the server was set up: user, project, managed, a plugin, or a claude.ai connector",
+      "example": "remote-devices / device_bash",
+      "attributes": [
+        {
+          "keys": [
+            "mcp_server.name",
+            "mcp_tool.name",
+            "anthropic.mcp.server.name",
+            "mcp_server_scope"
+          ]
+        },
+        {
+          "keys": [
+            "server_name",
+            "server_scope"
+          ],
+          "records": [
+            "mcp_server_connection"
+          ]
+        }
+      ],
+      "parameters": [
+        "mcp_server_name",
+        "mcp_tool_name"
+      ]
+    },
+    {
+      "id": "skill.name",
+      "class": "metadata",
+      "default": "on",
+      "switch": "OTEL_LOG_TOOL_DETAILS",
+      "description": "The skill used, third-party plugins' skills included",
+      "example": "pdf",
+      "attributes": [
+        {
+          "keys": [
+            "skill.name",
+            "skill_name"
+          ]
+        }
+      ],
+      "parameters": [
+        "skill_name"
+      ]
+    },
+    {
+      "id": "agent.type",
+      "class": "metadata",
+      "default": "on",
+      "switch": "OTEL_LOG_TOOL_DETAILS",
+      "description": "The type of each subagent started, custom ones included",
+      "example": "Explore",
+      "attributes": [
+        {
+          "keys": [
+            "agent.name",
+            "subagent_type"
+          ]
+        },
+        {
+          "keys": [
+            "agent_type"
+          ],
+          "records": [
+            "subagent_completed"
+          ]
+        }
+      ],
+      "parameters": [
+        "subagent_type"
+      ]
+    },
+    {
+      "id": "command.name",
+      "class": "metadata",
+      "default": "on",
+      "description": "The slash command run, not its arguments",
+      "example": "compact",
+      "attributes": [
+        {
+          "keys": [
+            "command_name"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "bash.class",
+      "class": "metadata",
+      "default": "on",
+      "description": "The kind and program of each shell command, in Bash or an MCP shell tool such as Cowork's device_bash",
+      "example": "vcs / git",
+      "attributes": [
+        {
+          "keys": [
+            "bash_command_class",
+            "bash_argv0",
+            "bash_subcommand",
+            "has_pipe"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "bash.outcome",
+      "class": "metadata",
+      "default": "on",
+      "description": "Commits, reverts, pushes, branches opened, merges, tags, workflow runs and pull requests opened, merged or updated by shell commands that succeeded, as counts",
+      "example": "1 commit, 1 push",
+      "metrics": [
+        "claude_code.commit.count",
+        "claude_code.pull_request.count"
+      ],
+      "attributes": [
+        {
+          "keys": [
+            "mainwave.command.counted",
+            "mainwave.command.commits",
+            "mainwave.command.reverts",
+            "mainwave.command.pushes",
+            "mainwave.command.prs_opened",
+            "mainwave.command.prs_merged",
+            "mainwave.command.prs_updated",
+            "mainwave.command.merges",
+            "mainwave.command.tags",
+            "mainwave.command.workflow_runs",
+            "mainwave.command.branches_opened"
+          ],
+          "records": [
+            "claude_code.tool"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "file.kind",
+      "class": "metadata",
+      "default": "on",
+      "description": "The language of each file edited or written, from its extension",
+      "example": "TypeScript",
+      "attributes": [
+        {
+          "keys": [
+            "language"
+          ],
+          "records": [
+            "claude_code.code_edit_tool.decision"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "web.domain",
+      "class": "metadata",
+      "default": "on",
+      "switch": "OTEL_LOG_TOOL_DETAILS",
+      "description": "The site of each page fetched",
+      "example": "docs.python.org",
+      "attributes": [
+        {
+          "keys": [
+            "url.domain"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "repo",
+      "class": "identifiers",
+      "default": "on",
+      "switch": "OTEL_METRICS_INCLUDE_REPOSITORY",
+      "description": "The Git remote's address, owner and name, the branch and the commit, and the branch, ref or tag a shell command opened, pushed, merged or tagged",
+      "example": "github.com/acme/api",
+      "key_prefixes": [
+        "vcs."
+      ],
+      "parameters": [
+        "git_commit_id",
+        "git_branch"
+      ],
+      "attributes": [
+        {
+          "keys": [
+            "mainwave.command.branch_opened",
+            "mainwave.command.push_ref",
+            "mainwave.command.merge_ref",
+            "mainwave.command.tag_name"
+          ],
+          "records": [
+            "claude_code.tool"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "file.path",
+      "class": "identifiers",
+      "default": "on",
+      "switch": "OTEL_LOG_TOOL_DETAILS",
+      "description": "The path of each file read, edited or written",
+      "example": "/Users/ana/acme/api/src/login.ts",
+      "attributes": [
+        {
+          "keys": [
+            "file_path",
+            "workspace.host_paths"
+          ]
+        }
+      ],
+      "output_keys": [
+        "file_path"
+      ]
+    },
+    {
+      "id": "web.url",
+      "class": "identifiers",
+      "default": "on",
+      "switch": "OTEL_LOG_TOOL_DETAILS",
+      "description": "The full address of each page fetched",
+      "example": "https://docs.python.org/3/library/re.html",
+      "attributes": [
+        {
+          "keys": [
+            "url.full"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "mcp.url",
+      "class": "identifiers",
+      "default": "on",
+      "needs": "tool.mcp",
+      "description": "The MCP servers set up for the session, called or not: each one's name, where it was set up and its address, read from Claude's MCP settings. A remote server's address keeps scheme, host, port and path; a local server's is its command. Headers and environment variables are never read",
+      "example": "https://mcp.example.com/mcp",
+      "attributes": [
+        {
+          "keys": [
+            "server_name",
+            "server_scope",
+            "transport_type",
+            "server_url"
+          ],
+          "records": [
+            "mcp_server_configured"
+          ]
+        }
+      ],
+      "own_rows": [
+        "mcp_server_configured"
+      ]
+    },
+    {
+      "id": "bash.command",
+      "class": "content",
+      "default": "off",
+      "switch": "OTEL_LOG_TOOL_DETAILS",
+      "description": "The full text of each shell command, in Bash or an MCP shell tool",
+      "example": "git commit -m \"fix login redirect\"",
+      "attributes": [
+        {
+          "keys": [
+            "full_command",
+            "bash_command"
+          ]
+        }
+      ],
+      "parameters": [
+        "bash_command",
+        "full_command"
+      ],
+      "output_keys": [
+        "bash_command"
+      ]
+    },
+    {
+      "id": "tool.input",
+      "class": "content",
+      "default": "off",
+      "switch": "OTEL_LOG_TOOL_DETAILS",
+      "holds": [
+        "bash.command",
+        "file.path",
+        "web.url"
+      ],
+      "description": "Each tool call's input: what an edit writes, search patterns, MCP arguments, subagent task prompts",
+      "example": "{\"pattern\":\"login\"}",
+      "attributes": [
+        {
+          "keys": [
+            "tool_input"
+          ]
+        }
+      ],
+      "parameters": [
+        "timeout",
+        "description",
+        "dangerouslyDisableSandbox"
+      ],
+      "output_keys": [
+        "diff"
+      ]
+    },
+    {
+      "id": "tool.result",
+      "class": "content",
+      "default": "off",
+      "switch": "OTEL_LOG_TOOL_CONTENT",
+      "description": "What each tool returned: command output, file contents read, MCP results, a failed call's error",
+      "example": "3 files changed, 41 insertions(+)",
+      "attributes": [
+        {
+          "keys": [
+            "error"
+          ],
+          "records": [
+            "tool_result"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "skill.text",
+      "class": "content",
+      "default": "off",
+      "needs": "skill.name",
+      "description": "The instructions of each skill run, as Claude Code expanded them for the model with arguments filled in; sent once per session for each distinct text, later runs refer to it",
+      "example": "Review the diff for correctness bugs…",
+      "attributes": [
+        {
+          "keys": [
+            "skill.text",
+            "skill.text_id"
+          ],
+          "records": [
+            "skill_prompt"
+          ]
+        }
+      ],
+      "own_rows": [
+        "skill_prompt"
+      ]
+    },
+    {
+      "id": "prompt.text",
+      "class": "content",
+      "default": "off",
+      "switch": "OTEL_LOG_USER_PROMPTS",
+      "description": "What the person typed, pastes expanded, slash command arguments included",
+      "example": "Fix the login redirect on Safari",
+      "attributes": [
+        {
+          "keys": [
+            "prompt",
+            "prompt_text"
+          ],
+          "records": [
+            "user_prompt"
+          ],
+          "redact": true
+        },
+        {
+          "keys": [
+            "user_prompt"
+          ],
+          "records": [
+            "claude_code.interaction"
+          ],
+          "redact": true
+        }
+      ]
+    },
+    {
+      "id": "response.text",
+      "class": "content",
+      "default": "off",
+      "switch": "OTEL_LOG_ASSISTANT_RESPONSES",
+      "description": "The model's visible answers",
+      "example": "Fixed: the redirect now keeps the query string.",
+      "attributes": [
+        {
+          "keys": [
+            "response"
+          ],
+          "records": [
+            "assistant_response"
+          ],
+          "redact": true
+        }
+      ]
+    },
+    {
+      "id": "response.thinking",
+      "class": "content",
+      "default": "off",
+      "description": "The model's thinking text, where the API returns it",
+      "example": "The redirect drops the query because…",
+      "attributes": [
+        {
+          "keys": [
+            "response.thinking"
+          ]
+        }
+      ]
+    }
+  ]
+}

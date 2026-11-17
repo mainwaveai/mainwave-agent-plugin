@@ -37,12 +37,12 @@ import type { TelemetryAttribute } from 'claude-code'
 
 import { isAccountMemoryTool, notRecorded, shellCommand } from './capture.ts'
 import { TOOL_OUTPUT_EVENT } from './catalog.ts'
-import { bashClass, CODE_EDIT_TOOLS, errorClassOf, genAiProvider, gitCounts, languageOf, linesChanged, mcpCreatesPr, mcpParts, metricQuerySource, querySourceSafe, toolNameSafe } from './derive.ts'
+import { bashClass, CODE_EDIT_TOOLS, commandOutcomes, errorClassOf, genAiProvider, gitCounts, languageOf, linesChanged, mcpCreatesPr, mcpParts, metricQuerySource, querySourceSafe, toolNameSafe } from './derive.ts'
 import { allows, type Gate } from './gate.ts'
 import type { Measure } from './meter.ts'
 import type { BuiltSpan } from './otlp.ts'
 import { cut } from './protect.ts'
-import { stripOwned } from './stamps.ts'
+import { commandStamps, stripOwned } from './stamps.ts'
 
 type Attrs = Record<string, TelemetryAttribute>
 type Ctx = { traceId: string; spanId: string }
@@ -874,6 +874,29 @@ function inputAttrs(r: Rebuild, tool: Tool): [string, TelemetryAttribute | undef
   return out
 }
 
+/**
+ * What a shell command did, by Mainwave's rules (derive.ts), for its tool span, where `bash.outcome` is on: `counted` on every
+ * command, and on one that ran and succeeded each count above 0, with the refs it names where `repo` is on too (stamps.ts). Claude
+ * Code stamps none of them, so a data point at `claude` sends none. Mainwave counts a span's command from these where it has no
+ * command text. A ref longer than the attribute limit is left off, not cut: cut, it names another ref. If reading the command
+ * fails, nothing is stamped, and the span goes without.
+ */
+function outcomeAttrs(r: Rebuild, tool: Tool): [string, TelemetryAttribute][] {
+  const gate = r.settings.gate()
+  const command = shellCommand(tool.name, tool.input)
+  if (command === undefined || !allows(gate, 'bash.outcome', false)) return []
+  const ran = tool.decision ? tool.decision.decision === 'accept' : tool.result !== undefined
+  const succeeded = ran && !tool.isError && tool.result?.success !== false
+  let stamps: Record<string, number | string>
+  try {
+    stamps = commandStamps(succeeded ? commandOutcomes(command) : undefined, allows(gate, 'repo', false))
+  } catch {
+    return []
+  }
+  const limit = r.settings.valueLengthLimit
+  return Object.entries(stamps).filter(([, v]) => typeof v !== 'string' || limit === undefined || v.length <= limit)
+}
+
 /** A web address's host, or undefined when it does not parse. */
 function hostOf(url: string): string | undefined {
   try {
@@ -968,6 +991,7 @@ function finishTool(r: Rebuild, tool: Tool, force: boolean): Emit {
       ['anthropic.mcp.server.name', mcp?.server],
       ['gen_ai.conversation.id', conversation],
       ...inputAttrs(r, tool),
+      ...outcomeAttrs(r, tool),
       ...agentAttrs(r, tool.agentId),
       ['tool_use_id', tool.id],
       ['gen_ai.tool.call.id', tool.id],

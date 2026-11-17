@@ -1,0 +1,1037 @@
+{
+  "_meta": {
+    "description": "Shell commands and the outcomes Mainwave derives from each. Mainwave's backend rules are the truth: a backend test runs every case through the backend's own SQL. The Mainwave plugin computes the same outcomes on the person's machine and stamps them on the command's tool span, so command text need not leave it, and runs every case through its own implementation from a byte copy of this file. A case changes only by a reviewed edit that changes the backend's rules, never to match one implementation's output.",
+    "format": {
+      "cases": "A list of { name, command, outcomes, refs }. `command` is the shell command as the tool ran it, newlines included.",
+      "outcomes": "The counts above 0, by column. A column absent from `outcomes` is 0. The plugin sends each one as the integer attribute `mainwave.command.<column>` on the command's `claude_code.tool` span, and sends none that is 0.",
+      "refs": "The refs the command names, by name, each the pattern's raw capture (not normalized: `HEAD:refs/heads/x` stays as written). A ref absent from `refs` is none. Each rides beside its count: `branch_opened` with `branches_opened`, `push_ref` with `pushes`, `merge_ref` with `merges`, `tag_name` with `tags`. The plugin sends each as the string attribute `mainwave.command.<name>`, only while the `repo` data point is on.",
+      "counted": "The presence key: the plugin sends the integer attribute `mainwave.command.counted` (1) on every shell command's `claude_code.tool` span, succeeded or not, while the `bash.outcome` data point is on, with or without counts. A span with it has known outcomes, so a command that made none reads as 0, not as a command whose outcomes weren't captured. Not a case field."
+    },
+    "columns": {
+      "commits": "`git commit` and `git cherry-pick` at a command position (the outcome counts' commits). `git revert` is not one.",
+      "reverts": "`git revert`. The Activity rollup's commit count is `commits` plus `reverts`.",
+      "pushes": "`git push`.",
+      "prs_opened": "`gh pr create` and `glab mr create`.",
+      "prs_merged": "`gh pr merge` and `glab mr merge`.",
+      "prs_updated": "`gh pr edit|ready|comment|review`, `gh stack submit|push`, `glab mr update|note|approve`.",
+      "merges": "`git merge` invocations that are not a branch sync (a `--ff-only` merge of a remote-tracking ref or of none).",
+      "tags": "`git tag <name>` (not listing or deleting) and `gh|glab release create`.",
+      "workflow_runs": "`gh workflow run` and `glab ci run`.",
+      "branches_opened": "1 when the command opens a branch (`git checkout -b|-B`, `git switch -c|-C|--create|--force-create`, `git worktree add -b|-B`), however many it opens. A flag, not a count."
+    },
+    "ref_names": {
+      "branch_opened": "The branch the first branch open names.",
+      "push_ref": "The ref the first `git push <remote> <ref>` names; a push with no ref names none.",
+      "merge_ref": "The ref the last `git merge` that is not a sync names.",
+      "tag_name": "The tag the first `git tag` names; a CLI release names none."
+    },
+    "rules": "A command position is the start of the command or a point after `&&`, `;`, `|` or a newline, past `rtk`, `do`, `then`, `else`, `if`, `until` or `while`. Heredoc bodies, quoted strings holding a separator or a newline, and comments are cut before matching, so text there never counts. `git -C <dir>` may precede a subcommand.",
+    "scope": "The plugin stamps counts and refs only on a shell command that succeeded, and `counted` on every shell command; command text, when collected, counts every command run. A span with command text is counted from it and never from stamps."
+  },
+  "cases": [
+    {
+      "name": "a commit",
+      "command": "git commit -m \"fix login redirect\"",
+      "outcomes": {
+        "commits": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a chain counts each command once",
+      "command": "git add -A && git commit -m \"x\" && git push",
+      "outcomes": {
+        "commits": 1,
+        "pushes": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "git -C names the repository before the subcommand",
+      "command": "git -C services/api commit -am 'wip'",
+      "outcomes": {
+        "commits": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a cherry-pick is a commit",
+      "command": "git cherry-pick 4f1c2ab",
+      "outcomes": {
+        "commits": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a revert is a revert, not a commit",
+      "command": "git revert HEAD --no-edit",
+      "outcomes": {
+        "reverts": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a commit then a revert on separate commands",
+      "command": "git commit -m \"a\" && git revert --no-edit HEAD~1",
+      "outcomes": {
+        "commits": 1,
+        "reverts": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "two commits a newline apart, each with arguments",
+      "command": "git commit -m one\ngit commit -m two",
+      "outcomes": {
+        "commits": 2
+      },
+      "refs": {}
+    },
+    {
+      "name": "two bare commits a line apart",
+      "command": "git commit\ngit commit",
+      "outcomes": {
+        "commits": 2
+      },
+      "refs": {}
+    },
+    {
+      "name": "commits and reverts a line apart",
+      "command": "git commit\ngit revert\ngit cherry-pick\ngit revert",
+      "outcomes": {
+        "commits": 2,
+        "reverts": 2
+      },
+      "refs": {}
+    },
+    {
+      "name": "a semicolon chain",
+      "command": "git commit -m x; git push origin main; gh pr create --fill",
+      "outcomes": {
+        "commits": 1,
+        "pushes": 1,
+        "prs_opened": 1
+      },
+      "refs": {
+        "push_ref": "main"
+      }
+    },
+    {
+      "name": "a quoted separator inside a commit message is data",
+      "command": "git commit -m 'msg; with semicolon && git push' && git push",
+      "outcomes": {
+        "commits": 1,
+        "pushes": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "cd then push names the ref",
+      "command": "cd ~/src/api && git push origin feat/x",
+      "outcomes": {
+        "pushes": 1
+      },
+      "refs": {
+        "push_ref": "feat/x"
+      }
+    },
+    {
+      "name": "push with flags and a refspec",
+      "command": "git push -u origin HEAD:refs/heads/feat/y",
+      "outcomes": {
+        "pushes": 1
+      },
+      "refs": {
+        "push_ref": "HEAD:refs/heads/feat/y"
+      }
+    },
+    {
+      "name": "a bare push names no ref",
+      "command": "git push",
+      "outcomes": {
+        "pushes": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a force push",
+      "command": "git push --force-with-lease origin fix/login",
+      "outcomes": {
+        "pushes": 1
+      },
+      "refs": {
+        "push_ref": "fix/login"
+      }
+    },
+    {
+      "name": "a loop body is a command position",
+      "command": "for b in a b; do git push origin $b; done",
+      "outcomes": {
+        "pushes": 1
+      },
+      "refs": {
+        "push_ref": "$b"
+      }
+    },
+    {
+      "name": "a conditional body is a command position",
+      "command": "if git diff --quiet; then git commit -am x; fi",
+      "outcomes": {
+        "commits": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "the rtk wrapper",
+      "command": "rtk git push origin main",
+      "outcomes": {
+        "pushes": 1
+      },
+      "refs": {
+        "push_ref": "main"
+      }
+    },
+    {
+      "name": "a heredoc body is data",
+      "command": "git commit -F - <<'EOF'\nfix: x\n\ngit push origin main\ngh pr create --fill\nEOF\ngit push",
+      "outcomes": {
+        "commits": 1,
+        "pushes": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a file written by a heredoc is data",
+      "command": "cat > notes.md <<EOF\ngit push origin main\nEOF",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "echo of a command is no command",
+      "command": "echo git push origin main",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a quoted string with a separator is cut",
+      "command": "echo \"git push && gh pr create\"",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a python -c script is cut",
+      "command": "python -c 'import os; os.system(\"git push\")'",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "bash -c with no separator is not read",
+      "command": "bash -lc 'git push'",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a comment is data",
+      "command": "ls # then git push\ngit status",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "read-only git commands",
+      "command": "git status && git diff && git log --oneline -5",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "merge-base is read-only",
+      "command": "git merge-base HEAD origin/main",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "gh pr create opens a PR",
+      "command": "gh pr create --title \"Fix login\" --body \"Fixes the redirect\"",
+      "outcomes": {
+        "prs_opened": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "gh pr merge merges a PR",
+      "command": "gh pr merge 42 --squash --delete-branch",
+      "outcomes": {
+        "prs_merged": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "gh pr create then gh pr merge",
+      "command": "gh pr create --fill && gh pr merge --auto --squash",
+      "outcomes": {
+        "prs_opened": 1,
+        "prs_merged": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "glab mr create",
+      "command": "glab mr create --title \"Fix login\" --fill",
+      "outcomes": {
+        "prs_opened": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "glab mr merge",
+      "command": "glab mr merge 7",
+      "outcomes": {
+        "prs_merged": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "gh pr view is read-only",
+      "command": "gh pr view 42 --json state",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "gh pr edit updates a PR",
+      "command": "gh pr edit 5 --add-label ready",
+      "outcomes": {
+        "prs_updated": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "gh pr comment and gh pr ready update a PR each",
+      "command": "gh pr comment 5 --body \"done\" && gh pr ready 5",
+      "outcomes": {
+        "prs_updated": 2
+      },
+      "refs": {}
+    },
+    {
+      "name": "gh stack submit updates a PR",
+      "command": "gh stack submit",
+      "outcomes": {
+        "prs_updated": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "glab mr note updates a PR",
+      "command": "glab mr note 7 -m \"lgtm\"",
+      "outcomes": {
+        "prs_updated": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "git checkout -b opens a branch",
+      "command": "git checkout -b feat/ABC-1-login",
+      "outcomes": {
+        "branches_opened": 1
+      },
+      "refs": {
+        "branch_opened": "feat/ABC-1-login"
+      }
+    },
+    {
+      "name": "checkout with flags before -b",
+      "command": "git checkout -q -b fix/x origin/main",
+      "outcomes": {
+        "branches_opened": 1
+      },
+      "refs": {
+        "branch_opened": "fix/x"
+      }
+    },
+    {
+      "name": "git switch -c opens a branch",
+      "command": "git switch -c fix/redirect",
+      "outcomes": {
+        "branches_opened": 1
+      },
+      "refs": {
+        "branch_opened": "fix/redirect"
+      }
+    },
+    {
+      "name": "git switch --create",
+      "command": "git switch --create chore/deps",
+      "outcomes": {
+        "branches_opened": 1
+      },
+      "refs": {
+        "branch_opened": "chore/deps"
+      }
+    },
+    {
+      "name": "git worktree add -b",
+      "command": "git worktree add ../wt -b feat/wt origin/master",
+      "outcomes": {
+        "branches_opened": 1
+      },
+      "refs": {
+        "branch_opened": "feat/wt"
+      }
+    },
+    {
+      "name": "a quoted branch name",
+      "command": "git switch -c 'feat/quoted'",
+      "outcomes": {
+        "branches_opened": 1
+      },
+      "refs": {
+        "branch_opened": "feat/quoted"
+      }
+    },
+    {
+      "name": "cd then open a branch",
+      "command": "cd /repo && git -C . checkout -b feat/cw",
+      "outcomes": {
+        "branches_opened": 1
+      },
+      "refs": {
+        "branch_opened": "feat/cw"
+      }
+    },
+    {
+      "name": "two branch opens are one",
+      "command": "git checkout -b a && git checkout -b b",
+      "outcomes": {
+        "branches_opened": 1
+      },
+      "refs": {
+        "branch_opened": "a"
+      }
+    },
+    {
+      "name": "a plain checkout opens nothing",
+      "command": "git checkout main && git pull",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a merge names its ref",
+      "command": "git merge feature-x",
+      "outcomes": {
+        "merges": 1
+      },
+      "refs": {
+        "merge_ref": "feature-x"
+      }
+    },
+    {
+      "name": "a merge with flags",
+      "command": "git merge --no-ff feat/login -m 'merge login'",
+      "outcomes": {
+        "merges": 1
+      },
+      "refs": {
+        "merge_ref": "feat/login"
+      }
+    },
+    {
+      "name": "a fast-forward of the upstream is a sync",
+      "command": "git pull && git merge --ff-only origin/main",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a fast-forward of a local branch is a merge",
+      "command": "git merge --ff-only feat/local",
+      "outcomes": {
+        "merges": 1
+      },
+      "refs": {
+        "merge_ref": "feat/local"
+      }
+    },
+    {
+      "name": "a tag names it",
+      "command": "git tag v1.2.0 && git push origin v1.2.0",
+      "outcomes": {
+        "pushes": 1,
+        "tags": 1
+      },
+      "refs": {
+        "push_ref": "v1.2.0",
+        "tag_name": "v1.2.0"
+      }
+    },
+    {
+      "name": "an annotated tag",
+      "command": "git tag -a v2.0.0 -m \"release\"",
+      "outcomes": {
+        "tags": 1
+      },
+      "refs": {
+        "tag_name": "v2.0.0"
+      }
+    },
+    {
+      "name": "listing tags makes none",
+      "command": "git tag -l && git tag",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a CLI release makes a tag",
+      "command": "gh release create v2.1.0 --generate-notes",
+      "outcomes": {
+        "tags": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a workflow run",
+      "command": "gh workflow run ci.yml --ref main",
+      "outcomes": {
+        "workflow_runs": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a GitLab pipeline run",
+      "command": "glab ci run",
+      "outcomes": {
+        "workflow_runs": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a whole delivery in one command",
+      "command": "git checkout -b feat/z && git commit -am z && git push -u origin feat/z && gh pr create --fill && gh pr merge --squash",
+      "outcomes": {
+        "commits": 1,
+        "pushes": 1,
+        "prs_opened": 1,
+        "prs_merged": 1,
+        "branches_opened": 1
+      },
+      "refs": {
+        "branch_opened": "feat/z",
+        "push_ref": "feat/z"
+      }
+    },
+    {
+      "name": "no outcome",
+      "command": "ls -la && pytest -q",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "the merge ref is the last merge, not the first",
+      "command": "git merge feat/a && git merge feat/b",
+      "outcomes": {
+        "merges": 2
+      },
+      "refs": {
+        "merge_ref": "feat/b"
+      }
+    },
+    {
+      "name": "a sync before a real merge counts only the real one",
+      "command": "git merge --ff-only origin/main && git merge feat/x",
+      "outcomes": {
+        "merges": 1
+      },
+      "refs": {
+        "merge_ref": "feat/x"
+      }
+    },
+    {
+      "name": "a sync after a real merge leaves the real merge's ref",
+      "command": "git merge feat/x && git merge --ff-only origin/main",
+      "outcomes": {
+        "merges": 1
+      },
+      "refs": {
+        "merge_ref": "feat/x"
+      }
+    },
+    {
+      "name": "a fast-forward with a redirect is a sync",
+      "command": "git merge --ff-only origin/main 2>&1",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a fast-forward with a redirect and a target is a sync",
+      "command": "git merge --ff-only > /dev/null",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a fast-forward naming no ref is a sync",
+      "command": "git merge --ff-only",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a fast-forward of an upstream remote is a sync",
+      "command": "git fetch && git merge --ff-only upstream/main",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a fast-forward of FETCH_HEAD is a sync",
+      "command": "git fetch origin && git merge --ff-only FETCH_HEAD",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a fast-forward of the upstream shorthand is a sync",
+      "command": "git merge --ff-only @{u}",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a fast-forward of a remotes ref is a sync",
+      "command": "git merge --ff-only refs/remotes/origin/main",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a merge of a remote ref without --ff-only is a merge",
+      "command": "git merge origin/main",
+      "outcomes": {
+        "merges": 1
+      },
+      "refs": {
+        "merge_ref": "origin/main"
+      }
+    },
+    {
+      "name": "a fast-forward naming a remote ref and a local branch is a merge",
+      "command": "git merge --ff-only origin/main feat/x",
+      "outcomes": {
+        "merges": 1
+      },
+      "refs": {
+        "merge_ref": "origin/main"
+      }
+    },
+    {
+      "name": "a quoted remote ref is not a sync",
+      "command": "git merge --ff-only \"origin/main\"",
+      "outcomes": {
+        "merges": 1
+      },
+      "refs": {
+        "merge_ref": "\"origin/main\""
+      }
+    },
+    {
+      "name": "git -C names the repository before merge",
+      "command": "git -C ../other merge feat/x",
+      "outcomes": {
+        "merges": 1
+      },
+      "refs": {
+        "merge_ref": "feat/x"
+      }
+    },
+    {
+      "name": "a merge abort is a merge naming no ref",
+      "command": "git merge --abort",
+      "outcomes": {
+        "merges": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "the push ref is the first push's",
+      "command": "git push origin feat/a && git push origin feat/b",
+      "outcomes": {
+        "pushes": 2
+      },
+      "refs": {
+        "push_ref": "feat/a"
+      }
+    },
+    {
+      "name": "a push naming only a remote names no ref",
+      "command": "git push origin",
+      "outcomes": {
+        "pushes": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a delete push names no ref",
+      "command": "git push origin --delete old-branch",
+      "outcomes": {
+        "pushes": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "git -C names the repository before push",
+      "command": "git -C repo push origin main",
+      "outcomes": {
+        "pushes": 1
+      },
+      "refs": {
+        "push_ref": "main"
+      }
+    },
+    {
+      "name": "the tag name is the first tag's",
+      "command": "git tag v1 && git tag v2",
+      "outcomes": {
+        "tags": 2
+      },
+      "refs": {
+        "tag_name": "v1"
+      }
+    },
+    {
+      "name": "a CLI release before a tag leaves the tag's name",
+      "command": "gh release create v1 && git tag v2",
+      "outcomes": {
+        "tags": 2
+      },
+      "refs": {
+        "tag_name": "v2"
+      }
+    },
+    {
+      "name": "a signed tag",
+      "command": "git tag -s v3 -m release",
+      "outcomes": {
+        "tags": 1
+      },
+      "refs": {
+        "tag_name": "v3"
+      }
+    },
+    {
+      "name": "deleting a tag makes none",
+      "command": "git tag -d v1",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a glab release makes a tag",
+      "command": "glab release create v2.1.0",
+      "outcomes": {
+        "tags": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "two PRs opened in one command",
+      "command": "gh pr create --fill && glab mr create --fill",
+      "outcomes": {
+        "prs_opened": 2
+      },
+      "refs": {}
+    },
+    {
+      "name": "two PRs merged in one command",
+      "command": "gh pr merge 1 && glab mr merge 2",
+      "outcomes": {
+        "prs_merged": 2
+      },
+      "refs": {}
+    },
+    {
+      "name": "two workflow runs in one command",
+      "command": "gh workflow run a.yml && glab ci run",
+      "outcomes": {
+        "workflow_runs": 2
+      },
+      "refs": {}
+    },
+    {
+      "name": "gh pr review updates a PR",
+      "command": "gh pr review 5 --approve",
+      "outcomes": {
+        "prs_updated": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "gh stack push updates a PR",
+      "command": "gh stack push",
+      "outcomes": {
+        "prs_updated": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "glab mr update updates a PR",
+      "command": "glab mr update 7 --title x",
+      "outcomes": {
+        "prs_updated": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "glab mr approve updates a PR",
+      "command": "glab mr approve 7",
+      "outcomes": {
+        "prs_updated": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "gh pr list and gh pr checks are read-only",
+      "command": "gh pr list && gh pr checks 5",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a pipe is a separator",
+      "command": "echo x | git commit -F -",
+      "outcomes": {
+        "commits": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a command before a pipe",
+      "command": "git push origin main | tee out.log",
+      "outcomes": {
+        "pushes": 1
+      },
+      "refs": {
+        "push_ref": "main"
+      }
+    },
+    {
+      "name": "an else body is a command position",
+      "command": "if git diff --quiet; then echo clean; else git push origin main; fi",
+      "outcomes": {
+        "pushes": 1
+      },
+      "refs": {
+        "push_ref": "main"
+      }
+    },
+    {
+      "name": "an until condition is a command position",
+      "command": "until git push origin main; do sleep 1; done",
+      "outcomes": {
+        "pushes": 1
+      },
+      "refs": {
+        "push_ref": "main"
+      }
+    },
+    {
+      "name": "a while condition is a command position",
+      "command": "while git commit -am x; do :; done",
+      "outcomes": {
+        "commits": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "the rtk proxy wrapper",
+      "command": "rtk proxy git commit -m x",
+      "outcomes": {
+        "commits": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a wrapper inside a loop body",
+      "command": "if true; then rtk git push origin main; fi",
+      "outcomes": {
+        "pushes": 1
+      },
+      "refs": {
+        "push_ref": "main"
+      }
+    },
+    {
+      "name": "a subcommand that only starts with commit is none",
+      "command": "git commit-tree HEAD^{tree} && git pushd",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a heredoc with another delimiter is data",
+      "command": "cat <<MSG\ngit push origin main\nMSG\ngit commit -m x",
+      "outcomes": {
+        "commits": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a dashed heredoc with an indented terminator",
+      "command": "cat <<-DOC\n\tgit push origin main\n\tDOC\ngit commit -m x",
+      "outcomes": {
+        "commits": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a quoted heredoc delimiter with an underscore",
+      "command": "cat <<'END_OF_TEXT'\ngit push origin main\nEND_OF_TEXT\ngit tag v1",
+      "outcomes": {
+        "tags": 1
+      },
+      "refs": {
+        "tag_name": "v1"
+      }
+    },
+    {
+      "name": "the rest of a heredoc's opener line is still shell",
+      "command": "cat <<EOF > f.txt && git push origin main\ngit commit -m body\nEOF",
+      "outcomes": {
+        "pushes": 1
+      },
+      "refs": {
+        "push_ref": "main"
+      }
+    },
+    {
+      "name": "a heredoc with CRLF lines",
+      "command": "cat <<EOF\r\ngit push\r\nEOF\r\ngit commit -m x",
+      "outcomes": {
+        "commits": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a here-string is no heredoc",
+      "command": "cat <<< EOF\ngit push\nEOF",
+      "outcomes": {
+        "pushes": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a lower-case heredoc tag is not cut",
+      "command": "cat <<eof\ngit push\neof",
+      "outcomes": {
+        "pushes": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a backslash-escaped quote opens no string",
+      "command": "echo don\\'t; git commit -m x; echo it\\'s",
+      "outcomes": {
+        "commits": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "an apostrophe in a comment opens no string",
+      "command": "git commit -m x # don't stop\ngit push # it's done",
+      "outcomes": {
+        "commits": 1,
+        "pushes": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a hash inside quotes is not a comment",
+      "command": "git commit -m \"fix #12\" && git push",
+      "outcomes": {
+        "commits": 1,
+        "pushes": 1
+      },
+      "refs": {}
+    },
+    {
+      "name": "a quoted string without a separator is kept",
+      "command": "git commit -m \"a b\" && git tag v1",
+      "outcomes": {
+        "commits": 1,
+        "tags": 1
+      },
+      "refs": {
+        "tag_name": "v1"
+      }
+    },
+    {
+      "name": "checkout -B opens a branch",
+      "command": "git checkout -B feat/b",
+      "outcomes": {
+        "branches_opened": 1
+      },
+      "refs": {
+        "branch_opened": "feat/b"
+      }
+    },
+    {
+      "name": "switch -C opens a branch",
+      "command": "git switch -C feat/c",
+      "outcomes": {
+        "branches_opened": 1
+      },
+      "refs": {
+        "branch_opened": "feat/c"
+      }
+    },
+    {
+      "name": "switch --force-create opens a branch",
+      "command": "git switch --force-create feat/d",
+      "outcomes": {
+        "branches_opened": 1
+      },
+      "refs": {
+        "branch_opened": "feat/d"
+      }
+    },
+    {
+      "name": "worktree add -B opens a branch",
+      "command": "git worktree add ../wt -B feat/e origin/master",
+      "outcomes": {
+        "branches_opened": 1
+      },
+      "refs": {
+        "branch_opened": "feat/e"
+      }
+    },
+    {
+      "name": "a double-quoted branch name",
+      "command": "git checkout -b \"feat/dq\"",
+      "outcomes": {
+        "branches_opened": 1
+      },
+      "refs": {
+        "branch_opened": "feat/dq"
+      }
+    },
+    {
+      "name": "a branch name ends at a semicolon",
+      "command": "git checkout -b feat/semi;git status",
+      "outcomes": {
+        "branches_opened": 1
+      },
+      "refs": {
+        "branch_opened": "feat/semi"
+      }
+    },
+    {
+      "name": "the branch flag must belong to the same command",
+      "command": "git checkout main && ls -b",
+      "outcomes": {},
+      "refs": {}
+    },
+    {
+      "name": "a quoted mention of a branch open is not the open",
+      "command": "echo \"git checkout -b x\" && git checkout -q -b y",
+      "outcomes": {
+        "branches_opened": 1
+      },
+      "refs": {
+        "branch_opened": "y"
+      }
+    },
+    {
+      "name": "git switch without -c opens nothing",
+      "command": "git switch main && git worktree add ../wt main",
+      "outcomes": {},
+      "refs": {}
+    }
+  ]
+}
