@@ -311,7 +311,7 @@ async function flushOwn($: EngineInterface): Promise<void> {
   for (let o = own.shift(); o !== undefined; o = own.shift()) {
     const at = new Date(o.atMs).toISOString()
     const attributes = applyStamps({ ...r.common, 'event.name': o.event, 'event.timestamp': at, ...o.attributes }, {
-      'mainwave.mod.name': PLUGIN_NAME, 'mainwave.mod.version': VERSION, 'mainwave.mod.entrypoint': ep, 'mainwave.telemetry.route': 'plugin',
+      'mainwave.plugin.name': PLUGIN_NAME, 'mainwave.plugin.version': VERSION, 'mainwave.plugin.entrypoint': ep, 'mainwave.telemetry.route': 'plugin',
     })
     const row = gateRow(gate, { event: o.event, loggedAt: at, attributes })
     try {
@@ -533,9 +533,9 @@ export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams
       // The identity is the session's to keep, not the row's: a failed write never holds the row.
     }
     attributes = applyStamps(e.attributes, {
-      'mainwave.mod.name': PLUGIN_NAME,
-      'mainwave.mod.version': VERSION,
-      'mainwave.mod.entrypoint': ep,
+      'mainwave.plugin.name': PLUGIN_NAME,
+      'mainwave.plugin.version': VERSION,
+      'mainwave.plugin.entrypoint': ep,
       'mainwave.telemetry.route': 'exporter',
     })
   } else {

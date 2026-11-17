@@ -12,9 +12,9 @@ The plugin does two things.
 
 | Attribute | Value |
 | --- | --- |
-| `mainwave.mod.name` | `mainwave` |
-| `mainwave.mod.version` | the plugin's version, such as `0.1.0` |
-| `mainwave.mod.entrypoint` | where the session runs, from `CLAUDE_CODE_ENTRYPOINT` (`cli`, `claude-vscode`, `remote_cowork` and so on); `other` for anything else |
+| `mainwave.plugin.name` | `mainwave` |
+| `mainwave.plugin.version` | the plugin's version, such as `0.1.0` |
+| `mainwave.plugin.entrypoint` | where the session runs, from `CLAUDE_CODE_ENTRYPOINT` (`cli`, `claude-vscode`, `remote_cowork` and so on); `other` for anything else |
 | `mainwave.telemetry.route` | which path the row took: `exporter` on the row Claude Code's exporter sends, `plugin` on the plugin's own copy |
 
 Mainwave can then tell which sessions run the plugin, which version, and where.
@@ -89,7 +89,7 @@ Every span and data point starts with the attributes Claude Code puts first on a
 Rules it keeps:
 
 - **It never holds anything up.** The exporter's row always goes on, whether or not the copy could be queued. If stamping fails, the row goes on as Claude Code wrote it, minus any key the plugin owns. The hooks on turns, model requests, tool calls, slash commands, subagents and skill prompts only watch: each passes its event and its result on unchanged, and a fault in one is caught.
-- **Nothing else can pose as it.** Any key under `mainwave.mod.` or `mainwave.telemetry.` already on a row is removed before the plugin adds its own, and each value it adds must fit a fixed shape.
+- **Nothing else can pose as it.** Any key under `mainwave.plugin.`, `mainwave.telemetry.` or `mainwave.redaction.` already on a row is removed before the plugin adds its own, and so is any key under `mainwave.mod.`, where earlier Mainwave plugins put their stamps, and each value it adds must fit a fixed shape.
 - **Its key goes to one place.** The plugin sends the dev ingest key only to the dev collector, as a bearer token, and never writes it to a row, a file or a log. Keyless, it sends no key at all. The plugin never reads the organization's collector URL or key. This holds against settings, not against other plugins: any plugin the person installs can see and rewrite every plugin's requests, this one's included, so a dev key is only as safe as the person's other plugins.
 - **It sends what its data points allow, and nothing else.** What each data point is, and when it goes, is in What it sends, below. It adds no commands, panes or tools.
 
@@ -180,7 +180,7 @@ An owner or admin of the Claude organization, on claude.ai:
 
 Each re-sync picks up the repository's `main` branch. For the stamps to reach Mainwave, the organization also needs Mainwave's managed `env` block (from Mainwave's org-wide setup); without it the plugin loads and stamps nothing.
 
-To check it works: run a session, then look for rows with `mainwave.mod.name = mainwave` in Mainwave.
+To check it works: run a session, then look for rows with `mainwave.plugin.name = mainwave` in Mainwave.
 
 ### For yourself
 
