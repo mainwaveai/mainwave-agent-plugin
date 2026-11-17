@@ -764,6 +764,8 @@ function checkKeyless(pass, { captured, run }, reference) {
     ['a tool_result row with its parameters and input', rowsOf('tool_result').some(r => /"full_command":"echo e2e"/.test(String(r.attributes.tool_parameters?.v ?? '')) && r.attributes.tool_input !== undefined)],
   ]
   for (const [what, ok] of expectations) if (!ok) problems.push(`defaults: no ${what} was sent`)
+  // What Claude Code never sends is off by default: no row of the plugin's own for MCP server addresses or skill text.
+  for (const ev of ['mcp_server_configured', 'skill_prompt']) if (rowsOf(ev).length > 0) problems.push(`defaults: ${ev} rows were sent`)
   const requests = captured.plugin.logs.length + captured.plugin.traces.length + captured.plugin.metrics.length
   console.log(`keyless: ${requests} requests, none refused; ${rows.length} rows, ${spans.length} spans in ${new Set(spans.map(s => s.traceId)).size} traces (${interactions.length} interactions), ${points.length} metric points`)
   console.log(`  spans: ${[...got].map(([n, c]) => `${n} ${c}`).join(', ')}`)

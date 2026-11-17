@@ -14,7 +14,7 @@
 
 import type { TelemetryAttribute } from 'claude-code'
 
-import { CATALOG, DATA_POINTS, DEFAULTS, OUTPUT_OWNERS, ownerOf, PARAMETER_OWNERS, sensitive, TOOL_OUTPUT_EVENT, type DataPointId, type Switch } from './catalog.ts'
+import { CATALOG, DATA_POINTS, DEFAULTS, OUTPUT_OWNERS, OWN_ROWS, ownerOf, PARAMETER_OWNERS, sensitive, SKILL_PROMPT_ROW, TOOL_OUTPUT_EVENT, type DataPointId, type Switch } from './catalog.ts'
 import type { BuiltSpan, CopiedRow, MetricPoint } from './otlp.ts'
 import { CONTENT_MAX_LENGTH, cut, redact } from './protect.ts'
 import { COUNT_RULES, REDACTION_COUNT } from './stamps.ts'
@@ -45,12 +45,14 @@ export function resolveGate(env: Readonly<Partial<Record<Switch, string | undefi
 
 /**
  * Whether a data point goes out at one place: `claude` says whether Claude Code sends it there under the session's settings (on its
- * row, it is there; on a span the plugin rebuilds, Claude Code's own rule). A data point that holds others goes only where they all do.
+ * row, it is there; on a span the plugin rebuilds, Claude Code's own rule). A data point that holds others goes only where they all do,
+ * and one that adds detail to another only where that one goes.
  */
 export function allows(gate: Gate, id: DataPointId, claude: boolean): boolean {
   const s = gate.settings.get(id)
   const own = s === 'required' || s === 'on' || (s === 'claude' && claude)
-  return own && (DATA_POINTS.get(id)?.holds ?? []).every(h => allows(gate, h, claude))
+  const d = DATA_POINTS.get(id)
+  return own && (d?.holds ?? []).every(h => allows(gate, h, claude)) && (d?.needs === undefined || allows(gate, d.needs, claude))
 }
 
 // ── The gate in force ─────────────────────────────────────────────────────────
@@ -221,6 +223,11 @@ export function gateAttributes(gate: Gate, record: string, attributes: Readonly<
     const p = gateParameters(gate, undefined, fill.parameters)
     if (p !== undefined) put(out, 'tool_parameters', p)
   }
+  // A skill's text with its arguments filled in holds words the person typed: it goes only where prompts do, else it is held back.
+  if (record === SKILL_PROMPT_ROW && out['skill.has_arguments'] === true && out['skill.text'] !== undefined && !allows(gate, 'prompt.text', false)) {
+    delete out['skill.text']
+    put(out, 'skill.text_held_back', true)
+  }
   const { attributes: safe, count } = protect(gate, record, out)
   return withCount(safe, count)
 }
@@ -274,8 +281,13 @@ export function gateSpan(gate: Gate, span: BuiltSpan, strict = false): BuiltSpan
   return { ...span, attributes: withCount(attributes, count), ...(span.events ? { events } : {}), ...(status ? { status } : {}) }
 }
 
-/** A copied row through the gate again, as it is sent: nothing is added, only what the gate in force now holds back is removed. */
-export function gateRow(gate: Gate, row: CopiedRow, strict = false): CopiedRow {
+/**
+ * A row through the gate, as it is queued and again as it is sent: nothing is added, only what the gate in force now holds back is
+ * removed. A row the plugin makes itself (catalog.ts, `OWN_ROWS`) goes only while its data point is on: null otherwise.
+ */
+export function gateRow(gate: Gate, row: CopiedRow, strict = false): CopiedRow | null {
+  const own = OWN_ROWS[row.event]
+  if (own !== undefined && !allows(gate, own, false)) return null
   return { ...row, attributes: gateAttributes(gate, row.event, row.attributes, {}, strict) }
 }
 

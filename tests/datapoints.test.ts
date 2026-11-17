@@ -157,3 +157,76 @@ describe('an explicit setting', () => {
     expect(rowsOf(posts).find(r => r['event.name'] === 'user_prompt')!['prompt']).toBe('<REDACTED>')
   })
 })
+
+describe("the MCP servers set up, and each skill's text: data points no Claude Code row carries", () => {
+  const HOME = '/home/ana'
+  const ROOT = '/home/ana/acme/api'
+  const FILES: Record<string, unknown> = {
+    [`${HOME}/.claude.json`]: {
+      oauthAccount: { emailAddress: EMAIL },
+      mcpServers: { linear: { type: 'http', url: 'https://ana:hunter2@mcp.example.com/mcp?team=acme#x', headers: { Authorization: 'Bearer abc' } } },
+      projects: { [ROOT]: { mcpServers: { db: { command: 'npx', args: ['db-mcp', `--token=${'s'.repeat(24)}`], env: { DB_PASSWORD: 'pw' } } } } },
+    },
+    [`${ROOT}/.mcp.json`]: { mcpServers: { docs: { type: 'sse', url: 'https://docs.example.com/sse' }, linear: { url: 'https://other.example.com' } } },
+  }
+
+  /** A whole session that runs two skills and calls a claude.ai connector, with Claude's settings files in place. */
+  async function run($: Engine, on: On, overrides?: Overrides) {
+    const { posts } = world(on, { HOME }, overrides)
+    const reads: string[] = []
+    on('fs.read', (_$, e) => {
+      const path = (e as { path: string }).path
+      reads.push(path)
+      if (!(path in FILES)) throw new Error('ENOENT')
+      return { value: JSON.stringify(FILES[path]) } as never
+    })
+    on('session.root', () => ({ value: ROOT }) as never)
+    on('skill.prompt', (_$, e) => ({ text: (e as { text: string }).text }) as never)
+    await $.session.start({ cwd: ROOT, surface: null, isInteractive: false } as never)
+    await turn($)
+    for (let i = 0; i < 2; i++) await $.skill.prompt({ skill: 'review', text: 'Review the diff for correctness bugs.', source: 'userSettings', frontmatter: {} } as never)
+    await $.prompt.submit({ text: '/fix PR 12' } as never)
+    await $.skill.prompt({ skill: 'fix', text: 'Fix what PR 12 broke.', source: 'userSettings', frontmatter: {} } as never)
+    await $.tool.call({ tool: 'mcp__claude_ai_Gmail__create_draft', to: 'x', tool_use_id: 'toolu_2' } as never)
+    await row($, 'tool_result', { tool_name: 'mcp_tool', tool_use_id: 'toolu_2', success: 'true', mcp_server_scope: 'claudeai' })
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    return { posts, reads }
+  }
+
+  test('off by default: no row, and no settings file read', keyless, async ($, on) => {
+    const { posts, reads } = await run($, on)
+    const events = rowsOf(posts).map(r => r['event.name'])
+    expect(events).not.toContain('mcp_server_configured')
+    expect(events).not.toContain('skill_prompt')
+    expect(reads).toEqual([])
+  })
+
+  test("on: each server once, the nearest setting first, its address without credentials or query; a called one's name and scope", keyless, async ($, on) => {
+    const { posts } = await run($, on, { 'mcp.url': 'on' })
+    const servers = rowsOf(posts).filter(r => r['event.name'] === 'mcp_server_configured')
+    const pick = (r: Record<string, unknown>) => ({ server_name: r['server_name'], server_scope: r['server_scope'], transport_type: r['transport_type'], server_url: r['server_url'] })
+    expect(servers.map(pick)).toEqual([
+      { server_name: 'db', server_scope: 'local', transport_type: 'stdio', server_url: 'npx db-mcp --token=[REDACTED:assigned_secret]' },
+      { server_name: 'docs', server_scope: 'project', transport_type: 'sse', server_url: 'https://docs.example.com/sse' },
+      { server_name: 'linear', server_scope: 'project', transport_type: 'http', server_url: 'https://other.example.com' },
+      { server_name: 'remote-devices', server_scope: 'unknown', transport_type: undefined, server_url: undefined },
+      { server_name: 'claude_ai_Gmail', server_scope: 'claudeai', transport_type: undefined, server_url: undefined },
+    ])
+    // Routed as the session's other rows are, and nothing else in the files read is sent.
+    expect(servers[0]).toEqual(expect.objectContaining({ 'organization.id': ORG, 'user.email': EMAIL, 'mainwave.telemetry.route': 'plugin' }))
+    const all = posts.map(p => p.body).join('\n')
+    for (const secret of ['hunter2', 'Bearer abc', 'DB_PASSWORD', 'oauthAccount', 'team=acme']) expect(all).not.toContain(secret)
+  })
+
+  test("on: a skill's text once per session, later runs by its ID; a text holding the person's arguments only where prompts go", keyless, async ($, on) => {
+    const rows = (await run($, on, { 'skill.text': 'on', 'prompt.text': 'off' })).posts
+    const skills = rowsOf(rows).filter(r => r['event.name'] === 'skill_prompt')
+    expect(skills).toHaveLength(3)
+    const [first, again, fix] = skills
+    expect(first).toEqual(expect.objectContaining({ 'skill.name': 'review', 'skill.source': 'userSettings', 'skill.text': 'Review the diff for correctness bugs.', 'skill.has_arguments': false }))
+    expect(again!['skill.text']).toBeUndefined()
+    expect(again!['skill.text_id']).toBe(first!['skill.text_id'])
+    expect(fix).toEqual(expect.objectContaining({ 'skill.name': 'fix', 'skill.has_arguments': true, 'skill.text_held_back': true }))
+    expect(fix!['skill.text']).toBeUndefined()
+  })
+})

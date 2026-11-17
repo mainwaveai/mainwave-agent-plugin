@@ -424,7 +424,8 @@ function bodyOf(batch: readonly Queued[], nowMs: number): string {
       const d = gatePoint(gate, item.d, strict)
       return d === null ? null : { ...item, d }
     }
-    return { ...item, d: gateRow(gate, item.d, strict) }
+    const d = gateRow(gate, item.d, strict)
+    return d === null ? null : { ...item, d }
   }).filter((item): item is Queued => item !== null)
   if (signal === 'traces') return tracesBody(groups<BuiltSpan>(gated))
   if (signal === 'metrics') return metricsBody(groups<MetricPoint>(gated), scopeVersion)

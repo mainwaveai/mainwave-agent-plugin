@@ -5,25 +5,34 @@
 //
 // The exporter's row always goes on: the copy is queued beside it, never in its place. Fail open: a hook that throws never holds up a
 // row, a turn, a tool call or the session. A row whose stamping failed goes on without any key the plugin owns, as Claude Code wrote
-// it otherwise. The hooks that watch turns, model requests, tool calls, slash commands and spawns only observe: each passes its event on
-// unchanged, and its result back unchanged.
+// it otherwise. The hooks that watch turns, model requests, tool calls, slash commands, spawns and skill prompts only observe: each
+// passes its event on unchanged, and its result back unchanged.
+//
+// Two data points no Claude Code row carries come in rows the plugin makes itself, each sent only while its data point is on: the MCP
+// servers set up for the session (`mcp.url`, read from Claude's MCP settings at session start, and named when a call first names a
+// server not read there), and each skill's text as the engine expands it for the model (`skill.text`, the `skill.prompt` hook). Such a
+// row waits for the session's identity, which only Claude Code's rows carry.
 
 import { atom, update } from 'claude-code'
 import type { CatchHandler, EngineInterface, Frozen, Hook, Next, Register, StreamHook, TelemetryAttribute, TelemetryLogResult, TelemetryRecordEntry, Timer } from 'claude-code'
 
 import type { RowIdentity } from '../types'
 import { capturePrompt, captureTool, newCapture, rowFill, streamChunk, streamedThinking, streamStart, type Capture } from './capture.ts'
-import type { Switch } from './catalog.ts'
-import { configureGate, currentGate, gateAttributes, gateSpan, metricAllowed, OVERRIDES_KEY, overridesOf, setOverrides } from './gate.ts'
+import { MCP_SERVER_ROW, SKILL_PROMPT_ROW, type Switch } from './catalog.ts'
+import { mcpParts } from './derive.ts'
+import { allows, configureGate, currentGate, gateAttributes, gateRow, gateSpan, metricAllowed, OVERRIDES_KEY, overridesOf, setOverrides } from './gate.ts'
 import { endSession } from './http.ts'
 import { identityOf, isOrgId, mergeIdentity } from './identity.ts'
 import { add, collect, newMeter, type Meter } from './meter.ts'
 import type { CopiedRow } from './otlp.ts'
 import {
-  agentSpawned, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
+  agentSpawned, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
 } from './rebuild.ts'
 import { contentLimit } from './protect.ts'
 import { adopt, configure, enqueue, ensureTimer, finish, isCopying, keyMalformed, snapshot } from './sender.ts'
+import {
+  DESKTOP_UNDER_APPDATA, DESKTOP_UNDER_HOME, distinct, enabledPlugins, fileServers, foldersUp, globalServers, join, MANAGED_DIRS, MAX_PLUGINS, parse, pluginServers, serverAttributes, toolSpelling, type McpServer,
+} from './servers.ts'
 import { applyStamps, entrypointOf, filterStamps, PLUGIN_NAME, stripOwned } from './stamps.ts'
 import { VERSION } from './version.ts'
 
@@ -47,6 +56,8 @@ type CommandParams = Parameters<Hook<'command.run'>>
 type CommandCatchParams = Parameters<CatchHandler<Hook<'command.run'>>>
 type SpawnParams = Parameters<Hook<'agent.spawn'>>
 type SpawnCatchParams = Parameters<CatchHandler<Hook<'agent.spawn'>>>
+type SkillParams = Parameters<Hook<'skill.prompt'>>
+type SkillCatchParams = Parameters<CatchHandler<Hook<'skill.prompt'>>>
 
 /** The session's identity as its rows say (types/index.d.ts). */
 const identityAtom = atom({ plugin: 'mainwave', key: 'identity' } as const, {})
@@ -68,6 +79,23 @@ let sweepTimer: Timer | null = null
 let meterTimer: Timer | null = null
 let gateRead: Promise<void> | null = null
 let capture: Capture = newCapture()
+/** The plugin's own rows, waiting for the session's identity (`r.common`). */
+let own: OwnRow[] = []
+/** The MCP servers sent this session, as a tool's name spells them; and the reading of Claude's MCP settings, once started. */
+let serversSent = new Set<string>()
+let serversRead: Promise<void> | null = null
+/** Each skill text sent this session, and its ID; how many skill runs given arguments are running; the arguments seen lately. */
+let skillTexts = new Map<string, string>()
+let argsInFlight = 0
+let recentArgs: { text: string; atMs: number }[] = []
+
+type OwnRow = { event: string; atMs: number; attributes: Record<string, TelemetryAttribute> }
+
+/** How many own rows wait at most; how many skill texts are remembered; how long, and how many, arguments are remembered. */
+const MAX_OWN = 1_000
+const MAX_SKILL_TEXTS = 200
+const ARGS_MS = 60_000
+const MAX_ARGS = 20
 
 /** `CLAUDE_CODE_ENTRYPOINT`, normalized; `other` when it cannot be read. */
 async function readEntrypoint($: EngineInterface): Promise<string> {
@@ -251,6 +279,133 @@ async function collectNow($: EngineInterface): Promise<void> {
   }
 }
 
+/** Queues the plugin's own rows that wait, once a row of Claude Code's has said who the session is; until then they wait on. */
+async function flushOwn($: EngineInterface): Promise<void> {
+  if (own.length === 0 || !isCopying()) return
+  const r = await rebuildOf($)
+  if (r === null || Object.keys(r.common).length === 0) return
+  const gate = await gateOf($)
+  entrypoint ??= readEntrypoint($)
+  const ep = await entrypoint
+  const rows = own
+  own = []
+  for (const o of rows) {
+    const at = new Date(o.atMs).toISOString()
+    const attributes = applyStamps({ ...r.common, 'event.name': o.event, 'event.timestamp': at, ...o.attributes }, {
+      'mainwave.mod.name': PLUGIN_NAME, 'mainwave.mod.version': VERSION, 'mainwave.mod.entrypoint': ep, 'mainwave.telemetry.route': 'plugin',
+    })
+    const row = gateRow(gate, { event: o.event, loggedAt: at, attributes })
+    if (row !== null) await enqueue($, { s: 'logs', d: row })
+  }
+}
+
+/** Adds the plugin's own rows to those waiting, and queues them if the session's identity is known. */
+async function queueOwn($: EngineInterface, rows: readonly OwnRow[]): Promise<void> {
+  own.push(...rows)
+  if (own.length > MAX_OWN) own.splice(0, own.length - MAX_OWN)
+  await flushOwn($)
+}
+
+/** A file's text; undefined when it cannot be read. */
+async function readText($: EngineInterface, path: string): Promise<string | undefined> {
+  try {
+    const text = await $.fs.read(path)
+    return typeof text === 'string' ? text : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** The MCP servers set up for the session, as Claude's settings files list them (servers.ts). Reads nothing else in those files. */
+async function readServers($: EngineInterface): Promise<McpServer[]> {
+  const [home, profile, appData, configDir] = await Promise.all([
+    settle($.env.get('HOME')), settle($.env.get('USERPROFILE')), settle($.env.get('APPDATA')), settle($.env.get('CLAUDE_CONFIG_DIR')),
+  ])
+  const homeDir = home || profile || undefined
+  const read = async (path: string) => parse(await readText($, path))
+  // A managed file has exclusive control: only its servers load.
+  const managed = await Promise.all(MANAGED_DIRS.map(d => read(join(d, 'managed-mcp.json'))))
+  if (managed.some(m => m !== undefined)) return distinct(managed.flatMap(m => fileServers(m, 'managed')))
+  let root: string | undefined
+  try {
+    root = await $.session.root()
+  } catch {
+    root = undefined
+  }
+  const base = configDir || homeDir
+  const global = globalServers(base === undefined ? undefined : await read(join(base, '.claude.json')), root)
+  const project = root === undefined ? [] : (await Promise.all(foldersUp(root).map(d => read(join(d, '.mcp.json'))))).flatMap(m => fileServers(m, 'project'))
+  const claudeDir = configDir || (homeDir === undefined ? undefined : join(homeDir, '.claude'))
+  let plugins: McpServer[] = []
+  if (claudeDir !== undefined) {
+    let enabled: unknown
+    try {
+      enabled = await $.settings.read({ key: 'enabledPlugins' })
+    } catch {
+      enabled = undefined
+    }
+    const installed = enabledPlugins(await read(join(claudeDir, 'plugins', 'installed_plugins.json')), enabled).slice(0, MAX_PLUGINS)
+    plugins = (await Promise.all(installed.map(async p => pluginServers(p.name, await read(join(p.path, '.mcp.json')), await read(join(p.path, '.claude-plugin', 'plugin.json')))))).flat()
+  }
+  entrypoint ??= readEntrypoint($)
+  const desktopPaths = /desktop|cowork|local-agent/.test(await entrypoint)
+    ? [...(homeDir === undefined ? [] : DESKTOP_UNDER_HOME.map(p => join(homeDir, ...p))), ...(appData ? [join(appData, ...DESKTOP_UNDER_APPDATA)] : [])]
+    : []
+  const desktop = (await Promise.all(desktopPaths.map(read))).flatMap(m => fileServers(m, 'desktop'))
+  return distinct([...global.local, ...project, ...global.user, ...plugins, ...desktop])
+}
+
+/** The rows for the MCP servers Claude's settings list, once per session, when their data point is on. */
+async function noteServers($: EngineInterface): Promise<void> {
+  const servers = (await readServers($)).filter(s => !serversSent.has(toolSpelling(s.name)))
+  const atMs = await $.clock.now()
+  for (const s of servers) serversSent.add(toolSpelling(s.name))
+  if (servers.length > 0) await queueOwn($, servers.map(s => ({ event: MCP_SERVER_ROW, atMs, attributes: serverAttributes(s) })))
+}
+
+/**
+ * A call's `tool_result` row named an MCP server not sent yet (a claude.ai connector, one the host app provides, one set on the
+ * command line): its row, with the name its tools are called by and the scope the row gives.
+ */
+async function noteCalledServer($: EngineInterface, attributes: Readonly<Record<string, TelemetryAttribute>>, tool: string | undefined): Promise<void> {
+  const name = tool ?? (typeof attributes['tool_name'] === 'string' ? attributes['tool_name'] : undefined)
+  const server = name === undefined ? undefined : mcpParts(name)?.server
+  if (server === undefined || !allows(await gateOf($), 'mcp.url', false)) return
+  // What the settings list goes first: the called server may be there, with its address.
+  await serversRead
+  if (serversSent.has(server)) return
+  serversSent.add(server)
+  const scope = typeof attributes['mcp_server_scope'] === 'string' ? attributes['mcp_server_scope'] : 'unknown'
+  await queueOwn($, [{ event: MCP_SERVER_ROW, atMs: await $.clock.now(), attributes: serverAttributes({ name: server, scope }) }])
+}
+
+/** Arguments a skill or slash command was given, kept a short while: a skill text that holds them holds words the person typed. */
+function noteArgs(text: unknown, atMs: number): boolean {
+  if (typeof text !== 'string' || text.trim() === '') return false
+  recentArgs = [...recentArgs.filter(a => atMs - a.atMs < ARGS_MS), { text: text.trim(), atMs }].slice(-MAX_ARGS)
+  return true
+}
+
+/** The arguments a slash command typed as a prompt carries: what follows `/name`. */
+const slashArgs = (text: unknown): string | undefined => (typeof text === 'string' ? /^\/[^\s/]+\s+([\s\S]+)$/.exec(text)?.[1] : undefined)
+
+/**
+ * One skill run's row: its name, where it comes from, its text's ID, and the text itself the first time it is seen this session. A
+ * text with arguments filled in is sent only where prompts are (gate.ts); one held back is not remembered as sent.
+ */
+function skillRow(gate: ReturnType<typeof currentGate>, skill: string, source: string, text: string, atMs: number): OwnRow {
+  const hasArgs = argsInFlight > 0 || recentArgs.some(a => atMs - a.atMs < ARGS_MS && text.includes(a.text))
+  let id = skillTexts.get(text)
+  const first = id === undefined
+  id ??= randomHex(16)
+  if (first && skillTexts.size < MAX_SKILL_TEXTS && (!hasArgs || allows(gate, 'prompt.text', false))) skillTexts.set(text, id)
+  return {
+    event: SKILL_PROMPT_ROW,
+    atMs,
+    attributes: { 'skill.name': skill, 'skill.source': source, 'skill.text_id': id, 'skill.has_arguments': hasArgs, ...(first ? { 'skill.text': text } : {}) },
+  }
+}
+
 /**
  * Reads one row into the rebuild: the row's own attributes as Claude Code raised them, before any stamp. Answers what it produced
  * and the ids the row's copy carries, where the rebuild gives them; null when the plugin does not rebuild.
@@ -297,6 +452,12 @@ export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams
     } catch {
       out = null
     }
+    if (e.event === 'tool_result') {
+      // Its call's name as the hook saw it (the row's may read `mcp_tool`), before the row's fill lets the call go.
+      const id = e.attributes['tool_use_id']
+      const tool = typeof id === 'string' ? capture.tools.get(id)?.name : undefined
+      void noteCalledServer($, e.attributes, tool).catch(() => undefined)
+    }
     try {
       // The copy goes through the gate: what it holds back removed, what the plugin read and it allows added, the protections applied.
       const gated = gateAttributes(await gateOf($), e.event, attributes, rowFill(capture, e.event, e.attributes))
@@ -305,6 +466,8 @@ export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams
       // Lost to the copy alone.
     }
     if (out !== null) await emit($, out).catch(() => undefined)
+    // The session's identity may be known now: the plugin's own rows waiting for it go.
+    await flushOwn($).catch(() => undefined)
   }
   return next({ ...e, attributes })
 }
@@ -337,6 +500,11 @@ export async function sessionStart($: SessionStartParams[0], e: SessionStartPara
       await update($, sessionCountedAtom, counted => ((first = counted !== true), true))
       if (first && r !== null) await emit($, sessionStarted(r, await $.clock.now()))
       await adopt($)
+      // A new session (a /clear too): its servers and skill texts are sent again. Claude's settings are read beside the session's
+      // start, never holding it.
+      serversSent = new Set()
+      skillTexts = new Map()
+      if (allows(await gateOf($), 'mcp.url', false)) serversRead = noteServers($).catch(() => undefined)
     } catch {
       // Sending starts with the next row instead.
     }
@@ -442,7 +610,20 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
   } catch {
     r = null
   }
-  const result = await next(e)
+  // A skill given arguments: the text it expands to holds them.
+  let withArgs = false
+  try {
+    withArgs = e.tool === 'Skill' && noteArgs((e as unknown as { args?: unknown }).args, await $.clock.now())
+  } catch {
+    withArgs = false
+  }
+  if (withArgs) argsInFlight += 1
+  let result: Awaited<ReturnType<typeof next>>
+  try {
+    result = await next(e)
+  } finally {
+    if (withArgs) argsInFlight -= 1
+  }
   if (r !== null) {
     try {
       await emit($, toolEnd(r, e.tool_use_id, result as never, await $.clock.now()))
@@ -465,9 +646,17 @@ export async function commandHook($: CommandParams[0], e: CommandParams[1], next
   } catch {
     r = null
   }
+  let withArgs = false
+  try {
+    withArgs = noteArgs(e.args, await $.clock.now())
+  } catch {
+    withArgs = false
+  }
+  if (withArgs) argsInFlight += 1
   try {
     return await next(e)
   } finally {
+    if (withArgs) argsInFlight -= 1
     // Ended however the command ends, a refused or failed one too, so it never waits on to be taken by a later turn.
     if (r !== null) {
       try {
@@ -485,6 +674,7 @@ export async function promptHook($: PromptParams[0], e: PromptParams[1], next: P
   let r: Rebuild | null = null
   let out: Emit | null = null
   try {
+    noteArgs(slashArgs(e.text), await $.clock.now())
     r = await rebuildOf($)
     if (r !== null) {
       capturePrompt(capture, e.text)
@@ -536,6 +726,25 @@ export function spawnCatch($: SpawnCatchParams[0], e: SpawnCatchParams[1], next:
   return next(e)
 }
 
+/** A skill's prompt expanded for the model: its text, for `skill.text`. The text the model reads is the one `next` answers, unchanged. */
+export async function skillHook($: SkillParams[0], e: SkillParams[1], next: SkillParams[2]) {
+  const result = await next(e)
+  try {
+    if (isCopying() && typeof result.text === 'string') {
+      const gate = await gateOf($)
+      if (allows(gate, 'skill.text', false)) await queueOwn($, [skillRow(gate, e.skill, e.source, result.text, await $.clock.now())])
+    }
+  } catch {
+    // The run's text is lost to the copy alone.
+  }
+  return result
+}
+
+/** A skill's prompt goes on whatever the hook did; once it has gone on, its result stands. */
+export function skillCatch($: SkillCatchParams[0], e: SkillCatchParams[1], next: SkillCatchParams[2]) {
+  return next(e)
+}
+
 /**
  * Sends what it can of the queue within the session's end bound and keeps the rest for a later session. Requests still waiting for
  * the ending session then answer `stopped` (http.ts); the event goes on unchanged.
@@ -576,6 +785,12 @@ export const register: Register = (on, options) => {
   meterTimer = null
   gateRead = null
   capture = newCapture()
+  own = []
+  serversSent = new Set()
+  serversRead = null
+  skillTexts = new Map()
+  argsInFlight = 0
+  recentArgs = []
   configure(options)
 
   on('session.start', sessionStart)
@@ -589,6 +804,7 @@ export const register: Register = (on, options) => {
   on('command.run', commandHook).catch(commandCatch)
   on('prompt.submit', promptHook).catch(promptCatch)
   on('agent.spawn', spawnHook).catch(spawnCatch)
+  on('skill.prompt', skillHook).catch(skillCatch)
 
   on('session.end', sessionEnd)
 }

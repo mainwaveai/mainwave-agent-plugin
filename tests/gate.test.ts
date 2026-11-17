@@ -10,14 +10,19 @@ import { contentLimit, CONTENT_MAX_LENGTH, cut, redact } from '../hooks/protect.
 const SWITCHED_OFF = { OTEL_LOG_TOOL_DETAILS: '0', OTEL_LOG_TOOL_CONTENT: '0', OTEL_LOG_USER_PROMPTS: '0', OTEL_METRICS_INCLUDE_REPOSITORY: '0' }
 
 describe('the catalog', () => {
-  test('twenty-two data points: four required, nine metadata, three identifiers and six content, each ID once', () => {
-    expect(CATALOG.length).toBe(22)
-    expect(new Set(CATALOG.map(d => d.id)).size).toBe(22)
+  test('twenty-four data points: four required, nine metadata, four identifiers and seven content, each ID once', () => {
+    expect(CATALOG.length).toBe(24)
+    expect(new Set(CATALOG.map(d => d.id)).size).toBe(24)
     expect(CATALOG.filter(d => d.required).map(d => d.id)).toEqual(['session.identity', 'session.links', 'session.client', 'usage'])
     const switchable = CATALOG.filter(d => !d.required)
     expect(switchable.filter(d => d.class === 'metadata').length).toBe(9)
-    expect(switchable.filter(d => d.class === 'identifiers').length).toBe(3)
-    expect(switchable.filter(d => d.class === 'content').length).toBe(6)
+    expect(switchable.filter(d => d.class === 'identifiers').length).toBe(4)
+    expect(switchable.filter(d => d.class === 'content').length).toBe(7)
+  })
+
+  test('MCP server addresses add detail to MCP names, and skill text to skill names', () => {
+    expect(CATALOG.find(d => d.id === 'mcp.url')?.needs).toBe('tool.mcp')
+    expect(CATALOG.find(d => d.id === 'skill.text')?.needs).toBe('skill.name')
   })
 
   test('every switchable data point has a default, and only it', () => {
@@ -44,7 +49,10 @@ describe('resolveGate', () => {
     for (const id of ['tool.mcp', 'skill.name', 'agent.type', 'repo', 'file.path', 'bash.command', 'tool.input', 'tool.result', 'prompt.text', 'response.text'] as const) {
       expect([id, g.settings.get(id)]).toEqual([id, 'on'])
     }
+    // Claude Code exports none of these.
     expect(g.settings.get('response.thinking')).toBe('off')
+    expect(g.settings.get('mcp.url')).toBe('off')
+    expect(g.settings.get('skill.text')).toBe('off')
     expect(g.settings.get('usage')).toBe('required')
   })
 
@@ -88,6 +96,13 @@ describe('allows', () => {
     expect(allows(resolveGate({}, { 'web.url': 'off' }), 'tool.input', false)).toBe(false)
     expect(allows(resolveGate({}, { 'bash.command': 'claude' }), 'tool.input', false)).toBe(false)
     expect(allows(resolveGate({}, { 'bash.command': 'claude' }), 'tool.input', true)).toBe(true)
+  })
+
+  test('a data point that adds detail to another goes only where that one goes', () => {
+    expect(allows(resolveGate({}, { 'mcp.url': 'on' }), 'mcp.url', false)).toBe(true)
+    expect(allows(resolveGate({}, { 'mcp.url': 'on', 'tool.mcp': 'off' }), 'mcp.url', false)).toBe(false)
+    expect(allows(resolveGate({ OTEL_LOG_TOOL_DETAILS: '0' }, { 'skill.text': 'on' }), 'skill.text', false)).toBe(false)
+    expect(allows(resolveGate({}, { 'skill.text': 'on' }), 'skill.text', false)).toBe(true)
   })
 })
 
@@ -162,8 +177,43 @@ describe('a record an earlier load captured', () => {
   test("is held, where a data point follows Claude Code, to what is on: this load cannot tell the plugin's reading from Claude Code's", () => {
     const row = { event: 'user_prompt', loggedAt: '2026-11-12T00:00:00.000Z', attributes: { prompt: 'hello', prompt_length: '5', 'vcs.repository.name': 'api' } }
     const g = resolveGate({ OTEL_LOG_USER_PROMPTS: '0' })
-    expect(gateRow(g, row).attributes['prompt']).toBe('hello')
-    expect(gateRow(g, row, true).attributes).toEqual({ prompt: '<REDACTED>', prompt_length: '5', 'vcs.repository.name': 'api' })
+    expect(gateRow(g, row)!.attributes['prompt']).toBe('hello')
+    expect(gateRow(g, row, true)!.attributes).toEqual({ prompt: '<REDACTED>', prompt_length: '5', 'vcs.repository.name': 'api' })
+  })
+})
+
+describe("the plugin's own rows", () => {
+  const server = { event: 'mcp_server_configured', loggedAt: '2026-11-12T00:00:00.000Z', attributes: { 'organization.id': 'o', server_name: 'linear', server_scope: 'user', transport_type: 'http', server_url: 'https://mcp.example.com/mcp' } }
+  const skill = (attributes: Record<string, string | boolean>) => ({ event: 'skill_prompt', loggedAt: '2026-11-12T00:00:00.000Z', attributes: { 'organization.id': 'o', 'skill.name': 'review', 'skill.text_id': 'abc', ...attributes } })
+
+  test('go only while their data point is on: none is sent by default, Claude Code exporting neither', () => {
+    expect(gateRow(resolveGate({}), server)).toBeNull()
+    expect(gateRow(resolveGate({}, { 'mcp.url': 'on' }), server)?.attributes['server_url']).toBe('https://mcp.example.com/mcp')
+    expect(gateRow(resolveGate({}, { 'mcp.url': 'on', 'tool.mcp': 'off' }), server)).toBeNull()
+    expect(gateRow(resolveGate({}, { 'mcp.url': 'claude' }), server)).toBeNull()
+    expect(gateRow(resolveGate({}), skill({ 'skill.text': 'Review it.' }))).toBeNull()
+  })
+
+  test("a skill's text with arguments filled in goes only where prompts do; held back, the row says so", () => {
+    const g = resolveGate({}, { 'skill.text': 'on', 'prompt.text': 'off' })
+    expect(gateRow(g, skill({ 'skill.text': 'Review it.', 'skill.has_arguments': false }))?.attributes['skill.text']).toBe('Review it.')
+    const held = gateRow(g, skill({ 'skill.text': 'Review PR 12.', 'skill.has_arguments': true }))!.attributes
+    expect(held['skill.text']).toBeUndefined()
+    expect(held['skill.text_held_back']).toBe(true)
+    expect(gateRow(resolveGate({}, { 'skill.text': 'on' }), skill({ 'skill.text': 'Review PR 12.', 'skill.has_arguments': true }))?.attributes['skill.text']).toBe('Review PR 12.')
+  })
+
+  test('their addresses and text go through the protections', () => {
+    const g = resolveGate({}, { 'mcp.url': 'on', 'skill.text': 'on' })
+    const local = { ...server, attributes: { ...server.attributes, transport_type: 'stdio', server_url: `npx server --token=${'s'.repeat(24)}` } }
+    expect(gateRow(g, local)?.attributes['server_url']).toBe('npx server --token=[REDACTED:assigned_secret]')
+    expect(gateRow(g, skill({ 'skill.text': `Use ghp_${'a'.repeat(36)}.` }))?.attributes['skill.text']).toBe('Use [REDACTED:github_token].')
+  })
+
+  test("Claude Code's MCP connection row: its server's name and scope are MCP names", () => {
+    expect(ownerOf('mcp_server_connection', 'server_name')?.id).toBe('tool.mcp')
+    expect(ownerOf('mcp_server_configured', 'server_url')?.id).toBe('mcp.url')
+    expect(ownerOf('skill_prompt', 'skill.text')?.id).toBe('skill.text')
   })
 })
 
