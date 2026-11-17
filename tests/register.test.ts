@@ -73,10 +73,11 @@ describe('stamping', () => {
     expect(a['mainwave.mod']).toBe('kept')
   })
 
-  test('no settings layer is read for a row, and no option turns stamping off', async ($, on) => {
+  test("no settings layer is read for a row but the person's own, once per load for the opt-in; no option turns stamping off", async ($, on) => {
     const rig = boot(on, { layers: { policy: { pluginConfigs: { 'mainwave@synced': { options: { reporting: false } } } } } })
     expect(ownedKeys(await log(rig, $, inOrg))).toEqual(STAMPED)
-    expect(rig.reads).toEqual([])
+    expect(ownedKeys(await log(rig, $, inOrg))).toEqual(STAMPED)
+    expect(rig.reads).toEqual(['user'])
   })
 })
 

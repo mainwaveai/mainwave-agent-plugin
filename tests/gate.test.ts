@@ -3,7 +3,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { CATALOG, DEFAULTS, ownerOf } from '../hooks/catalog.ts'
-import { allows, gateAttributes, gateEvent, gatePoint, gateRow, gateSpan, resolveGate } from '../hooks/gate.ts'
+import { allows, gateAttributes, gateEvent, gatePoint, gateRow, gateSpan, optInOf, resolveGate } from '../hooks/gate.ts'
 import type { BuiltSpan } from '../hooks/otlp.ts'
 import { contentLimit, CONTENT_MAX_LENGTH, cut, redact } from '../hooks/protect.ts'
 
@@ -79,6 +79,106 @@ describe('resolveGate', () => {
     expect(g.settings.get('tool.call')).toBe('off')
     expect(g.settings.get('response.thinking')).toBe('on')
     expect(g.settings.get('usage')).toBe('required')
+  })
+})
+
+describe("the person's opt-in", () => {
+  test('turns on each data point listed that is off by default, and says which', () => {
+    const g = resolveGate({}, {}, undefined, ['response.thinking', 'mcp.url'])
+    expect(g.settings.get('response.thinking')).toBe('on')
+    expect(g.settings.get('mcp.url')).toBe('on')
+    expect(g.settings.get('skill.text')).toBe('off')
+    // In catalog order, whatever order the list is in.
+    expect(g.optedIn).toEqual(['mcp.url', 'response.thinking'])
+    expect(resolveGate({}).optedIn).toEqual([])
+  })
+
+  test('only adds: a data point on by default stays as it is, and nothing listed or not turns anything off', () => {
+    const everything = CATALOG.map(d => d.id)
+    const g = resolveGate({}, {}, undefined, ['tool.input', 'prompt.text'])
+    const plain = resolveGate({})
+    for (const d of CATALOG) expect([d.id, g.settings.get(d.id)]).toEqual([d.id, plain.settings.get(d.id)])
+    expect(g.optedIn).toEqual([])
+    const all = resolveGate({}, {}, undefined, everything)
+    for (const d of CATALOG) expect([d.id, all.settings.get(d.id)]).toEqual([d.id, d.required ? 'required' : 'on'])
+    expect(all.optedIn).toEqual(['mcp.url', 'skill.text', 'response.thinking'])
+  })
+
+  test('an explicit setting wins: off stays off, claude stays claude, and an explicit on is not an opt-in', () => {
+    const g = resolveGate({}, { 'response.thinking': 'off', 'skill.text': 'claude', 'mcp.url': 'on' }, undefined, ['response.thinking', 'skill.text', 'mcp.url'])
+    expect(g.settings.get('response.thinking')).toBe('off')
+    expect(g.settings.get('skill.text')).toBe('claude')
+    expect(g.settings.get('mcp.url')).toBe('on')
+    expect(g.optedIn).toEqual([])
+  })
+
+  test("thinking follows the responses' switch for the opt-in: a session that turned responses off gets none, unless set explicitly", () => {
+    const asked = ['response.thinking'] as const
+    expect(resolveGate({ OTEL_LOG_ASSISTANT_RESPONSES: '0' }, {}, undefined, asked).settings.get('response.thinking')).toBe('off')
+    // Responses follow prompts when their own switch is unset, as in Claude Code.
+    expect(resolveGate({ OTEL_LOG_USER_PROMPTS: '0' }, {}, undefined, asked).settings.get('response.thinking')).toBe('off')
+    expect(resolveGate({ OTEL_LOG_USER_PROMPTS: '0', OTEL_LOG_ASSISTANT_RESPONSES: '1' }, {}, undefined, asked).settings.get('response.thinking')).toBe('on')
+    expect(resolveGate({ OTEL_LOG_TOOL_DETAILS: '0' }, {}, undefined, asked).settings.get('response.thinking')).toBe('on')
+    expect(resolveGate({ OTEL_LOG_ASSISTANT_RESPONSES: '0' }, { 'response.thinking': 'on' }).settings.get('response.thinking')).toBe('on')
+    expect(resolveGate({ OTEL_LOG_ASSISTANT_RESPONSES: '0' }, {}, undefined, asked).optedIn).toEqual([])
+  })
+
+  test('the stamp names only what the opt-in lets go somewhere: not one the data point it adds detail to keeps back', () => {
+    const all = ['mcp.url', 'skill.text', 'response.thinking'] as const
+    expect(resolveGate({ OTEL_LOG_TOOL_DETAILS: '0' }, {}, undefined, all).optedIn).toEqual(['response.thinking'])
+    expect(resolveGate({}, { 'tool.mcp': 'off' }, undefined, all).optedIn).toEqual(['skill.text', 'response.thinking'])
+    expect(resolveGate({}, { 'skill.name': 'claude' }, undefined, all).optedIn).toEqual(['mcp.url', 'response.thinking'])
+  })
+
+  test('a switch the session sets to 0 keeps what it governs as Claude Code sends it, opt-in or not', () => {
+    const g = resolveGate({ OTEL_LOG_TOOL_DETAILS: '0' }, {}, undefined, ['bash.command', 'mcp.url', 'skill.text'])
+    expect(g.settings.get('bash.command')).toBe('claude')
+    // What they add detail to follows Claude Code, so they go nowhere the plugin alone would send them.
+    expect(allows(g, 'mcp.url', false)).toBe(false)
+    expect(allows(g, 'skill.text', false)).toBe(false)
+  })
+
+  test('a data point opted in to still goes only where the one it adds detail to goes', () => {
+    expect(allows(resolveGate({}, {}, undefined, ['mcp.url']), 'mcp.url', false)).toBe(true)
+    expect(allows(resolveGate({}, { 'tool.mcp': 'off' }, undefined, ['mcp.url']), 'mcp.url', false)).toBe(false)
+    expect(allows(resolveGate({}, { 'skill.name': 'off' }, undefined, ['skill.text']), 'skill.text', false)).toBe(false)
+    // And tool input, which holds others, only where they all go.
+    expect(allows(resolveGate({}, { 'web.url': 'off' }, undefined, ['tool.input']), 'tool.input', false)).toBe(false)
+  })
+
+  const values: [string, unknown, string[]][] = [
+    ['a list', ['response.thinking', 'mcp.url'], ['mcp.url', 'response.thinking']],
+    ['a string, commas and spaces', ' skill.text, mcp.url  response.thinking ', ['mcp.url', 'skill.text', 'response.thinking']],
+    ['twice', ['mcp.url', 'mcp.url'], ['mcp.url']],
+    ['an unknown ID', ['mcp.url', 'mcp.urls', 'everything', '*'], ['mcp.url']],
+    ['a required data point', ['usage', 'session.identity', 'skill.text'], ['skill.text']],
+    ['one on by default, kept and harmless', ['tool.input'], ['tool.input']],
+    ['items of another type', [1, null, { id: 'mcp.url' }, ['mcp.url'], 'skill.text'], ['skill.text']],
+    ['a number', 42, []],
+    ['true', true, []],
+    ['an object', { 'mcp.url': true }, []],
+    ['null', null, []],
+    ['unset', undefined, []],
+    ['empty', '', []],
+  ]
+  for (const [name, raw, want] of values) test(`optInOf: ${name}`, () => expect(optInOf(raw)).toEqual(want))
+
+  test('every record the plugin sends carries the data points opted in to, and only while there are any', () => {
+    const optedIn = resolveGate({}, {}, undefined, ['response.thinking', 'mcp.url'])
+    const prompt = { event: 'user_prompt', loggedAt: '2026-11-12T00:00:00.000Z', attributes: { 'organization.id': 'o', prompt: 'go', 'mainwave.telemetry.route': 'plugin' } }
+    const stamped = gateRow(optedIn, prompt)!.attributes
+    expect(stamped['mainwave.telemetry.opt_in']).toBe('mcp.url,response.thinking')
+    expect(Object.keys(stamped).at(-1)).toBe('mainwave.telemetry.opt_in')
+    // Gated again as it is sent, under a gate with no opt-in: the stamp goes with what it said.
+    expect(gateRow(resolveGate({}), { ...prompt, attributes: stamped })!.attributes['mainwave.telemetry.opt_in']).toBeUndefined()
+    // Gated again under the same: one stamp, unchanged.
+    expect(gateRow(optedIn, { ...prompt, attributes: stamped })!.attributes).toEqual(stamped)
+    const span: BuiltSpan = { name: 'claude_code.llm_request', traceId: 't'.repeat(32), spanId: 's'.repeat(16), startMs: 0, endMs: 1, attributes: { 'response.thinking': 'Commit first.' } }
+    expect(gateSpan(optedIn, span).attributes).toEqual({ 'response.thinking': 'Commit first.', 'mainwave.telemetry.opt_in': 'mcp.url,response.thinking' })
+    expect(gateSpan(resolveGate({}), span).attributes).toEqual({})
+    // Not on a metric point: its attributes name its series.
+    const point = { name: 'claude_code.token.usage', startMs: 0, timeMs: 1, value: 1, attributes: { type: 'input' } }
+    expect(gatePoint(optedIn, point)!.attributes).toEqual({ type: 'input' })
   })
 })
 

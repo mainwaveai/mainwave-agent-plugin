@@ -20,7 +20,7 @@ import type { RowIdentity } from '../types'
 import { capturePrompt, captureTool, newCapture, rowFill, streamChunk, streamedThinking, streamStart, type Capture } from './capture.ts'
 import { MCP_SERVER_ROW, SKILL_PROMPT_ROW, type Switch } from './catalog.ts'
 import { mcpParts } from './derive.ts'
-import { allows, configureGate, currentGate, gateAttributes, gateRow, gateSpan, metricAllowed, OVERRIDES_KEY, overridesOf, setOverrides } from './gate.ts'
+import { allows, configureGate, currentGate, gateAttributes, gateRow, gateSpan, metricAllowed, OVERRIDES_KEY, overridesOf, setOptIn, setOverrides } from './gate.ts'
 import { endSession } from './http.ts'
 import { identityOf, isOrgId, mergeIdentity } from './identity.ts'
 import { add, collect, newMeter, type Meter } from './meter.ts'
@@ -29,7 +29,7 @@ import {
   agentSpawned, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
 } from './rebuild.ts'
 import { contentLimit } from './protect.ts'
-import { adopt, configure, enqueue, ensureTimer, finish, isCopying, keyMalformed, snapshot } from './sender.ts'
+import { adopt, configure, enqueue, ensureTimer, finish, isCopying, keyMalformed, readOptIn, snapshot } from './sender.ts'
 import {
   approvalsOf, approved, permitted, DESKTOP_UNDER_APPDATA, DESKTOP_UNDER_HOME, distinct, enabledPlugins, fileServers, foldersUp, globalServers, join, managedDirs, manifestServerFiles, MAX_PLUGINS, parse,
   pluginServers, projectEntry, serverAttributes, toolSpelling, type Approvals, type McpServer,
@@ -174,8 +174,9 @@ async function readClaudeTraces($: EngineInterface): Promise<boolean> {
 }
 
 /**
- * The gate's settings for this load, read from the environment once: Claude Code's switches (one set to `0` keeps what it governs as
- * Claude Code sends it) and the length limit. A read that fails counts as unset.
+ * The gate's settings for this load, read once: Claude Code's switches from the environment (one set to `0` keeps what it governs as
+ * Claude Code sends it), the length limit, the explicit settings in the store, and the data points the person opts in to in their own
+ * user settings. A read that fails counts as unset.
  */
 async function readGate($: EngineInterface): Promise<void> {
   // Each name spelled out: the engine lists the variables a module reads from its calls.
@@ -197,6 +198,7 @@ async function readGate($: EngineInterface): Promise<void> {
     CLAUDE_CODE_OTEL_CONTENT_MAX_LENGTH: contentMax, OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT: anyLimit, OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT: rowLimit, OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT: spanLimit,
   }))
   await readOverrides($)
+  await readOptIn($)
 }
 
 /** The explicit settings per data point the store keeps, if any. A store that cannot be read leaves those held. */
@@ -891,6 +893,8 @@ export const register: Register = (on, options) => {
   sweepTimer = null
   meterTimer = null
   gateRead = null
+  // The opt-in of an earlier load stands for nothing until this one reads it.
+  setOptIn([])
   capture = newCapture()
   own = []
   serversSent = new Set()

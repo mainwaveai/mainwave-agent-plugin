@@ -20,7 +20,11 @@ export const CONTRACT: Record<string, (v: unknown) => boolean> = {
   'mainwave.telemetry.route': v => v === 'exporter' || v === 'plugin',
   // On the plugin's own copy only, where the protections replaced a secret: how many.
   'mainwave.redaction.count': v => typeof v === 'number' && Number.isInteger(v) && v >= 1,
+  // On the plugin's own copy only, where the person opted in to data points off by default: which, each once.
+  'mainwave.telemetry.opt_in': v => typeof v === 'string' && v.split(',').every(id => OPT_IN_IDS.includes(id)) && new Set(v.split(',')).size === v.split(',').length,
 }
+/** The data points a person may opt in to: those the plugin sends no record of by default. */
+export const OPT_IN_IDS = ['mcp.url', 'skill.text', 'response.thinking']
 /** The keys every stamped row carries. */
 export const STAMPED = ['mainwave.plugin.entrypoint', 'mainwave.plugin.name', 'mainwave.plugin.version', 'mainwave.telemetry.route']
 // mainwave.mod. is the old prefix: the plugin writes nothing there, so a key under it on a row is a violation.
@@ -34,6 +38,8 @@ export type Rig = { rows: { event: string; attributes: Record<string, unknown> }
 
 /** The plugin's dev key option in a settings layer, under the given plugin id. */
 export const keyOption = (value: unknown, id = 'mainwave@mainwave'): Record<string, unknown> => ({ pluginConfigs: { [id]: { options: { devIngestKey: value } } } })
+/** The person's opt-in to more data points in a settings layer, under the given plugin id. */
+export const optInOption = (value: unknown, id = 'mainwave@synced'): Record<string, unknown> => ({ pluginConfigs: { [id]: { options: { extraDataPoints: value } } } })
 
 /** A dev ingest key, as a person would set it. */
 export const KEY = 'mw_dev_example_key_0001'

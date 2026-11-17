@@ -7,8 +7,10 @@
 //   claude  sent exactly where Claude Code sends it under the session's own settings, and nowhere more.
 // With no organization settings, each takes its default (catalog.ts, `DEFAULTS`); a Claude Code switch the session's environment
 // sets to `0` (`false`, `no`, `off`) turns the data points it governs to `claude`, so an admin who turned a capture off in Mainwave's
-// org-wide setup keeps that choice. An explicit setting for a data point (`setOverrides`, for organization settings) wins over both.
-// Required data points are always sent.
+// org-wide setup keeps that choice. The person can opt in to data points still at a default of `off` (`setOptIn`, from their own user
+// settings): each turns `on`. An explicit setting for a data point (`setOverrides`, for organization settings) wins over all three,
+// and the opt-in never raises a data point a switch at `0` governs (thinking counts as governed by the responses' switch, for this).
+// It only adds: it never turns anything off. Required data points are always sent.
 //
 // Whatever the gate says, every identifier and content value goes through the always-on protections (protect.ts) before it is queued.
 
@@ -17,19 +19,34 @@ import type { TelemetryAttribute } from 'claude-code'
 import { CATALOG, DATA_POINTS, DEFAULTS, OUTPUT_OWNERS, OWN_ROWS, ownerOf, PARAMETER_OWNERS, sensitive, SKILL_PROMPT_ROW, TOOL_OUTPUT_EVENT, type DataPointId, type Switch } from './catalog.ts'
 import type { BuiltSpan, CopiedRow, MetricPoint } from './otlp.ts'
 import { CONTENT_MAX_LENGTH, cut, redact } from './protect.ts'
-import { COUNT_RULES, REDACTION_COUNT } from './stamps.ts'
+import { COUNT_RULES, filterStamps, OPT_IN_STAMP, REDACTION_COUNT } from './stamps.ts'
 
 export type Setting = 'on' | 'off' | 'claude'
-export type Gate = { settings: ReadonlyMap<DataPointId, Setting | 'required'>; limit: number }
+/** `optedIn`: the data points that are `on` because the person opted in, in catalog order. */
+export type Gate = { settings: ReadonlyMap<DataPointId, Setting | 'required'>; limit: number; optedIn: readonly DataPointId[] }
 export type Overrides = Partial<Record<DataPointId, Setting>>
 
+
+/**
+ * For the opt-in alone, the switch a data point with none of its own follows: thinking is the model's output, as its responses are, so
+ * a session that turned responses off (`OTEL_LOG_ASSISTANT_RESPONSES`, else `OTEL_LOG_USER_PROMPTS`) gets no thinking by opt-in. An
+ * explicit setting for it is unchanged.
+ */
+const OPT_IN_SWITCH: Readonly<Partial<Record<DataPointId, Switch>>> = { 'response.thinking': 'OTEL_LOG_ASSISTANT_RESPONSES' }
 
 /** Whether a switch's value turns it off, as Claude Code reads a false value. */
 export const switchedOff = (raw: string | undefined): boolean => ['0', 'false', 'no', 'off'].includes((raw ?? '').trim().toLowerCase())
 
-/** The settings in force: overrides, else the default, turned to `claude` where the session's environment switched it off. */
-export function resolveGate(env: Readonly<Partial<Record<Switch, string | undefined>>>, overrides: Overrides = {}, limit = CONTENT_MAX_LENGTH): Gate {
+/**
+ * The settings in force, in this order: an explicit setting; else, where the session's environment switched the data point's switch
+ * off, `claude` for one on by default (one off by default stays off); else `on` for one off by default that the person opted in to;
+ * else the default. `optedIn` lists those the opt-in turned on that can go somewhere: not one the data point it adds detail to keeps
+ * from going.
+ */
+export function resolveGate(env: Readonly<Partial<Record<Switch, string | undefined>>>, overrides: Overrides = {}, limit = CONTENT_MAX_LENGTH, optIn: Iterable<DataPointId> = []): Gate {
   const settings = new Map<DataPointId, Setting | 'required'>()
+  const wanted = new Set(optIn)
+  const raised: DataPointId[] = []
   const value = (s: Switch) => (s === 'OTEL_LOG_ASSISTANT_RESPONSES' ? env.OTEL_LOG_ASSISTANT_RESPONSES ?? env.OTEL_LOG_USER_PROMPTS : env[s])
   for (const d of CATALOG) {
     if (d.required) {
@@ -38,9 +55,17 @@ export function resolveGate(env: Readonly<Partial<Record<Switch, string | undefi
     }
     const explicit = overrides[d.id]
     const byDefault = DEFAULTS[d.id as keyof typeof DEFAULTS]
-    settings.set(d.id, explicit ?? (byDefault === 'on' && d.switch !== undefined && switchedOff(value(d.switch)) ? 'claude' : byDefault))
+    const switched = d.switch !== undefined && switchedOff(value(d.switch))
+    const follows = OPT_IN_SWITCH[d.id]
+    if (explicit !== undefined) settings.set(d.id, explicit)
+    else if (switched) settings.set(d.id, byDefault === 'on' ? 'claude' : byDefault)
+    else if (byDefault === 'off' && wanted.has(d.id) && !(follows !== undefined && switchedOff(value(follows)))) {
+      settings.set(d.id, 'on')
+      raised.push(d.id)
+    } else settings.set(d.id, byDefault)
   }
-  return { settings, limit }
+  const gate: Gate = { settings, limit, optedIn: [] }
+  return { ...gate, optedIn: raised.filter(id => allows(gate, id, false)) }
 }
 
 /**
@@ -60,7 +85,8 @@ export function allows(gate: Gate, id: DataPointId, claude: boolean): boolean {
 let env: Partial<Record<Switch, string | undefined>> = {}
 let overrides: Overrides = {}
 let limit = CONTENT_MAX_LENGTH
-let current: Gate = resolveGate(env, overrides, limit)
+let optIn: readonly DataPointId[] = []
+let current: Gate = resolveGate(env, overrides, limit, optIn)
 
 /** The gate in force for this load. */
 export const currentGate = (): Gate => current
@@ -69,13 +95,19 @@ export const currentGate = (): Gate => current
 export function configureGate(switches: Partial<Record<Switch, string | undefined>>, contentLimit: number = CONTENT_MAX_LENGTH): void {
   env = { ...switches }
   limit = contentLimit
-  current = resolveGate(env, overrides, limit)
+  current = resolveGate(env, overrides, limit, optIn)
 }
 
 /** Explicit settings per data point, over the defaults: for organization settings, and for tests. */
 export function setOverrides(next: Overrides): void {
   overrides = { ...next }
-  current = resolveGate(env, overrides, limit)
+  current = resolveGate(env, overrides, limit, optIn)
+}
+
+/** The data points the person opts in to (`optInOf`), from their own user settings: read once per load, and again before each send. */
+export function setOptIn(next: readonly DataPointId[]): void {
+  optIn = [...next]
+  current = resolveGate(env, overrides, limit, optIn)
 }
 
 /**
@@ -95,6 +127,17 @@ export function overridesOf(raw: unknown): Overrides {
     if (d !== undefined && !d.required && typeof setting === 'string' && SETTINGS.includes(setting)) out[d.id] = setting as Setting
   }
   return out
+}
+
+/**
+ * The data points a value of the opt-in option lists: a list of IDs, or one string of IDs separated by commas or spaces. Each known
+ * data point that has a setting, once, in catalog order; anything else (an unknown ID, a required data point, a value of another
+ * type) is ignored. A data point on by default may be listed: it changes nothing.
+ */
+export function optInOf(raw: unknown): DataPointId[] {
+  const items = typeof raw === 'string' ? raw.split(/[\s,]+/) : Array.isArray(raw) ? raw : []
+  const named = new Set(items.filter((v): v is string => typeof v === 'string').map(v => v.trim()))
+  return CATALOG.filter(d => !d.required && named.has(d.id)).map(d => d.id)
 }
 
 // ── Records ───────────────────────────────────────────────────────────────────
@@ -253,6 +296,20 @@ const COUNTED_BY: Readonly<Record<string, DataPointId>> = { 'claude_code.commit.
 export const metricAllowed = (gate: Gate, name: string, strict = false): boolean => COUNTED_BY[name] === undefined || allows(gate, COUNTED_BY[name]!, !strict)
 
 /**
+ * A record's attributes stamped with the gate it went through: `mainwave.telemetry.opt_in` lists the data points the person's opt-in
+ * turned on, and is left off where it turned none on. Re-stamped each time a record goes through the gate, so a record sent carries
+ * the opt-in it was sent under.
+ */
+function withOptIn(gate: Gate, attributes: Attrs): Attrs {
+  const out: Attrs = {}
+  for (const [key, value] of Object.entries(attributes)) if (key !== OPT_IN_STAMP) put(out, key, value)
+  if (gate.optedIn.length === 0) return out
+  const stamp = filterStamps({ [OPT_IN_STAMP]: gate.optedIn.join(',') }).kept[OPT_IN_STAMP]
+  if (stamp !== undefined) put(out, OPT_IN_STAMP, stamp)
+  return out
+}
+
+/**
  * A span the plugin rebuilt, through the gate: its attributes and events, and its status message, which repeats a failed run's
  * `error`. A run's error text is a tool result: with those off, the run keeps only the error's class, as Claude Code's does.
  */
@@ -278,17 +335,18 @@ export function gateSpan(gate: Gate, span: BuiltSpan, strict = false): BuiltSpan
     events.push(g.event)
     count += g.count
   }
-  return { ...span, attributes: withCount(attributes, count), ...(span.events ? { events } : {}), ...(status ? { status } : {}) }
+  return { ...span, attributes: withOptIn(gate, withCount(attributes, count)), ...(span.events ? { events } : {}), ...(status ? { status } : {}) }
 }
 
 /**
- * A row through the gate, as it is queued and again as it is sent: nothing is added, only what the gate in force now holds back is
- * removed. A row the plugin makes itself (catalog.ts, `OWN_ROWS`) goes only while its data point is on: null otherwise.
+ * A row through the gate, as it is queued and again as it is sent: no data is added, only what the gate in force now holds back is
+ * removed, and the row stamped with the opt-in of that gate. A row the plugin makes itself (catalog.ts, `OWN_ROWS`) goes only while
+ * its data point is on: null otherwise.
  */
 export function gateRow(gate: Gate, row: CopiedRow, strict = false): CopiedRow | null {
   const own = OWN_ROWS[row.event]
   if (own !== undefined && !allows(gate, own, false)) return null
-  return { ...row, attributes: gateAttributes(gate, row.event, row.attributes, {}, strict) }
+  return { ...row, attributes: withOptIn(gate, gateAttributes(gate, row.event, row.attributes, {}, strict)) }
 }
 
 /** A metric point through the gate: null when its metric's data point is off. */

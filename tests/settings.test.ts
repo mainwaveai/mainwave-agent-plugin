@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from 'claude-code/testing'
 
-import { ingestKeyOf, namesOption, type Layer } from '../hooks/settings.ts'
+import { ingestKeyOf, namesOption, optionValues, type Layer } from '../hooks/settings.ts'
 
 const cfg = (entries: Record<string, unknown>): Layer => ({ pluginConfigs: entries })
 const opt = (value: unknown) => ({ options: { devIngestKey: value } })
@@ -44,4 +44,19 @@ describe('ingestKeyOf', () => {
     ['non-ASCII', 'mw_dev_ключ_0001', null],
   ]
   for (const [name, raw, want] of cases) test(name, () => expect(ingestKeyOf(raw)).toBe(want))
+})
+
+describe('optionValues', () => {
+  const ids = (value: unknown) => ({ options: { extraDataPoints: value } })
+  const cases: [string, Layer, unknown[]][] = [
+    ['no pluginConfigs', {}, []],
+    ['pluginConfigs not an object', { pluginConfigs: 'x' }, []],
+    ['unreadable', 'unreadable', []],
+    ['another plugin only', cfg({ other: ids(['mcp.url']) }), []],
+    ['our entry without the field', cfg({ 'mainwave@synced': opt('x') }), []],
+    ['one entry', cfg({ 'mainwave@synced': ids(['mcp.url']) }), [['mcp.url']]],
+    ['each of our ids, in order', cfg({ mainwave: ids('skill.text'), 'mainwave@mainwave': ids(['mcp.url']), 'mainwave-telemetry': ids(['x']) }), ['skill.text', ['mcp.url']]],
+    ['a value of any type, as it is', cfg({ 'mainwave@synced': ids(42) }), [42]],
+  ]
+  for (const [name, layer, want] of cases) test(name, () => expect(optionValues(layer, 'extraDataPoints')).toEqual(want))
 })

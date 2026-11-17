@@ -1,13 +1,13 @@
 // End to end: the data points the plugin sends, as a Cowork session runs. Cowork exports no spans and withholds tool details and
 // prompts from its rows; its shell commands run through the `remote-devices` MCP server's `device_bash`. The engine beneath is played
 // by rig.ts and the kit's mocks; every request the plugin makes is read back whole. Explicit settings per data point reach the plugin
-// as organization settings will: kept in its store, under `dataPoints`.
+// as organization settings will: kept in its store, under `dataPoints`. The person's opt-in reaches it from their settings layers.
 
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
 import type { Overrides } from '../hooks/gate.ts'
-import { boot, contractViolations, EMAIL, LOGGED_AT, memoryStore, network, ORG, STAMPED, type Post } from './rig.ts'
+import { boot, contractViolations, EMAIL, LOGGED_AT, memoryStore, network, optInOption, ORG, STAMPED, type Layers, type Post } from './rig.ts'
 
 const keyless = { options: {} }
 const START = 1_800_000_000_000
@@ -17,12 +17,13 @@ const DEVICE_BASH = 'mcp__remote-devices__device_bash'
 const COMMAND = 'git commit -m "fix login" && git push'
 const TOKEN = `ghp_${'a'.repeat(36)}`
 
-function world(on: On, env: Record<string, string> = {}, overrides?: Overrides, merged?: Record<string, unknown>) {
+function world(on: On, env: Record<string, string> = {}, overrides?: Overrides, merged?: Record<string, unknown>, layers: Layers = {}) {
   const clock = mock.clock(on, { now: START })
   const store = memoryStore(on, overrides ? { dataPoints: overrides } : {})
   const posts = network(on)
-  // A read of the merged settings names no source.
-  boot(on, { entrypoint: 'remote_cowork', env, ...(merged ? { layers: { undefined: merged } as never } : {}) })
+  // A read of the merged settings names no source. The layers object is read as each read comes, so a test can change it mid-session.
+  if (merged) Object.assign(layers, { undefined: merged })
+  const rig = boot(on, { entrypoint: 'remote_cowork', env, layers })
   on('session.start', (_$, e) => ({ cwd: (e as { cwd: string }).cwd }) as never)
   on('session.end', (_$, e) => ({ sessionId: (e as { sessionId: string }).sessionId }) as never)
   on('ui.log', () => ({ value: undefined }) as never)
@@ -36,7 +37,7 @@ function world(on: On, env: Record<string, string> = {}, overrides?: Overrides, 
     return { turnId: e.turnId, index: e.index, answer: 'Done.', toolUses: [], stopReason: 'end_turn', usage: { ...USAGE, model: 'claude-haiku-5-5' } } as never
   })
   on('tool.call', () => ({ result: [{ type: 'text', text: `[main 1a2b3c] fix login ${TOKEN}` }] }) as never)
-  return { clock, posts, store }
+  return { clock, posts, store, rig }
 }
 
 /** A Cowork row: no span, and what its export withholds left out. */
@@ -71,8 +72,8 @@ const spansOf = (posts: readonly Post[]) => bodies(posts, '/v1/traces').flatMap(
 const metricNames = (posts: readonly Post[]) => bodies(posts, '/v1/metrics').flatMap(b => b.resourceMetrics.flatMap((r: any) => r.scopeMetrics.flatMap((s: any) => s.metrics.map((m: any) => m.name))))
 
 /** A whole session: its start, one turn, its end. Answers every request the plugin made. */
-async function session($: Engine, on: On, opts: { env?: Record<string, string>; overrides?: Overrides } = {}) {
-  const { posts } = world(on, opts.env, opts.overrides)
+async function session($: Engine, on: On, opts: { env?: Record<string, string>; overrides?: Overrides; layers?: Layers } = {}) {
+  const { posts } = world(on, opts.env, opts.overrides, undefined, opts.layers)
   await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
   await turn($)
   await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
@@ -172,8 +173,8 @@ describe("the MCP servers set up, and each skill's text: data points no Claude C
   }
 
   /** The engine beneath, with Claude's settings files in place; a slash command expands its skill as it runs, as Claude Code's do. */
-  function engine($: Engine, on: On, overrides?: Overrides, files: Record<string, unknown> = FILES, merged?: Record<string, unknown>) {
-    const { posts } = world(on, { HOME }, overrides, merged)
+  function engine($: Engine, on: On, overrides?: Overrides, files: Record<string, unknown> = FILES, merged?: Record<string, unknown>, layers?: Layers, env: Record<string, string> = {}) {
+    const { posts } = world(on, { HOME, ...env }, overrides, merged, layers)
     const reads: string[] = []
     on('fs.read', (_$, e) => {
       const path = (e as { path: string }).path
@@ -194,8 +195,8 @@ describe("the MCP servers set up, and each skill's text: data points no Claude C
   }
 
   /** A whole session that runs two skills, a slash command with arguments, a claude.ai connector and a configured server. */
-  async function run($: Engine, on: On, overrides?: Overrides, files?: Record<string, unknown>, merged?: Record<string, unknown>) {
-    const { posts, reads } = engine($, on, overrides, files, merged)
+  async function run($: Engine, on: On, overrides?: Overrides, files?: Record<string, unknown>, merged?: Record<string, unknown>, layers?: Layers, env?: Record<string, string>) {
+    const { posts, reads } = engine($, on, overrides, files, merged, layers, env)
     await $.session.start({ cwd: ROOT, surface: null, isInteractive: false } as never)
     await turn($)
     for (let i = 0; i < 2; i++) await $.skill.prompt({ skill: 'review', text: 'Review the diff for correctness bugs.', source: 'userSettings', frontmatter: {} } as never)
@@ -306,5 +307,124 @@ describe("the MCP servers set up, and each skill's text: data points no Claude C
     expect(bySession('mcp_server_configured', 's-2').map(r => r['server_name'])).toEqual(['db', 'docs', 'linear'])
     expect(bySession('skill_prompt', 's-1').map(r => r['skill.text'])).toEqual(['Review it.'])
     expect(bySession('skill_prompt', 's-2').map(r => r['skill.text'])).toEqual(['Review it.'])
+  })
+
+  test("opted in to by the person: the servers and skill texts are sent, each row saying it was their opt-in", keyless, async ($, on) => {
+    const { posts } = await run($, on, undefined, undefined, undefined, { user: optInOption(['mcp.url', 'skill.text']) })
+    const servers = ofEvent(posts, 'mcp_server_configured')
+    expect(servers.map(r => r['server_name'])).toEqual(['db', 'docs', 'linear', 'remote-devices', 'claude_ai_Gmail'])
+    expect(servers.every(r => r['mainwave.telemetry.opt_in'] === 'mcp.url,skill.text')).toBe(true)
+    expect(ofEvent(posts, 'skill_prompt')[0]!['skill.text']).toBe('Review the diff for correctness bugs.')
+  })
+
+  test('opted in to, under a session that sets MCP and skill names to 0: nothing the plugin alone would send', keyless, async ($, on) => {
+    const { posts, reads } = await run($, on, undefined, undefined, undefined, { user: optInOption(['mcp.url', 'skill.text']) }, { OTEL_LOG_TOOL_DETAILS: '0' })
+    expect(ofEvent(posts, 'mcp_server_configured')).toEqual([])
+    expect(ofEvent(posts, 'skill_prompt')).toEqual([])
+    expect(reads).toEqual([])
+    // Nothing went by the opt-in, so nothing says it did.
+    expect(posts.map(p => p.body).join('\n')).not.toContain('mainwave.telemetry.opt_in')
+  })
+
+  test('opted in to, where the organization set MCP names off: no server is sent', keyless, async ($, on) => {
+    const { posts, reads } = await run($, on, { 'tool.mcp': 'off' }, undefined, undefined, { user: optInOption(['mcp.url']) })
+    expect(ofEvent(posts, 'mcp_server_configured')).toEqual([])
+    expect(reads).toEqual([])
+    expect(posts.map(p => p.body).join('\n')).not.toContain('mainwave.telemetry.opt_in')
+  })
+})
+
+describe("the person's opt-in, in their own user settings", () => {
+  const thinkingOf = (posts: readonly Post[]) => spansOf(posts).find(s => s.name === 'claude_code.llm_request')!.attrs['response.thinking']
+
+  test("turns on thinking, off by default; every row and span of the copy says so, no metric and none of the exporter's rows", keyless, async ($, on) => {
+    const { posts, rig } = world(on, {}, undefined, undefined, { user: optInOption(['response.thinking']) })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await turn($)
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    expect(thinkingOf(posts)).toBe('Commit first.')
+    const rows = rowsOf(posts)
+    const spans = spansOf(posts)
+    expect(rows.length).toBeGreaterThan(0)
+    for (const r of [...rows, ...spans.map(s => s.attrs)]) {
+      expect(r['mainwave.telemetry.opt_in']).toBe('response.thinking')
+      expect(contractViolations(r)).toEqual([])
+    }
+    expect(posts.filter(p => p.url.endsWith('/v1/metrics')).map(p => p.body).join('')).not.toContain('opt_in')
+    expect(rig.rows.length).toBeGreaterThan(0)
+    for (const r of rig.rows) expect(r.attributes['mainwave.telemetry.opt_in']).toBeUndefined()
+  })
+
+  test('under any of the plugin ids, as a list or a string', keyless, async ($, on) => {
+    expect(thinkingOf(await session($, on, { layers: { user: optInOption('response.thinking', 'mainwave') } }))).toBe('Commit first.')
+  })
+
+  test('only adds: one on by default, an unknown ID, a required one and a value of the wrong type change nothing, and turn nothing off', keyless, async ($, on) => {
+    const posts = await session($, on, { layers: { user: optInOption(['prompt.text', 'tool.input', 'everything', 'usage', 7]) } })
+    const all = posts.map(p => p.body).join('\n')
+    expect(all).toContain('ship it')
+    expect(all).toContain('commit -m')
+    expect(all).not.toContain('mainwave.telemetry.opt_in')
+    expect(thinkingOf(posts)).toBeUndefined()
+  })
+
+  for (const [name, value] of [['a number', 42], ['true', true], ['an object', { 'response.thinking': true }], ['null', null]] as const) {
+    test(`a value of the wrong type (${name}) is ignored, and the plugin goes on as without it`, keyless, async ($, on) => {
+      const posts = await session($, on, { layers: { user: optInOption(value) } })
+      expect(rowsOf(posts).find(r => r['event.name'] === 'user_prompt')!['prompt']).toBe('ship it')
+      expect(thinkingOf(posts)).toBeUndefined()
+    })
+  }
+
+  test("user settings that can't be read opt in to nothing, and the plugin goes on", keyless, async ($, on) => {
+    const posts = await session($, on, { layers: { user: 'reject' } })
+    expect(rowsOf(posts).find(r => r['event.name'] === 'user_prompt')!['prompt']).toBe('ship it')
+    expect(thinkingOf(posts)).toBeUndefined()
+  })
+
+  test("a session that sets responses (or prompts) to 0 gets no thinking by opt-in: thinking is the model's output too", keyless, async ($, on) => {
+    const posts = await session($, on, { env: { OTEL_LOG_USER_PROMPTS: '0' }, layers: { user: optInOption(['response.thinking']) } })
+    expect(thinkingOf(posts)).toBeUndefined()
+    expect(posts.map(p => p.body).join('\n')).not.toContain('Commit first.')
+    expect(posts.map(p => p.body).join('\n')).not.toContain('mainwave.telemetry.opt_in')
+  })
+
+  test('a stamp already on a row Claude Code raises is not taken for the opt-in: removed, and the copy carries only its own', keyless, async ($, on) => {
+    const layers: Layers = {}
+    const { posts, rig } = world(on, {}, undefined, undefined, layers)
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await row($, 'user_prompt', { prompt: 'one', prompt_length: '3', 'mainwave.telemetry.opt_in': 'response.thinking' })
+    layers.user = optInOption(['skill.text'])
+    await row($, 'user_prompt', { prompt: 'two', prompt_length: '3', 'mainwave.telemetry.opt_in': 'mcp.url,response.thinking' })
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    for (const r of rig.rows) expect(r.attributes['mainwave.telemetry.opt_in']).toBeUndefined()
+    // Sent under the opt-in read last, before the send: each copy says what that one turned on.
+    const prompts = rowsOf(posts).filter(r => r['event.name'] === 'user_prompt')
+    expect(prompts.map(r => r['mainwave.telemetry.opt_in'])).toEqual(['skill.text', 'skill.text'])
+  })
+
+  test("an organization's explicit off stays off", keyless, async ($, on) => {
+    const posts = await session($, on, { overrides: { 'response.thinking': 'off' }, layers: { user: optInOption(['response.thinking']) } })
+    expect(thinkingOf(posts)).toBeUndefined()
+    expect(posts.map(p => p.body).join('\n')).not.toContain('mainwave.telemetry.opt_in')
+  })
+
+  test("a repository's settings, the local project's, --settings and managed settings opt in to nothing", keyless, async ($, on) => {
+    const opt = optInOption(['response.thinking'])
+    const posts = await session($, on, { layers: { project: opt, local: opt, flag: opt, policy: opt, undefined: opt } as Layers })
+    expect(thinkingOf(posts)).toBeUndefined()
+    expect(posts.map(p => p.body).join('\n')).not.toContain('mainwave.telemetry.opt_in')
+  })
+
+  test('taken off the list after a record was queued: it goes without it, as the list is read again before each send', keyless, async ($, on) => {
+    const layers: Layers = { user: optInOption(['response.thinking']) }
+    const { posts } = world(on, {}, undefined, undefined, layers)
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await turn($)
+    layers.user = {}
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    expect(thinkingOf(posts)).toBeUndefined()
+    expect(posts.map(p => p.body).join('\n')).not.toContain('Commit first.')
+    expect(posts.map(p => p.body).join('\n')).not.toContain('mainwave.telemetry.opt_in')
   })
 })

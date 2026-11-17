@@ -40,11 +40,11 @@
 
 import type { EngineInterface, PluginOptions, Timer } from 'claude-code'
 
-import { currentGate, gatePoint, gateRow, gateSpan } from './gate.ts'
+import { currentGate, gatePoint, gateRow, gateSpan, optInOf, setOptIn } from './gate.ts'
 import { fetchWithin, type FetchOutcome } from './http.ts'
 import { logsBody, metricsBody, resourceOf, tracesBody, type BuiltSpan, type CopiedRow, type MetricPoint } from './otlp.ts'
 import { routingIdentityOf } from './identity.ts'
-import { ingestKeyOf, KEY_OPTION, namesOption, type Layer } from './settings.ts'
+import { ingestKeyOf, KEY_OPTION, namesOption, OPT_IN_OPTION, optionValues, type Layer } from './settings.ts'
 
 /** The one place the copy goes, a path per signal. Nothing reads another URL from settings or the environment. */
 export const DEV_COLLECTOR = 'https://collector.dev.mainwave.com'
@@ -433,11 +433,25 @@ function bodyOf(batch: readonly Queued[], nowMs: number): string {
   return logsBody(groups<CopiedRow>(gated).map(g => ({ resource: g.resource, rows: g.items })), scopeVersion, nowMs)
 }
 
-async function readLayer($: EngineInterface, source: 'project' | 'local'): Promise<Layer> {
+async function readLayer($: EngineInterface, source: 'user' | 'project' | 'local'): Promise<Layer> {
   try {
     return await $.settings.read({ source })
   } catch {
     return 'unreadable'
+  }
+}
+
+/**
+ * The data points the person opts in to, read from their own user settings into the gate (gate.ts, `setOptIn`): once per load, and
+ * again before each send, so a data point taken off the list stops going out from records already queued. A layer that cannot be read
+ * opts in to nothing. A batch sent again under its idempotency key goes through the gate as it is then, as with any setting: the
+ * collector keeps the copy it took first.
+ */
+export async function readOptIn($: EngineInterface): Promise<void> {
+  try {
+    setOptIn(optionValues(await readLayer($, 'user'), OPT_IN_OPTION).flatMap(optInOf))
+  } catch {
+    setOptIn([])
   }
 }
 
@@ -527,7 +541,9 @@ export async function flush($: EngineInterface, opts: { timeoutMs: number | (() 
     // Nothing that may go now (every signal waiting, or every record's organization and email refused): no request, and no settings read.
     const at = await $.clock.now()
     if (!SIGNALS.some(sig => ready(sig, at) && queue.some(item => item.s === sig && sendable(item)))) return
-    if (await repositoryNamesKey($)) return
+    // The opt-in is read beside the repository's settings, not after: the end of a session leaves little time.
+    const [refusedNow] = await Promise.all([repositoryNamesKey($), readOptIn($)])
+    if (refusedNow) return
     const limitNow = () => (typeof opts.timeoutMs === 'function' ? opts.timeoutMs() : opts.timeoutMs)
     if (opts.together) {
       const now = await $.clock.now()

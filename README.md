@@ -28,7 +28,7 @@ It also reads who the session is from those rows: the organization (`organizatio
 
 - **Log rows** are copies: the exporter's row as Claude Code raised it, with the same attributes (identity, `event.name`, `event.sequence`, `event.timestamp`), the same time and the same trace and span IDs. Where Claude Code's row names no span but the plugin builds the trace (below), the copy carries the IDs of the span it ran in, as Claude Code's rows do when it traces.
 - **Spans and metrics are rebuilt.** They never pass through a plugin: the one hook Claude Code gives plugins for its telemetry carries log rows alone. So the plugin puts them back together from what it does see: the rows, and Claude Code's own events for turns, model requests, tool calls and subagents. What it sends has the exporter's names, attributes, attribute order and value types, and the exporter's trace IDs; the table below says where each comes from.
-- **Every record** carries `mainwave.telemetry.route` set to `plugin`. The resource is rebuilt as the exporter builds it (`service.name`, `service.version`, then `OTEL_RESOURCE_ATTRIBUTES`, then `OTEL_SERVICE_NAME`), and each signal goes as OTLP/JSON under the exporter's own scope for it.
+- **Every record** carries `mainwave.telemetry.route` set to `plugin`. While the person has opted in to data points that are off by default (see Settings), every log row and span also carries `mainwave.telemetry.opt_in`, listing them. The resource is rebuilt as the exporter builds it (`service.name`, `service.version`, then `OTEL_RESOURCE_ATTRIBUTES`, then `OTEL_SERVICE_NAME`), and each signal goes as OTLP/JSON under the exporter's own scope for it.
 
 | What Claude Code sends | What the plugin rebuilds it from |
 | --- | --- |
@@ -126,18 +126,18 @@ These settings govern what the plugin sends. Where an organization's env block i
 | `repo` | Identifiers | The Git remote's address, owner and name, the branch and the commit | `vcs.*`; `git_commit_id`, `git_branch` in `tool_parameters` | On (`OTEL_METRICS_INCLUDE_REPOSITORY`) |
 | `file.path` | Identifiers | The path of each file read, edited or written | `file_path` | On (`OTEL_LOG_TOOL_DETAILS`) |
 | `web.url` | Identifiers | The full address of each page fetched | `url.full` on WebFetch calls | On (`OTEL_LOG_TOOL_DETAILS`) |
-| `mcp.url` | Identifiers | The MCP servers set up for the session, called or not: each one's name, where it was set up and its address. A remote server's address keeps scheme, host, port and path, and drops any user name, password, query and fragment; a local server's is its command and arguments. Goes only where `tool.mcp` does | The plugin's own `mcp_server_configured` row, one per server: `server_name`, `server_scope`, `transport_type`, `server_url` | Off |
+| `mcp.url` | Identifiers | The MCP servers set up for the session, called or not: each one's name, where it was set up and its address. A remote server's address keeps scheme, host, port and path, and drops any user name, password, query and fragment; a local server's is its command and arguments. Goes only where `tool.mcp` does | The plugin's own `mcp_server_configured` row, one per server: `server_name`, `server_scope`, `transport_type`, `server_url` | Off (a person may opt in) |
 | `bash.command` | Content | The full text of each shell command, in Bash or an MCP shell tool | `full_command`, `bash_command` | On (`OTEL_LOG_TOOL_DETAILS`) |
 | `tool.input` | Content | Each tool call's input: what an edit writes, search patterns, MCP arguments, subagent task prompts. Holds commands, file paths and web addresses, so it goes only where they all do | `tool_input`; `timeout`, `description` in `tool_parameters` | On (`OTEL_LOG_TOOL_DETAILS`) |
 | `tool.result` | Content | What each tool answered: command output, file contents read, MCP results, a failed call's error | the `tool.output` event; `error` on a call's row and run | On (`OTEL_LOG_TOOL_CONTENT`) |
-| `skill.text` | Content | The instructions of each skill run, as Claude Code expands them for the model, arguments filled in: typed as a slash command, run by the Skill tool or preloaded into a subagent. Goes only where `skill.name` does; a text with arguments only where `prompt.text` does too | The plugin's own `skill_prompt` row, one per run: `skill.name`, `skill.source`, `skill.has_arguments`, `skill.text_id`, and `skill.text` the first time the session sees that text; `skill.text_held_back` where it was held back | Off |
+| `skill.text` | Content | The instructions of each skill run, as Claude Code expands them for the model, arguments filled in: typed as a slash command, run by the Skill tool or preloaded into a subagent. Goes only where `skill.name` does; a text with arguments only where `prompt.text` does too | The plugin's own `skill_prompt` row, one per run: `skill.name`, `skill.source`, `skill.has_arguments`, `skill.text_id`, and `skill.text` the first time the session sees that text; `skill.text_held_back` where it was held back | Off (a person may opt in) |
 | `prompt.text` | Content | What the person typed, pastes expanded | `prompt`, `prompt_text`; `user_prompt` on `interaction` | On (`OTEL_LOG_USER_PROMPTS`) |
 | `response.text` | Content | The model's visible answers | `response` on `assistant_response` rows | On (`OTEL_LOG_ASSISTANT_RESPONSES`, else `OTEL_LOG_USER_PROMPTS`) |
-| `response.thinking` | Content | The model's thinking text, where the API returns it | `response.thinking` on `llm_request` | Off |
+| `response.thinking` | Content | The model's thinking text, where the API returns it | `response.thinking` on `llm_request` | Off (a person may opt in) |
 
-Never sent, whatever the settings: images and other attachments, the system prompt, `CLAUDE.md` and memory files, and raw API request and response bodies. The plugin reads no files beyond its own settings and store, except the MCP server entries above while `mcp.url` is on.
+Never sent, whatever the settings: images and other attachments, the system prompt, `CLAUDE.md` and memory files, and raw API request and response bodies. The plugin reads no files beyond the settings and store named here, except the MCP server entries above while `mcp.url` is on.
 
-**Defaults.** With no settings for a data point, the plugin sends it as Claude Code's own telemetry does with Mainwave's org-wide setup captures on (`OTEL_LOG_TOOL_DETAILS`, `OTEL_LOG_TOOL_CONTENT`, `OTEL_LOG_USER_PROMPTS`, `OTEL_METRICS_INCLUDE_REPOSITORY`), in Claude Code and Cowork alike, whether or not those switches are set. Where Claude Code's row leaves a value out (Cowork's export carries no tool details, content or prompts), the plugin adds what it read in its own hooks: the call's parameters and input, the prompt, the response. A data point Claude Code doesn't send even with all four on (thinking, MCP server addresses, skill text) is off. A switch the session's environment sets to `0` (or `false`, `no`, `off`) turns what it governs to as Claude Code sends it, which with that switch off is little or nothing: Mainwave's org-wide setup writes `0` for a capture an admin turns off, and the plugin keeps that choice. An explicit setting for a data point wins over both; the plugin reads explicit settings from its store, where a later version keeps the organization's settings from Mainwave.
+**Defaults.** With no settings for a data point, the plugin sends it as Claude Code's own telemetry does with Mainwave's org-wide setup captures on (`OTEL_LOG_TOOL_DETAILS`, `OTEL_LOG_TOOL_CONTENT`, `OTEL_LOG_USER_PROMPTS`, `OTEL_METRICS_INCLUDE_REPOSITORY`), in Claude Code and Cowork alike, whether or not those switches are set. Where Claude Code's row leaves a value out (Cowork's export carries no tool details, content or prompts), the plugin adds what it read in its own hooks: the call's parameters and input, the prompt, the response. A data point Claude Code doesn't send even with all four on (thinking, MCP server addresses, skill text) is off. A switch the session's environment sets to `0` (or `false`, `no`, `off`) turns what it governs to as Claude Code sends it, which with that switch off is little or nothing: Mainwave's org-wide setup writes `0` for a capture an admin turns off, and the plugin keeps that choice. A person can opt in, for their own sessions, to a data point that is off by default (see Settings): it turns on unless such a switch governs it. An explicit setting for a data point wins over all of these; the plugin reads explicit settings from its store, where a later version keeps the organization's settings from Mainwave. So, in order: an explicit setting, then a switch at `0`, then the person's opt-in, then the default.
 
 **The plugin's own rows.** `mcp.url` and `skill.text` are on no row of Claude Code's, so the plugin sends rows of its own for them, with the session's identity and stamps, once a row of Claude Code's has said who the session is. After a `/clear` or a resume, the session that follows gets its own: its servers and skill texts are sent again under its ID.
 
@@ -215,7 +215,11 @@ Answer `y` to add the marketplace, then pick a scope. From a shell: `claude plug
 
 ## Settings
 
-The plugin has one option, `devIngestKey`: an ingest key for Mainwave's dev collector. Unset (the default), the plugin sends its copy without a key, routed by the Claude organization and email on each record (see Keyless, above); the collector takes it only where it routes that organization and email domain to a Mainwave workspace, and refuses the rest. Set, the copy goes with the key as a bearer token instead. A key of the wrong shape sends nothing (the session's debug log says so, never with the value). There is no switch to turn stamping or the copy off; to stop the plugin, remove it. An earlier version's `devKeyless` option is gone: a value left in settings is ignored, whatever it is.
+The plugin reads two settings of the person's: the dev ingest key, and the data points they opt in to. Neither can come from a repository's settings.
+
+### Dev ingest key
+
+`devIngestKey`, the plugin's one option: an ingest key for Mainwave's dev collector. Unset (the default), the plugin sends its copy without a key, routed by the Claude organization and email on each record (see Keyless, above); the collector takes it only where it routes that organization and email domain to a Mainwave workspace, and refuses the rest. Set, the copy goes with the key as a bearer token instead. A key of the wrong shape sends nothing (the session's debug log says so, never with the value). There is no switch to turn stamping or the copy off; to stop the plugin, remove it. An earlier version's `devKeyless` option is gone: a value left in settings is ignored, whatever it is.
 
 Set the key from a shell, so it is kept in secure storage. It is read from standard input, so it stays out of the command line and shell history:
 
@@ -236,6 +240,30 @@ Your own settings (`~/.claude/settings.json`, or `--settings`) also work, with t
 The name to use is the plugin's ID: `mainwave@synced` for org sync, `mainwave@mainwave` for an install from this repository, or `mainwave` (or `mainwave@inline`) for a `--plugin-dir` load.
 
 Only the person's own settings count. If a repository's settings (`.claude/settings.json` or `.claude/settings.local.json`) name `devIngestKey` under any of the plugin's IDs, to any value, or cannot be read, the plugin sends nothing and drops what it had queued.
+
+### More data points, for your own sessions
+
+`extraDataPoints` lists data points for the plugin to send from your own sessions where your organization left them at their default of off: `response.thinking`, `mcp.url` and `skill.text` (see What it sends). Put it in your user settings (`settings.json` in `~/.claude`, or in `CLAUDE_CONFIG_DIR` where that is set), under the plugin's ID as above:
+
+```json
+{
+  "pluginConfigs": {
+    "mainwave@synced": { "options": { "extraDataPoints": ["response.thinking", "mcp.url"] } }
+  }
+}
+```
+
+The value is a list of IDs, or one string of IDs separated by commas or spaces. The limits:
+
+- **It only adds.** Each listed data point that is at its default of off turns on. Listing one that is already on changes nothing, and nothing in the list turns anything off.
+- **An explicit setting wins.** A data point an admin or the organization set to off stays off, whatever you list. So does one a switch the session's environment sets to `0` governs: Mainwave's org-wide setup writes `0` when an admin turns a capture off. Thinking is the model's output, so for this it follows the responses' switch: with `OTEL_LOG_ASSISTANT_RESPONSES` (else `OTEL_LOG_USER_PROMPTS`) at `0`, listing `response.thinking` sends no thinking.
+- **The nesting rules hold.** `mcp.url` goes only where `tool.mcp` does, and `skill.text` only where `skill.name` does (a skill's text with arguments, only where `prompt.text` does too). Both of those follow `OTEL_LOG_TOOL_DETAILS`, so with that set to `0` neither goes anywhere.
+- **Only your user settings count.** The plugin reads the list from them alone. A repository's settings (`.claude/settings.json`, `.claude/settings.local.json`), `--settings` and managed settings are ignored, so a repository can never raise what the plugin sends.
+- **A mistake is ignored.** Unknown IDs, required data points and values of another type are ignored, and the plugin goes on as without them. User settings that can't be read opt in to nothing.
+- **Read again before each send.** The plugin reads the list when it loads and again before each batch it sends, so a data point you take off the list stops going out, from records already queued too. One you add starts by the next session at the latest: the MCP servers are read as a session starts.
+- **Mainwave can see it.** Every log row and span the plugin sends while your list turns something on carries `mainwave.telemetry.opt_in`, listing those data points (`mcp.url,response.thinking`), so an admin can tell why that data is there. A data point the rules above keep from going anywhere is not listed. It changes only the plugin's copy: Claude Code's exporter sends what its switches say, and its rows carry no such stamp.
+
+`extraDataPoints` is not declared as a plugin option, so `/config` doesn't show it and `claude plugin configure` doesn't set it (setting `devIngestKey` with it leaves the list in place): Claude Code refuses to load a plugin whose declared option holds a value of the wrong type, and a mistake here must never stop the plugin.
 
 ## Developing
 
@@ -260,18 +288,18 @@ A release bumps the version in both `.claude-plugin/plugin.json` and `hooks/vers
 | Module | What it holds |
 | --- | --- |
 | `hooks/register.ts` | the hooks: the collector row hook and its fail-open handler, the turn, model request, tool call, command and spawn hooks, `session.start` and `session.end` |
-| `hooks/stamps.ts` | the keys the plugin owns, their shape rules, and the strip of forged keys |
-| `hooks/settings.ts` | where the dev ingest key may come from, and its shape |
+| `hooks/stamps.ts` | the keys the plugin owns (the opt-in stamp among them), their shape rules, and the strip of forged keys |
+| `hooks/settings.ts` | where the dev ingest key and the person's opt-in to more data points may come from, and the key's shape |
 | `hooks/identity.ts` | the organization, account, email and device read from a row, and the pair a record is routed by without a key |
 | `hooks/rebuild.ts` | Claude Code's spans, and the measures behind its metrics, rebuilt from rows and events; without the env block, the trace built by the plugin |
 | `hooks/catalog.ts` | the data points: their IDs, classes, switches and attributes, and the table of defaults |
-| `hooks/gate.ts` | the gate: which data points go, applied to every record as it is captured and again as it is sent |
+| `hooks/gate.ts` | the gate: which data points go (an explicit setting, a switch at `0`, the person's opt-in, the default), applied to every record as it is captured and again as it is sent, and the opt-in stamp |
 | `hooks/protect.ts` | the always-on protections: secrets replaced, long values cut |
 | `hooks/capture.ts` | what the hooks read for the rows Claude Code writes without it: a call's parameters and input, a prompt, a response |
 | `hooks/servers.ts` | the MCP servers set up for a session, read from Claude's settings files for `mcp.url`: name, scope, transport and address |
 | `hooks/derive.ts` | the rules Claude Code fills attributes by: tool names, query sources, Bash commands, line counts, languages |
 | `hooks/meter.ts` | the counters behind the metrics, collected as delta points |
-| `hooks/sender.ts` | the copy: one queue for all three signals, timer, batches (keyless, one organization and email each) and their idempotency keys, retries and the outbox kept in the store |
+| `hooks/sender.ts` | the copy: one queue for all three signals, the person's opt-in read again before each send, timer, batches (keyless, one organization and email each) and their idempotency keys, retries and the outbox kept in the store |
 | `hooks/otlp.ts` | the copy as OTLP/JSON (log records, spans, metric points), with the resource rebuilt as the exporter builds it |
 | `hooks/http.ts` | `fetchWithin`: a request with a time limit that ends with its session |
 
