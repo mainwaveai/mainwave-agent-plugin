@@ -144,6 +144,33 @@ describe("with the org-wide setup's captures as the organization's settings", ()
   })
 })
 
+describe("with the env block's captures on and no settings", () => {
+  test("Claude Code's rows lose the identifiers and content its switches put on them", keyless, async ($, on) => {
+    const captures = { OTEL_LOG_TOOL_DETAILS: '1', OTEL_LOG_TOOL_CONTENT: '1', OTEL_LOG_USER_PROMPTS: '1', OTEL_METRICS_INCLUDE_REPOSITORY: '1' }
+    const { posts } = world(on, captures)
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    const repo = { 'vcs.repository.url.full': 'https://github.com/acme/api', 'vcs.repository.name': 'api' }
+    await row($, 'user_prompt', { prompt: 'ship it', prompt_text: 'ship it', prompt_length: '7', ...repo })
+    await row($, 'assistant_response', { response: 'Done.', response_length: 5, request_id: 'req_1' })
+    await row($, 'tool_result', {
+      tool_name: 'Bash', tool_use_id: 'toolu_1', success: 'false', error_type: 'ShellError', error: 'fatal: no remote acme-secret-remote',
+      tool_parameters: JSON.stringify({ bash_command: 'git', full_command: COMMAND, description: 'Ship', git_branch: 'release/acme' }),
+      tool_input: JSON.stringify({ command: COMMAND, description: 'Ship' }), ...repo,
+    })
+    await row($, 'mcp_server_connection', { server_name: 'acme', server_scope: 'user', error: 'connect ECONNREFUSED https://mcp.acme.example.com/mcp' })
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    const all = posts.map(p => p.body).join('\n')
+    for (const text of ['ship it', 'Done.', 'commit -m', 'Ship', 'acme-secret-remote', 'release/acme', 'github.com/acme', 'mcp.acme.example.com']) expect([text, all.includes(text)]).toEqual([text, false])
+    const rows = rowsOf(posts)
+    const by = (ev: string) => rows.find(r => r['event.name'] === ev)!
+    expect(by('user_prompt')).toEqual(expect.objectContaining({ prompt: '<REDACTED>', prompt_text: '<REDACTED>', prompt_length: '7' }))
+    expect(by('assistant_response')['response']).toBe('<REDACTED>')
+    expect(by('tool_result')).toEqual(expect.objectContaining({ tool_name: 'Bash', success: 'false', error_type: 'ShellError' }))
+    for (const key of ['tool_parameters', 'tool_input', 'error', 'vcs.repository.url.full', 'vcs.repository.name']) expect([key, by('tool_result')[key]]).toEqual([key, undefined])
+    expect(by('mcp_server_connection')).toEqual(expect.objectContaining({ server_name: 'acme', server_scope: 'user' }))
+  })
+})
+
 describe('a switch the session sets to 0', () => {
   test('keeps what it governs as Claude Code sends it: no command, no prompt, no output, but the MCP names Claude Code always sends on spans', keyless, async ($, on) => {
     const posts = await session($, on, { env: { OTEL_LOG_TOOL_DETAILS: '0', OTEL_LOG_TOOL_CONTENT: '0', OTEL_LOG_USER_PROMPTS: '0' } })

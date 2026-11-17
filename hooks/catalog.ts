@@ -149,6 +149,8 @@ const OWNED: readonly Owned[] = [
   { key: 'response.thinking', id: 'response.thinking' },
   // Claude Code's row for each MCP server it connects: the server's name and where it was set up.
   ...['server_name', 'server_scope'].map(key => ({ key, id: 'tool.mcp' as const, in: ['mcp_server_connection'] })),
+  // Its error, where it failed, names the server's address or command.
+  { key: 'error', id: 'mcp.url', in: ['mcp_server_connection'] },
   // The plugin's own rows: one per MCP server set up, one per skill run.
   ...['server_name', 'server_scope', 'transport_type', 'server_url'].map(key => ({ key, id: 'mcp.url' as const, in: [MCP_SERVER_ROW] })),
   ...['skill.text', 'skill.text_id'].map(key => ({ key, id: 'skill.text' as const, in: [SKILL_PROMPT_ROW] })),

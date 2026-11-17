@@ -226,7 +226,11 @@ describe('gateAttributes on a row', () => {
     tool_parameters: '{"bash_command":"git","full_command":"git push","description":"Push","git_branch":"main"}', tool_input: '{"command":"git push"}',
   }
 
-  test('with the defaults the row goes as Claude Code wrote it, byte for byte', () => {
+  test('with no settings the row keeps its metadata alone: no repository, command, description or input', () => {
+    expect(gateAttributes(resolveGate({}), 'tool_result', row)).toEqual({ 'organization.id': 'o', 'event.name': 'tool_result', tool_name: 'Bash', tool_use_id: 'toolu_1' })
+  })
+
+  test('with everything on the row goes as Claude Code wrote it, byte for byte', () => {
     const out = gateAttributes(resolveGate({}, CAPTURES_ON), 'tool_result', row)
     expect(out).toEqual(row)
     expect(out['tool_parameters']).toBe(row.tool_parameters)
@@ -324,8 +328,11 @@ describe("the plugin's own rows", () => {
     expect(gateRow(g, skill({ 'skill.text': `Use ghp_${'a'.repeat(36)}.` }))?.attributes['skill.text']).toBe('Use [REDACTED:github_token].')
   })
 
-  test("Claude Code's MCP connection row: its server's name and scope are MCP names", () => {
+  test("Claude Code's MCP connection row: its server's name and scope are MCP names, and its error the server's address", () => {
     expect(ownerOf('mcp_server_connection', 'server_name')?.id).toBe('tool.mcp')
+    expect(ownerOf('mcp_server_connection', 'error')?.id).toBe('mcp.url')
+    const failed = { server_name: 'acme', server_scope: 'user', error: 'connect ECONNREFUSED https://mcp.acme.example.com/mcp' }
+    expect(gateAttributes(resolveGate({}), 'mcp_server_connection', failed)).toEqual({ server_name: 'acme', server_scope: 'user' })
     expect(ownerOf('mcp_server_configured', 'server_url')?.id).toBe('mcp.url')
     expect(ownerOf('skill_prompt', 'skill.text')?.id).toBe('skill.text')
   })
