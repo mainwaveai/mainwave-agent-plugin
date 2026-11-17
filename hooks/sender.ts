@@ -444,7 +444,8 @@ async function readLayer($: EngineInterface, source: 'user' | 'project' | 'local
 /**
  * The data points the person opts in to, read from their own user settings into the gate (gate.ts, `setOptIn`): once per load, and
  * again before each send, so a data point taken off the list stops going out from records already queued. A layer that cannot be read
- * opts in to nothing.
+ * opts in to nothing. A batch sent again under its idempotency key goes through the gate as it is then, as with any setting: the
+ * collector keeps the copy it took first.
  */
 export async function readOptIn($: EngineInterface): Promise<void> {
   try {

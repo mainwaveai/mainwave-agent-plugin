@@ -322,12 +322,15 @@ describe("the MCP servers set up, and each skill's text: data points no Claude C
     expect(ofEvent(posts, 'mcp_server_configured')).toEqual([])
     expect(ofEvent(posts, 'skill_prompt')).toEqual([])
     expect(reads).toEqual([])
+    // Nothing went by the opt-in, so nothing says it did.
+    expect(posts.map(p => p.body).join('\n')).not.toContain('mainwave.telemetry.opt_in')
   })
 
   test('opted in to, where the organization set MCP names off: no server is sent', keyless, async ($, on) => {
     const { posts, reads } = await run($, on, { 'tool.mcp': 'off' }, undefined, undefined, { user: optInOption(['mcp.url']) })
     expect(ofEvent(posts, 'mcp_server_configured')).toEqual([])
     expect(reads).toEqual([])
+    expect(posts.map(p => p.body).join('\n')).not.toContain('mainwave.telemetry.opt_in')
   })
 })
 
@@ -377,6 +380,27 @@ describe("the person's opt-in, in their own user settings", () => {
     const posts = await session($, on, { layers: { user: 'reject' } })
     expect(rowsOf(posts).find(r => r['event.name'] === 'user_prompt')!['prompt']).toBe('ship it')
     expect(thinkingOf(posts)).toBeUndefined()
+  })
+
+  test("a session that sets responses (or prompts) to 0 gets no thinking by opt-in: thinking is the model's output too", keyless, async ($, on) => {
+    const posts = await session($, on, { env: { OTEL_LOG_USER_PROMPTS: '0' }, layers: { user: optInOption(['response.thinking']) } })
+    expect(thinkingOf(posts)).toBeUndefined()
+    expect(posts.map(p => p.body).join('\n')).not.toContain('Commit first.')
+    expect(posts.map(p => p.body).join('\n')).not.toContain('mainwave.telemetry.opt_in')
+  })
+
+  test('a stamp already on a row Claude Code raises is not taken for the opt-in: removed, and the copy carries only its own', keyless, async ($, on) => {
+    const layers: Layers = {}
+    const { posts, rig } = world(on, {}, undefined, undefined, layers)
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await row($, 'user_prompt', { prompt: 'one', prompt_length: '3', 'mainwave.telemetry.opt_in': 'response.thinking' })
+    layers.user = optInOption(['skill.text'])
+    await row($, 'user_prompt', { prompt: 'two', prompt_length: '3', 'mainwave.telemetry.opt_in': 'mcp.url,response.thinking' })
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    for (const r of rig.rows) expect(r.attributes['mainwave.telemetry.opt_in']).toBeUndefined()
+    // Sent under the opt-in read last, before the send: each copy says what that one turned on.
+    const prompts = rowsOf(posts).filter(r => r['event.name'] === 'user_prompt')
+    expect(prompts.map(r => r['mainwave.telemetry.opt_in'])).toEqual(['skill.text', 'skill.text'])
   })
 
   test("an organization's explicit off stays off", keyless, async ($, on) => {

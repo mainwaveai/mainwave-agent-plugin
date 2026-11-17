@@ -9,8 +9,8 @@
 // sets to `0` (`false`, `no`, `off`) turns the data points it governs to `claude`, so an admin who turned a capture off in Mainwave's
 // org-wide setup keeps that choice. The person can opt in to data points still at a default of `off` (`setOptIn`, from their own user
 // settings): each turns `on`. An explicit setting for a data point (`setOverrides`, for organization settings) wins over all three,
-// and the opt-in never raises a data point a switch at `0` governs. It only adds: it never turns anything off. Required data points are
-// always sent.
+// and the opt-in never raises a data point a switch at `0` governs (thinking counts as governed by the responses' switch, for this).
+// It only adds: it never turns anything off. Required data points are always sent.
 //
 // Whatever the gate says, every identifier and content value goes through the always-on protections (protect.ts) before it is queued.
 
@@ -27,18 +27,26 @@ export type Gate = { settings: ReadonlyMap<DataPointId, Setting | 'required'>; l
 export type Overrides = Partial<Record<DataPointId, Setting>>
 
 
+/**
+ * For the opt-in alone, the switch a data point with none of its own follows: thinking is the model's output, as its responses are, so
+ * a session that turned responses off (`OTEL_LOG_ASSISTANT_RESPONSES`, else `OTEL_LOG_USER_PROMPTS`) gets no thinking by opt-in. An
+ * explicit setting for it is unchanged.
+ */
+const OPT_IN_SWITCH: Readonly<Partial<Record<DataPointId, Switch>>> = { 'response.thinking': 'OTEL_LOG_ASSISTANT_RESPONSES' }
+
 /** Whether a switch's value turns it off, as Claude Code reads a false value. */
 export const switchedOff = (raw: string | undefined): boolean => ['0', 'false', 'no', 'off'].includes((raw ?? '').trim().toLowerCase())
 
 /**
  * The settings in force, in this order: an explicit setting; else, where the session's environment switched the data point's switch
  * off, `claude` for one on by default (one off by default stays off); else `on` for one off by default that the person opted in to;
- * else the default.
+ * else the default. `optedIn` lists those the opt-in turned on that can go somewhere: not one the data point it adds detail to keeps
+ * from going.
  */
 export function resolveGate(env: Readonly<Partial<Record<Switch, string | undefined>>>, overrides: Overrides = {}, limit = CONTENT_MAX_LENGTH, optIn: Iterable<DataPointId> = []): Gate {
   const settings = new Map<DataPointId, Setting | 'required'>()
   const wanted = new Set(optIn)
-  const optedIn: DataPointId[] = []
+  const raised: DataPointId[] = []
   const value = (s: Switch) => (s === 'OTEL_LOG_ASSISTANT_RESPONSES' ? env.OTEL_LOG_ASSISTANT_RESPONSES ?? env.OTEL_LOG_USER_PROMPTS : env[s])
   for (const d of CATALOG) {
     if (d.required) {
@@ -48,14 +56,16 @@ export function resolveGate(env: Readonly<Partial<Record<Switch, string | undefi
     const explicit = overrides[d.id]
     const byDefault = DEFAULTS[d.id as keyof typeof DEFAULTS]
     const switched = d.switch !== undefined && switchedOff(value(d.switch))
+    const follows = OPT_IN_SWITCH[d.id]
     if (explicit !== undefined) settings.set(d.id, explicit)
     else if (switched) settings.set(d.id, byDefault === 'on' ? 'claude' : byDefault)
-    else if (byDefault === 'off' && wanted.has(d.id)) {
+    else if (byDefault === 'off' && wanted.has(d.id) && !(follows !== undefined && switchedOff(value(follows)))) {
       settings.set(d.id, 'on')
-      optedIn.push(d.id)
+      raised.push(d.id)
     } else settings.set(d.id, byDefault)
   }
-  return { settings, limit, optedIn }
+  const gate: Gate = { settings, limit, optedIn: [] }
+  return { ...gate, optedIn: raised.filter(id => allows(gate, id, false)) }
 }
 
 /**

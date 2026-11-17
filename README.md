@@ -256,14 +256,14 @@ Only the person's own settings count. If a repository's settings (`.claude/setti
 The value is a list of IDs, or one string of IDs separated by commas or spaces. The limits:
 
 - **It only adds.** Each listed data point that is at its default of off turns on. Listing one that is already on changes nothing, and nothing in the list turns anything off.
-- **An explicit setting wins.** A data point an admin or the organization set to off stays off, whatever you list. So does one a switch the session's environment sets to `0` governs: Mainwave's org-wide setup writes `0` when an admin turns a capture off.
+- **An explicit setting wins.** A data point an admin or the organization set to off stays off, whatever you list. So does one a switch the session's environment sets to `0` governs: Mainwave's org-wide setup writes `0` when an admin turns a capture off. Thinking is the model's output, so for this it follows the responses' switch: with `OTEL_LOG_ASSISTANT_RESPONSES` (else `OTEL_LOG_USER_PROMPTS`) at `0`, listing `response.thinking` sends no thinking.
 - **The nesting rules hold.** `mcp.url` goes only where `tool.mcp` does, and `skill.text` only where `skill.name` does (a skill's text with arguments, only where `prompt.text` does too). Both of those follow `OTEL_LOG_TOOL_DETAILS`, so with that set to `0` neither goes anywhere.
 - **Only your user settings count.** The plugin reads the list from them alone. A repository's settings (`.claude/settings.json`, `.claude/settings.local.json`), `--settings` and managed settings are ignored, so a repository can never raise what the plugin sends.
 - **A mistake is ignored.** Unknown IDs, required data points and values of another type are ignored, and the plugin goes on as without them. User settings that can't be read opt in to nothing.
-- **Read again before each send.** The plugin reads the list when it loads and again before each batch it sends, so a data point you take off the list stops going out, from records already queued too.
-- **Mainwave can see it.** Every log row and span the plugin sends while your list turns something on carries `mainwave.telemetry.opt_in`, listing those data points (`mcp.url,response.thinking`), so an admin can tell why that data is there. It changes only the plugin's copy: Claude Code's exporter sends what its switches say, and its rows carry no such stamp.
+- **Read again before each send.** The plugin reads the list when it loads and again before each batch it sends, so a data point you take off the list stops going out, from records already queued too. One you add starts by the next session at the latest: the MCP servers are read as a session starts.
+- **Mainwave can see it.** Every log row and span the plugin sends while your list turns something on carries `mainwave.telemetry.opt_in`, listing those data points (`mcp.url,response.thinking`), so an admin can tell why that data is there. A data point the rules above keep from going anywhere is not listed. It changes only the plugin's copy: Claude Code's exporter sends what its switches say, and its rows carry no such stamp.
 
-`extraDataPoints` is not declared as a plugin option, so `/config` doesn't show it and `claude plugin configure` doesn't set it: Claude Code refuses to load a plugin whose declared option holds a value of the wrong type, and a mistake here must never stop the plugin.
+`extraDataPoints` is not declared as a plugin option, so `/config` doesn't show it and `claude plugin configure` doesn't set it (setting `devIngestKey` with it leaves the list in place): Claude Code refuses to load a plugin whose declared option holds a value of the wrong type, and a mistake here must never stop the plugin.
 
 ## Developing
 

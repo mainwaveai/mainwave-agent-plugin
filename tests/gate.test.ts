@@ -112,6 +112,24 @@ describe("the person's opt-in", () => {
     expect(g.optedIn).toEqual([])
   })
 
+  test("thinking follows the responses' switch for the opt-in: a session that turned responses off gets none, unless set explicitly", () => {
+    const asked = ['response.thinking'] as const
+    expect(resolveGate({ OTEL_LOG_ASSISTANT_RESPONSES: '0' }, {}, undefined, asked).settings.get('response.thinking')).toBe('off')
+    // Responses follow prompts when their own switch is unset, as in Claude Code.
+    expect(resolveGate({ OTEL_LOG_USER_PROMPTS: '0' }, {}, undefined, asked).settings.get('response.thinking')).toBe('off')
+    expect(resolveGate({ OTEL_LOG_USER_PROMPTS: '0', OTEL_LOG_ASSISTANT_RESPONSES: '1' }, {}, undefined, asked).settings.get('response.thinking')).toBe('on')
+    expect(resolveGate({ OTEL_LOG_TOOL_DETAILS: '0' }, {}, undefined, asked).settings.get('response.thinking')).toBe('on')
+    expect(resolveGate({ OTEL_LOG_ASSISTANT_RESPONSES: '0' }, { 'response.thinking': 'on' }).settings.get('response.thinking')).toBe('on')
+    expect(resolveGate({ OTEL_LOG_ASSISTANT_RESPONSES: '0' }, {}, undefined, asked).optedIn).toEqual([])
+  })
+
+  test('the stamp names only what the opt-in lets go somewhere: not one the data point it adds detail to keeps back', () => {
+    const all = ['mcp.url', 'skill.text', 'response.thinking'] as const
+    expect(resolveGate({ OTEL_LOG_TOOL_DETAILS: '0' }, {}, undefined, all).optedIn).toEqual(['response.thinking'])
+    expect(resolveGate({}, { 'tool.mcp': 'off' }, undefined, all).optedIn).toEqual(['skill.text', 'response.thinking'])
+    expect(resolveGate({}, { 'skill.name': 'claude' }, undefined, all).optedIn).toEqual(['mcp.url', 'response.thinking'])
+  })
+
   test('a switch the session sets to 0 keeps what it governs as Claude Code sends it, opt-in or not', () => {
     const g = resolveGate({ OTEL_LOG_TOOL_DETAILS: '0' }, {}, undefined, ['bash.command', 'mcp.url', 'skill.text'])
     expect(g.settings.get('bash.command')).toBe('claude')

@@ -6,7 +6,7 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
 import { whoHash } from '../hooks/sender.ts'
-import { boot, EMAIL, IDEMPOTENCY_KEY, itemAttributes, KEY, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, type KeylessAnswer, type Layers, type Post, type Reply } from './rig.ts'
+import { boot, EMAIL, IDEMPOTENCY_KEY, itemAttributes, KEY, keylessAnswer, LOGGED_AT, memoryStore, network, optInOption, ORG, type KeylessAnswer, type Layers, type Post, type Reply } from './rig.ts'
 
 /** No options: the plugin's defaults, so no key, so keyless. */
 const keyless = { options: {} }
@@ -79,6 +79,12 @@ async function turn($: Engine) {
 const keptRow = (org: string, email: string, seq: number) => ({ s: 'logs', r: 0, d: { event: 'api_request', loggedAt: LOGGED_AT, attributes: { 'organization.id': org, 'user.email': email, 'session.id': 's-0', 'event.name': 'api_request', 'event.sequence': seq } } })
 /** An outbox an earlier session left a minute and more ago, so this session takes it over. */
 const leftBehind = (items: unknown[]) => ({ v: 2, updatedAt: START - 120_000, resources: [JSON.stringify({ 'service.name': 'claude-code' })], items })
+
+/** A request's span an outbox keeps, with its thinking, as a load whose gate let thinking go queued it. */
+const keptThinking = () => ({
+  s: 'traces', r: 0,
+  d: { name: 'claude_code.llm_request', traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), startMs: START - 200_000, endMs: START - 199_000, attributes: { 'organization.id': ORG, 'user.email': EMAIL, 'session.id': 's-0', 'response.thinking': 'An earlier thought.' } },
+})
 
 const sequencesOf = (post: Post) => itemAttributes(post).map(a => Number(Object.values(a.find(kv => kv.key === 'event.sequence')?.value ?? {})[0]))
 const emailsOf = (post: Post) => [...new Set(itemAttributes(post).map(a => a.find(kv => kv.key === 'user.email')?.value['stringValue']))]
@@ -175,6 +181,27 @@ describe('a session without the env block, sending keyless', () => {
     expect(posts.length).toBe(1)
     expect(lastOutbox(store.sets)!.items.map(i => i.d.attributes['prompt'])).toEqual(['one'])
     expect(logs.join('')).toContain('20 held back')
+  })
+
+  test("records an earlier session kept go through this load's opt-in: thinking goes, and says so, only while the person opts in to it", keyless, async ($, on) => {
+    const { clock, posts } = world(on, { store: { 'outbox:old': leftBehind([keptThinking()]) }, layers: { user: optInOption(['response.thinking']) } })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await row($, 'user_prompt', { prompt: 'go', prompt_length: '2' })
+    await clock.advance(TICK)
+    const traces = posts.filter(p => PATH(p.url) === '/v1/traces').map(p => p.body).join('')
+    expect(traces).toContain('An earlier thought.')
+    expect(traces).toContain('mainwave.telemetry.opt_in')
+  })
+
+  test('records an earlier session kept lose what this load does not opt in to', keyless, async ($, on) => {
+    const { clock, posts } = world(on, { store: { 'outbox:old': leftBehind([keptThinking()]) } })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await row($, 'user_prompt', { prompt: 'go', prompt_length: '2' })
+    await clock.advance(TICK)
+    const traces = posts.filter(p => PATH(p.url) === '/v1/traces').map(p => p.body)
+    expect(traces.length).toBeGreaterThan(0)
+    expect(traces.join('')).not.toContain('An earlier thought.')
+    expect(traces.join('')).not.toContain('mainwave.telemetry.opt_in')
   })
 
   test('a session with no outbox to take over reads no settings for it', keyless, async ($, on) => {
