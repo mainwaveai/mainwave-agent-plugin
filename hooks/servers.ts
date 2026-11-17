@@ -13,15 +13,34 @@
 // A claude.ai connector, a server the host app provides and one set with `--mcp-config` are in none of these: the plugin sends such a
 // server's name and scope when a call first names it.
 //
-// Only each server's name, transport and address are read: never its headers, environment or anything else in these files. A remote
-// server's address keeps scheme, host, port and path, and drops any user name, password, query and fragment; a local server's is its
-// command and arguments, which the always-on protections then scrub of secrets.
+// Only each server's name, transport and address are read, and the lists that say which project servers are approved or denied:
+// never its headers, environment or anything else in these files. A remote server's address keeps scheme, host, port and path, and
+// drops any user name, password, query and fragment (a token in the path stays, as the spec keeps the path); a local server's is its
+// command and arguments, the value after a flag that names a secret, a header or an environment variable replaced here, and the
+// always-on protections then scrub the rest of secrets.
+//
+// A project server goes only where Claude Code would load it: approved (`enableAllProjectMcpServers`, `enabledMcpjsonServers`) and
+// not refused (`disabledMcpjsonServers`), as the settings or the project's entry in the global config say. A server whose name an
+// organization's `deniedMcpServers` lists goes nowhere.
 
 /** One MCP server set up for the session. */
 export type McpServer = { name: string; scope: string; transport?: string; address?: string }
 
-/** The managed settings folders, by OS, as Claude Code names them. */
-export const MANAGED_DIRS = ['/Library/Application Support/ClaudeCode', '/etc/claude-code', 'C:\\Program Files\\ClaudeCode'] as const
+/** The managed settings folders, as Claude Code names them: macOS and Linux (each needs an administrator to create), and Windows. */
+export const MANAGED_DIRS_POSIX = ['/Library/Application Support/ClaudeCode', '/etc/claude-code'] as const
+export const MANAGED_DIR_WINDOWS = 'C:\\Program Files\\ClaudeCode'
+
+/** Whether a home folder is a Windows one (`C:\\Users\\ana`): only that OS's managed folder is read, never another's. */
+export const isWindowsPath = (path: string): boolean => /^[A-Za-z]:[\\/]/.test(path)
+
+/**
+ * The managed folders to read on the OS the environment says (`USERPROFILE` is Windows'): absolute paths of that OS alone, so a
+ * file a repository names like another OS's path is never read as one.
+ */
+export function managedDirs(home: string | undefined, profile: string | undefined): readonly string[] {
+  if ((profile !== undefined && isWindowsPath(profile)) || (home !== undefined && isWindowsPath(home))) return [MANAGED_DIR_WINDOWS]
+  return home !== undefined && home.startsWith('/') ? MANAGED_DIRS_POSIX : []
+}
 
 /** Where Claude Desktop keeps its config, under the home folder (macOS, Linux) or `APPDATA` (Windows). */
 export const DESKTOP_UNDER_HOME = [['Library', 'Application Support', 'Claude', 'claude_desktop_config.json'], ['.config', 'Claude', 'claude_desktop_config.json']] as const
@@ -64,10 +83,30 @@ export function foldersUp(root: string): string[] {
   return out
 }
 
-/** A remote server's address: scheme, host, port and path, without a user name, password, query or fragment. */
+/** A remote server's address: scheme, host, port and path, without a user name, password (to the last `@`), query or fragment. */
 export function remoteAddress(raw: string): string | undefined {
-  const m = /^([a-z][a-z0-9+.-]{0,31}:\/\/)(?:[^/?#@]{0,1024}@)?([^?#]{0,4096})/i.exec(raw.trim())
-  return m ? `${m[1]}${m[2]}` : undefined
+  const m = /^([a-z][a-z0-9+.-]{0,31}:\/\/)([^/?#]{0,4096})([^?#]{0,4096})/i.exec(raw.trim())
+  if (!m) return undefined
+  const at = m[2]!.lastIndexOf('@')
+  return `${m[1]}${at < 0 ? m[2] : m[2]!.slice(at + 1)}${m[3]}`
+}
+
+/** A flag whose next argument is a secret, a header or an environment variable: `--api-key x`, `-H "X-Auth: x"`, `-e TOKEN=x`. */
+const SECRET_FLAG = /^--?[A-Za-z0-9_.-]{0,64}(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|auth|credential|key)$/i
+const VALUE_FLAG = /^(?:-H|--header|-e|--env)$/
+
+/** A local server's command and arguments, each value a flag names as secret, a header or an environment variable replaced. */
+export function localAddress(command: string, args: readonly string[]): string {
+  const out = [command]
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i]!
+    out.push(arg)
+    if ((SECRET_FLAG.test(arg) || VALUE_FLAG.test(arg)) && i + 1 < args.length) {
+      out.push(VALUE_FLAG.test(arg) ? '[REDACTED:header_or_env]' : '[REDACTED:assigned_secret]')
+      i += 1
+    }
+  }
+  return out.join(' ')
 }
 
 /** One server's entry as a config file holds it, read for its transport and address alone. */
@@ -77,7 +116,7 @@ export function serverOf(name: string, scope: string, config: unknown): McpServe
   const command = typeof config['command'] === 'string' ? config['command'] : undefined
   const type = typeof config['type'] === 'string' ? config['type'] : url !== undefined ? 'http' : command !== undefined ? 'stdio' : undefined
   const args = Array.isArray(config['args']) ? config['args'].filter((a): a is string => typeof a === 'string') : []
-  const address = url !== undefined ? remoteAddress(url) : command !== undefined ? [command, ...args].join(' ') : undefined
+  const address = url !== undefined ? remoteAddress(url) : command !== undefined ? localAddress(command, args) : undefined
   return { name, scope, ...(type !== undefined ? { transport: type } : {}), ...(address !== undefined ? { address } : {}) }
 }
 
@@ -97,13 +136,40 @@ export function parse(text: string | undefined): unknown {
   }
 }
 
+/** The project's entry in Claude Code's global config, keyed by its folder as Claude Code writes it (forward slashes on Windows too). */
+export function projectEntry(json: unknown, root: string | undefined): Record<string, unknown> | undefined {
+  if (!isObject(json) || root === undefined || !isObject(json['projects'])) return undefined
+  const projects = json['projects']
+  for (const key of [root, root.replace(/\\/g, '/')]) if (isObject(projects[key])) return projects[key] as Record<string, unknown>
+  return undefined
+}
+
 /** Claude Code's global config: the user's servers, and the local ones of the project at `root`. */
 export function globalServers(json: unknown, root: string | undefined): { user: McpServer[]; local: McpServer[] } {
   if (!isObject(json)) return { user: [], local: [] }
-  const projects = json['projects']
-  const local = root !== undefined && isObject(projects) && isObject(projects[root]) ? (projects[root] as Record<string, unknown>)['mcpServers'] : undefined
-  return { user: serversIn(json['mcpServers'], 'user'), local: serversIn(local, 'local') }
+  return { user: serversIn(json['mcpServers'], 'user'), local: serversIn(projectEntry(json, root)?.['mcpServers'], 'local') }
 }
+
+/** Which of a project's `.mcp.json` servers load, as the settings and the project's entry in the global config say. */
+export type Approvals = { all: boolean; enabled: ReadonlySet<string>; disabled: ReadonlySet<string>; denied: ReadonlySet<string> }
+
+const names = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
+
+/** The approvals from the merged settings and the project's entry; `deniedMcpServers` by server name. */
+export function approvalsOf(settings: unknown, project: Record<string, unknown> | undefined): Approvals {
+  const s = isObject(settings) ? settings : {}
+  const p = project ?? {}
+  const denied = Array.isArray(s['deniedMcpServers']) ? s['deniedMcpServers'].flatMap(d => (isObject(d) && typeof d['serverName'] === 'string' ? [d['serverName']] : [])) : []
+  return {
+    all: s['enableAllProjectMcpServers'] === true || p['enableAllProjectMcpServers'] === true,
+    enabled: new Set([...names(s['enabledMcpjsonServers']), ...names(p['enabledMcpjsonServers'])]),
+    disabled: new Set([...names(s['disabledMcpjsonServers']), ...names(p['disabledMcpjsonServers'])]),
+    denied: new Set(denied),
+  }
+}
+
+/** A project server Claude Code would load: approved, and not refused. */
+export const approved = (a: Approvals, name: string): boolean => !a.disabled.has(name) && (a.all || a.enabled.has(name))
 
 /** A file that holds `{ mcpServers }`: `.mcp.json`, `managed-mcp.json`, Claude Desktop's config. */
 export const fileServers = (json: unknown, scope: string): McpServer[] => (isObject(json) ? serversIn(json['mcpServers'], scope) : [])
@@ -123,12 +189,23 @@ export function enabledPlugins(installed: unknown, enabled: unknown): { name: st
   return out
 }
 
-/** A plugin's servers, from its `.mcp.json` and its manifest's `mcpServers`, named as Claude Code names them: `plugin:<plugin>:<server>`. */
-export function pluginServers(plugin: string, mcpJson: unknown, manifest: unknown): McpServer[] {
+/** The files a plugin's manifest names for its servers (`mcpServers` as a path, or a list of paths), relative to the plugin. */
+export function manifestServerFiles(manifest: unknown): string[] {
+  const v = isObject(manifest) ? manifest['mcpServers'] : undefined
+  const list = typeof v === 'string' ? [v] : Array.isArray(v) ? v : []
+  return list.filter((x): x is string => typeof x === 'string' && x !== '' && !x.split(/[\\/]/).includes('..')).slice(0, 8)
+}
+
+/**
+ * A plugin's servers, from its `.mcp.json`, its manifest's `mcpServers` (written inline, or in the files it names, read in `files`),
+ * named as Claude Code names them: `plugin:<plugin>:<server>`.
+ */
+export function pluginServers(plugin: string, mcpJson: unknown, manifest: unknown, files: readonly unknown[] = []): McpServer[] {
   const name = (key: string) => `plugin:${plugin}:${key}`
-  const fromFile = isObject(mcpJson) ? serversIn(isObject(mcpJson['mcpServers']) ? mcpJson['mcpServers'] : mcpJson, 'plugin', name) : []
-  const fromManifest = isObject(manifest) ? serversIn(manifest['mcpServers'], 'plugin', name) : []
-  return [...fromFile, ...fromManifest]
+  const fromFile = (json: unknown) => (isObject(json) ? serversIn(isObject(json['mcpServers']) ? json['mcpServers'] : json, 'plugin', name) : [])
+  const inline = isObject(manifest) ? manifest['mcpServers'] : undefined
+  const fromList = Array.isArray(inline) ? inline.flatMap(x => fromFile(x)) : []
+  return [...fromFile(mcpJson), ...serversIn(inline, 'plugin', name), ...fromList, ...files.flatMap(fromFile)]
 }
 
 /** A server's name as an MCP tool's name spells it (`mcp__<server>__<tool>`): what a call is matched to its server by. */

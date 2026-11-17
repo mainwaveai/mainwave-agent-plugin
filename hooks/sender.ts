@@ -289,34 +289,35 @@ function dropOldest(): void {
 
 /**
  * Queues one record. Called from the hooks: it waits on nothing but the resource, read once per load, and starts the timer if none
- * runs (after a /clear the session goes on without a `session.start`).
+ * runs (after a /clear the session goes on without a `session.start`). Answers whether it was queued.
  */
-export async function enqueue($: EngineInterface, item: Item): Promise<void> {
-  if (!isCopying()) return
+export async function enqueue($: EngineInterface, item: Item): Promise<boolean> {
+  if (!isCopying()) return false
   // Without a key, a record that names no organization and email has nowhere to go: it is held back, never queued.
   const who = mode === 'keyless' ? whoOf(item.d) : undefined
   if (mode === 'keyless' && who === undefined) {
     counts.withheld += 1
-    return
+    return false
   }
   // An organization and email keyless ingest refused this load: what is queued for it is kept, but nothing more is added, so a
   // session whose organization nobody has claimed does not grow and rewrite its outbox for nothing. A later load tries again.
   if (who !== undefined && refusedWho.has(who)) {
     counts.withheld += 1
-    return
+    return false
   }
   resource ??= readResource($)
   const res = await resource
   const size = JSON.stringify(item.d).length
   if (size > BATCH_BYTES) {
     counts.dropped += 1
-    return
+    return false
   }
   queue.push({ ...item, resource: res, size, ...(who !== undefined ? { who } : {}) } as Queued)
   queuedBytes += size
   dirty = true
   dropOldest()
   ensureTimer($)
+  return true
 }
 
 /** Starts the send timer if it is not running. */

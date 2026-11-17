@@ -2,13 +2,24 @@
 
 import { describe, expect, test } from 'claude-code/testing'
 
-import { distinct, enabledPlugins, fileServers, foldersUp, globalServers, join, pluginServers, remoteAddress, serverOf, toolSpelling } from '../hooks/servers.ts'
+import {
+  approvalsOf, approved, distinct, enabledPlugins, fileServers, foldersUp, globalServers, join, localAddress, managedDirs, manifestServerFiles, pluginServers, projectEntry, remoteAddress, serverOf, toolSpelling,
+} from '../hooks/servers.ts'
 
 describe('addresses', () => {
   test('a remote server keeps scheme, host, port and path; never a user name, password, query or fragment', () => {
     expect(remoteAddress('https://ana:hunter2@mcp.example.com:8443/v1/mcp?key=abc#top')).toBe('https://mcp.example.com:8443/v1/mcp')
     expect(remoteAddress('https://${MCP_HOST}/mcp')).toBe('https://${MCP_HOST}/mcp')
     expect(remoteAddress('not a url')).toBeUndefined()
+    // A password with an `@` in it: all of it goes, to the last `@` before the path.
+    expect(remoteAddress('https://ana:p@ss@mcp.example.com/mcp')).toBe('https://mcp.example.com/mcp')
+  })
+
+  test('a value a flag names as a secret, a header or an environment variable is replaced, the flag kept', () => {
+    expect(localAddress('npx', ['mcp-remote', 'https://x.example.com', '--api-key', 'sk_live_1', '--access-token', 'abc', '-H', 'X-Auth: abc', '-e', 'FOO=bar', '--verbose'])).toBe(
+      'npx mcp-remote https://x.example.com --api-key [REDACTED:assigned_secret] --access-token [REDACTED:assigned_secret] -H [REDACTED:header_or_env] -e [REDACTED:header_or_env] --verbose',
+    )
+    expect(localAddress('server', ['--token'])).toBe('server --token')
   })
 
   test('a local server is its command and arguments; its environment and headers are never read', () => {
@@ -28,6 +39,20 @@ describe('where they are kept', () => {
     expect(globalServers('nope', '/p')).toEqual({ user: [], local: [] })
   })
 
+  test("the managed folder of the session's OS alone, as an absolute path", () => {
+    expect(managedDirs('/home/ana', undefined)).toEqual(['/Library/Application Support/ClaudeCode', '/etc/claude-code'])
+    expect(managedDirs('/c/Users/ana', 'C:\\Users\\ana')).toEqual(['C:\\Program Files\\ClaudeCode'])
+    expect(managedDirs(undefined, undefined)).toEqual([])
+  })
+
+  test("a project's servers load where approved and not refused; the project's entry is found under Windows paths too", () => {
+    const json = { projects: { 'C:/Users/ana/api': { enabledMcpjsonServers: ['a'], disabledMcpjsonServers: ['b'] } } }
+    const a = approvalsOf({ enabledMcpjsonServers: ['b', 'c'], deniedMcpServers: [{ serverName: 'x' }, { serverUrl: 'https://y' }] }, projectEntry(json, 'C:\\Users\\ana\\api'))
+    expect(['a', 'b', 'c', 'd'].map(n => approved(a, n))).toEqual([true, false, true, false])
+    expect([...a.denied]).toEqual(['x'])
+    expect(approved(approvalsOf({ enableAllProjectMcpServers: true }, undefined), 'd')).toBe(true)
+  })
+
   test('.mcp.json in the project root and each folder above it, nearest first, on any OS', () => {
     expect(foldersUp('/home/ana/api')).toEqual(['/home/ana/api', '/home/ana', '/home', '/'])
     expect(foldersUp('C:\\Users\\ana\\api')).toEqual(['C:\\Users\\ana\\api', 'C:\\Users\\ana', 'C:\\Users', 'C:\\'])
@@ -42,8 +67,9 @@ describe('where they are kept', () => {
     expect(pluginServers('tools', { mcpServers: { db: { command: 'db' } } }, { mcpServers: { web: { url: 'https://w.example.com' } } }).map(s => [s.name, s.scope])).toEqual([
       ['plugin:tools:db', 'plugin'], ['plugin:tools:web', 'plugin'],
     ])
-    // A manifest that names a file for its servers names no server itself.
-    expect(pluginServers('tools', undefined, { mcpServers: './mcp.json' })).toEqual([])
+    // A manifest that names files for its servers: those files, read beside it; never one outside the plugin.
+    expect(manifestServerFiles({ mcpServers: ['./a.json', '../b.json', 3] })).toEqual(['./a.json'])
+    expect(pluginServers('tools', undefined, { mcpServers: './a.json' }, [{ mcpServers: { s: { command: 's' } } }]).map(s => s.name)).toEqual(['plugin:tools:s'])
   })
 
   test("one row per name, the nearest setting's; a name as a tool's name spells it", () => {

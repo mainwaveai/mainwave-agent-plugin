@@ -31,7 +31,8 @@ import {
 import { contentLimit } from './protect.ts'
 import { adopt, configure, enqueue, ensureTimer, finish, isCopying, keyMalformed, snapshot } from './sender.ts'
 import {
-  DESKTOP_UNDER_APPDATA, DESKTOP_UNDER_HOME, distinct, enabledPlugins, fileServers, foldersUp, globalServers, join, MANAGED_DIRS, MAX_PLUGINS, parse, pluginServers, serverAttributes, toolSpelling, type McpServer,
+  approvalsOf, approved, DESKTOP_UNDER_APPDATA, DESKTOP_UNDER_HOME, distinct, enabledPlugins, fileServers, foldersUp, globalServers, join, managedDirs, manifestServerFiles, MAX_PLUGINS, parse,
+  pluginServers, projectEntry, serverAttributes, toolSpelling, type Approvals, type McpServer,
 } from './servers.ts'
 import { applyStamps, entrypointOf, filterStamps, PLUGIN_NAME, stripOwned } from './stamps.ts'
 import { VERSION } from './version.ts'
@@ -81,21 +82,27 @@ let gateRead: Promise<void> | null = null
 let capture: Capture = newCapture()
 /** The plugin's own rows, waiting for the session's identity (`r.common`). */
 let own: OwnRow[] = []
+/** The session a /clear or resume ended: the own rows of the session that follows wait for a row of its own, not this one's. */
+let endedSession: TelemetryAttribute | undefined
 /** The MCP servers sent this session, as a tool's name spells them; and the reading of Claude's MCP settings, once started. */
 let serversSent = new Set<string>()
 let serversRead: Promise<void> | null = null
-/** Each skill text sent this session, and its ID; how many skill runs given arguments are running; the arguments seen lately. */
-let skillTexts = new Map<string, string>()
+/** Each skill text's ID this session, and the texts queued with their text; the arguments given to runs not yet expanded. */
+let textIds = new Map<string, string>()
+let textsSent = new Set<string>()
 let argsInFlight = 0
+let pendingArgs = new Map<string, number>()
 let recentArgs: { text: string; atMs: number }[] = []
 
-type OwnRow = { event: string; atMs: number; attributes: Record<string, TelemetryAttribute> }
+/** One of the plugin's own rows; `text`, for a skill's row, the text it carries, marked sent once the row is queued. */
+type OwnRow = { event: string; atMs: number; attributes: Record<string, TelemetryAttribute>; text?: string }
 
-/** How many own rows wait at most; how many skill texts are remembered; how long, and how many, arguments are remembered. */
+/** How many own rows wait at most; how many skill texts keep their ID; how long, and how many, arguments are remembered. */
 const MAX_OWN = 1_000
 const MAX_SKILL_TEXTS = 200
 const ARGS_MS = 60_000
 const MAX_ARGS = 20
+const MAX_PENDING = 50
 
 /** `CLAUDE_CODE_ENTRYPOINT`, normalized; `other` when it cannot be read. */
 async function readEntrypoint($: EngineInterface): Promise<string> {
@@ -279,23 +286,29 @@ async function collectNow($: EngineInterface): Promise<void> {
   }
 }
 
-/** Queues the plugin's own rows that wait, once a row of Claude Code's has said who the session is; until then they wait on. */
+/**
+ * Queues the plugin's own rows that wait, once a row of Claude Code's has said who the session is (after a /clear, a row of the
+ * session that follows); until then they wait on. Taken one at a time, so a fault loses one row at most.
+ */
 async function flushOwn($: EngineInterface): Promise<void> {
   if (own.length === 0 || !isCopying()) return
   const r = await rebuildOf($)
   if (r === null || Object.keys(r.common).length === 0) return
+  if (endedSession !== undefined && r.common['session.id'] === endedSession) return
+  endedSession = undefined
   const gate = await gateOf($)
   entrypoint ??= readEntrypoint($)
   const ep = await entrypoint
-  const rows = own
-  own = []
-  for (const o of rows) {
+  for (let o = own.shift(); o !== undefined; o = own.shift()) {
     const at = new Date(o.atMs).toISOString()
     const attributes = applyStamps({ ...r.common, 'event.name': o.event, 'event.timestamp': at, ...o.attributes }, {
       'mainwave.mod.name': PLUGIN_NAME, 'mainwave.mod.version': VERSION, 'mainwave.mod.entrypoint': ep, 'mainwave.telemetry.route': 'plugin',
     })
     const row = gateRow(gate, { event: o.event, loggedAt: at, attributes })
-    if (row !== null) await enqueue($, { s: 'logs', d: row })
+    if (row === null) continue
+    const queued = await enqueue($, { s: 'logs', d: row })
+    // A text counts as sent once a row carrying it is queued: until then, the next run of it carries it too.
+    if (queued && o.text !== undefined && row.attributes['skill.text'] !== undefined) textsSent.add(o.text)
   }
 }
 
@@ -316,6 +329,16 @@ async function readText($: EngineInterface, path: string): Promise<string | unde
   }
 }
 
+/** The settings merged over every source, as Claude Code reads them; `{}` when they cannot be read. */
+async function mergedSettings($: EngineInterface): Promise<Record<string, unknown>> {
+  try {
+    const v = (await $.settings.read()) as unknown
+    return v !== null && typeof v === 'object' ? (v as Record<string, unknown>) : {}
+  } catch {
+    return {}
+  }
+}
+
 /** The MCP servers set up for the session, as Claude's settings files list them (servers.ts). Reads nothing else in those files. */
 async function readServers($: EngineInterface): Promise<McpServer[]> {
   const [home, profile, appData, configDir] = await Promise.all([
@@ -323,9 +346,11 @@ async function readServers($: EngineInterface): Promise<McpServer[]> {
   ])
   const homeDir = home || profile || undefined
   const read = async (path: string) => parse(await readText($, path))
+  const settings = await mergedSettings($)
+  const notDenied = (servers: McpServer[], a: Approvals) => servers.filter(s => !a.denied.has(s.name))
   // A managed file has exclusive control: only its servers load.
-  const managed = await Promise.all(MANAGED_DIRS.map(d => read(join(d, 'managed-mcp.json'))))
-  if (managed.some(m => m !== undefined)) return distinct(managed.flatMap(m => fileServers(m, 'managed')))
+  const managed = await Promise.all(managedDirs(home || undefined, profile || undefined).map(d => read(join(d, 'managed-mcp.json'))))
+  if (managed.some(m => m !== undefined)) return distinct(notDenied(managed.flatMap(m => fileServers(m, 'managed')), approvalsOf(settings, undefined)))
   let root: string | undefined
   try {
     root = await $.session.root()
@@ -333,26 +358,26 @@ async function readServers($: EngineInterface): Promise<McpServer[]> {
     root = undefined
   }
   const base = configDir || homeDir
-  const global = globalServers(base === undefined ? undefined : await read(join(base, '.claude.json')), root)
-  const project = root === undefined ? [] : (await Promise.all(foldersUp(root).map(d => read(join(d, '.mcp.json'))))).flatMap(m => fileServers(m, 'project'))
+  const globalJson = base === undefined ? undefined : await read(join(base, '.claude.json'))
+  const global = globalServers(globalJson, root)
+  const approvals = approvalsOf(settings, projectEntry(globalJson, root))
+  const project = root === undefined ? [] : (await Promise.all(foldersUp(root).map(d => read(join(d, '.mcp.json'))))).flatMap(m => fileServers(m, 'project')).filter(s => approved(approvals, s.name))
   const claudeDir = configDir || (homeDir === undefined ? undefined : join(homeDir, '.claude'))
   let plugins: McpServer[] = []
   if (claudeDir !== undefined) {
-    let enabled: unknown
-    try {
-      enabled = await $.settings.read({ key: 'enabledPlugins' })
-    } catch {
-      enabled = undefined
-    }
-    const installed = enabledPlugins(await read(join(claudeDir, 'plugins', 'installed_plugins.json')), enabled).slice(0, MAX_PLUGINS)
-    plugins = (await Promise.all(installed.map(async p => pluginServers(p.name, await read(join(p.path, '.mcp.json')), await read(join(p.path, '.claude-plugin', 'plugin.json')))))).flat()
+    const installed = enabledPlugins(await read(join(claudeDir, 'plugins', 'installed_plugins.json')), settings['enabledPlugins']).slice(0, MAX_PLUGINS)
+    plugins = (await Promise.all(installed.map(async p => {
+      const manifest = await read(join(p.path, '.claude-plugin', 'plugin.json'))
+      const files = await Promise.all(manifestServerFiles(manifest).map(f => read(join(p.path, f))))
+      return pluginServers(p.name, await read(join(p.path, '.mcp.json')), manifest, files)
+    }))).flat()
   }
   entrypoint ??= readEntrypoint($)
   const desktopPaths = /desktop|cowork|local-agent/.test(await entrypoint)
     ? [...(homeDir === undefined ? [] : DESKTOP_UNDER_HOME.map(p => join(homeDir, ...p))), ...(appData ? [join(appData, ...DESKTOP_UNDER_APPDATA)] : [])]
     : []
   const desktop = (await Promise.all(desktopPaths.map(read))).flatMap(m => fileServers(m, 'desktop'))
-  return distinct([...global.local, ...project, ...global.user, ...plugins, ...desktop])
+  return distinct(notDenied([...global.local, ...project, ...global.user, ...plugins, ...desktop], approvals))
 }
 
 /** The rows for the MCP servers Claude's settings list, once per session, when their data point is on. */
@@ -361,6 +386,13 @@ async function noteServers($: EngineInterface): Promise<void> {
   const atMs = await $.clock.now()
   for (const s of servers) serversSent.add(toolSpelling(s.name))
   if (servers.length > 0) await queueOwn($, servers.map(s => ({ event: MCP_SERVER_ROW, atMs, attributes: serverAttributes(s) })))
+}
+
+/** Reads Claude's MCP settings for the session that is starting, beside it, when MCP server addresses are on. */
+async function startServers($: EngineInterface): Promise<void> {
+  serversSent = new Set()
+  serversRead = null
+  if (allows(await gateOf($), 'mcp.url', false)) serversRead = noteServers($).catch(() => undefined)
 }
 
 /**
@@ -379,31 +411,76 @@ async function noteCalledServer($: EngineInterface, attributes: Readonly<Record<
   await queueOwn($, [{ event: MCP_SERVER_ROW, atMs: await $.clock.now(), attributes: serverAttributes({ name: server, scope }) }])
 }
 
-/** Arguments a skill or slash command was given, kept a short while: a skill text that holds them holds words the person typed. */
-function noteArgs(text: unknown, atMs: number): boolean {
-  if (typeof text !== 'string' || text.trim() === '') return false
-  recentArgs = [...recentArgs.filter(a => atMs - a.atMs < ARGS_MS), { text: text.trim(), atMs }].slice(-MAX_ARGS)
+/** Two names for the same skill: equal, or one the other with its plugin's prefix (`tools:review`). */
+const sameSkill = (a: string, b: string) => a === b || a.endsWith(`:${b}`) || b.endsWith(`:${a}`)
+
+/**
+ * A skill or slash command run given arguments: its name is held until a skill of that name expands, whenever that is, and the
+ * arguments a short while, so a text that holds words the person typed is known for one.
+ */
+function expectArgs(name: unknown, args: unknown, atMs: number): boolean {
+  if (typeof args !== 'string' || args.trim() === '') return false
+  if (typeof name === 'string' && name !== '' && (pendingArgs.has(name) || pendingArgs.size < MAX_PENDING)) pendingArgs.set(name, (pendingArgs.get(name) ?? 0) + 1)
+  recentArgs = [...recentArgs.filter(a => atMs - a.atMs < ARGS_MS), { text: args.trim(), atMs }].slice(-MAX_ARGS)
   return true
 }
 
-/** The arguments a slash command typed as a prompt carries: what follows `/name`. */
-const slashArgs = (text: unknown): string | undefined => (typeof text === 'string' ? /^\/[^\s/]+\s+([\s\S]+)$/.exec(text)?.[1] : undefined)
+/** Takes one run given arguments of this skill, if one waits. */
+function takeArgs(skill: string): boolean {
+  for (const [name, n] of pendingArgs) {
+    if (!sameSkill(name, skill)) continue
+    if (n > 1) pendingArgs.set(name, n - 1)
+    else pendingArgs.delete(name)
+    return true
+  }
+  return false
+}
+
+/** A slash command typed as a prompt: its name and what follows it. */
+function slashCommand(text: unknown): { name: string; args: string } | undefined {
+  const m = typeof text === 'string' ? /^\/([^\s/]+)\s+([\s\S]+)$/.exec(text) : null
+  return m ? { name: m[1]!, args: m[2]! } : undefined
+}
 
 /**
- * One skill run's row: its name, where it comes from, its text's ID, and the text itself the first time it is seen this session. A
- * text with arguments filled in is sent only where prompts are (gate.ts); one held back is not remembered as sent.
+ * Whether a skill's text holds words the person typed: a run given arguments waits to expand under its name or is running, its text
+ * holds arguments given lately, or it ends with the arguments Claude Code appends to a skill that names no placeholder.
  */
-function skillRow(gate: ReturnType<typeof currentGate>, skill: string, source: string, text: string, atMs: number): OwnRow {
-  const hasArgs = argsInFlight > 0 || recentArgs.some(a => atMs - a.atMs < ARGS_MS && text.includes(a.text))
-  let id = skillTexts.get(text)
-  const first = id === undefined
-  id ??= randomHex(16)
-  if (first && skillTexts.size < MAX_SKILL_TEXTS && (!hasArgs || allows(gate, 'prompt.text', false))) skillTexts.set(text, id)
+function holdsArgs(skill: string, text: string, atMs: number): boolean {
+  const waited = takeArgs(skill)
+  return waited || argsInFlight > 0 || /\nARGUMENTS: \S/.test(text) || recentArgs.some(a => atMs - a.atMs < ARGS_MS && text.includes(a.text))
+}
+
+/**
+ * One skill run's row: its name, where it comes from, its text's ID, and the text itself until a row carrying it is queued this
+ * session. A text with arguments filled in is sent only where prompts are (gate.ts).
+ */
+function skillRow(skill: string, source: string, text: string, atMs: number): OwnRow {
+  const hasArgs = holdsArgs(skill, text, atMs)
+  let id = textIds.get(text)
+  if (id === undefined) {
+    id = randomHex(16)
+    if (textIds.size < MAX_SKILL_TEXTS) textIds.set(text, id)
+  }
+  const withText = !textsSent.has(text)
   return {
     event: SKILL_PROMPT_ROW,
     atMs,
-    attributes: { 'skill.name': skill, 'skill.source': source, 'skill.text_id': id, 'skill.has_arguments': hasArgs, ...(first ? { 'skill.text': text } : {}) },
+    attributes: { 'skill.name': skill, 'skill.source': source, 'skill.text_id': id, 'skill.has_arguments': hasArgs, ...(withText ? { 'skill.text': text } : {}) },
+    ...(withText ? { text } : {}),
   }
+}
+
+/** A new session in the same process (/clear, resume): what the last one queued goes under its identity, and this one starts over. */
+async function nextSession($: EngineInterface): Promise<void> {
+  await serversRead
+  await flushOwn($)
+  const r = await rebuildOf($)
+  endedSession = r?.common['session.id']
+  textIds = new Map()
+  textsSent = new Set()
+  pendingArgs = new Map()
+  await startServers($)
 }
 
 /**
@@ -466,8 +543,8 @@ export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams
       // Lost to the copy alone.
     }
     if (out !== null) await emit($, out).catch(() => undefined)
-    // The session's identity may be known now: the plugin's own rows waiting for it go.
-    await flushOwn($).catch(() => undefined)
+    // The session's identity may be known now: the plugin's own rows waiting for it go, beside the row.
+    if (own.length > 0) void flushOwn($).catch(() => undefined)
   }
   return next({ ...e, attributes })
 }
@@ -500,11 +577,11 @@ export async function sessionStart($: SessionStartParams[0], e: SessionStartPara
       await update($, sessionCountedAtom, counted => ((first = counted !== true), true))
       if (first && r !== null) await emit($, sessionStarted(r, await $.clock.now()))
       await adopt($)
-      // A new session (a /clear too): its servers and skill texts are sent again. Claude's settings are read beside the session's
-      // start, never holding it.
-      serversSent = new Set()
-      skillTexts = new Map()
-      if (allows(await gateOf($), 'mcp.url', false)) serversRead = noteServers($).catch(() => undefined)
+      // A new session: its servers and skill texts are sent again (after a /clear, `session.end` starts them over). Claude's settings
+      // are read beside the session's start, never holding it.
+      textIds = new Map()
+      textsSent = new Set()
+      await startServers($)
     } catch {
       // Sending starts with the next row instead.
     }
@@ -538,6 +615,8 @@ export async function turnCompleteHook($: TurnCompleteParams[0], e: TurnComplete
     // The turn's interaction is not rebuilt.
   }
   const result = await next(e)
+  // A main-loop turn ended: a run given arguments that was to expand has expanded, or will not.
+  if (e.agentId === undefined) pendingArgs.clear()
   if (out !== null) await emit($, out).catch(() => undefined)
   return result
 }
@@ -613,7 +692,8 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
   // A skill given arguments: the text it expands to holds them.
   let withArgs = false
   try {
-    withArgs = e.tool === 'Skill' && noteArgs((e as unknown as { args?: unknown }).args, await $.clock.now())
+    const input = e as unknown as { skill?: unknown; args?: unknown }
+    withArgs = e.tool === 'Skill' && expectArgs(input.skill, input.args, await $.clock.now())
   } catch {
     withArgs = false
   }
@@ -648,7 +728,7 @@ export async function commandHook($: CommandParams[0], e: CommandParams[1], next
   }
   let withArgs = false
   try {
-    withArgs = noteArgs(e.args, await $.clock.now())
+    withArgs = expectArgs(e.command, e.args, await $.clock.now())
   } catch {
     withArgs = false
   }
@@ -674,7 +754,8 @@ export async function promptHook($: PromptParams[0], e: PromptParams[1], next: P
   let r: Rebuild | null = null
   let out: Emit | null = null
   try {
-    noteArgs(slashArgs(e.text), await $.clock.now())
+    const slash = slashCommand(e.text)
+    if (slash !== undefined) expectArgs(slash.name, slash.args, await $.clock.now())
     r = await rebuildOf($)
     if (r !== null) {
       capturePrompt(capture, e.text)
@@ -731,8 +812,8 @@ export async function skillHook($: SkillParams[0], e: SkillParams[1], next: Skil
   const result = await next(e)
   try {
     if (isCopying() && typeof result.text === 'string') {
-      const gate = await gateOf($)
-      if (allows(gate, 'skill.text', false)) await queueOwn($, [skillRow(gate, e.skill, e.source, result.text, await $.clock.now())])
+      // Queued beside the prompt: the text the model reads never waits on the plugin's work.
+      if (allows(await gateOf($), 'skill.text', false)) void queueOwn($, [skillRow(e.skill, e.source, result.text, await $.clock.now())]).catch(() => undefined)
     }
   } catch {
     // The run's text is lost to the copy alone.
@@ -755,6 +836,9 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
       // The settings as they stand now: what is queued goes through them as it is sent.
       await readOverrides($)
       await sweepNow($, true)
+      // The plugin's own rows still waiting go under the session's identity, those of the settings read beside its start too.
+      await serversRead
+      await flushOwn($).catch(() => undefined)
       // Claude Code's meter collects once more as the process ends; after a /clear or a resume the process goes on, and so does it.
       if (e.reason !== 'clear' && e.reason !== 'resume') await collectNow($)
     }
@@ -771,6 +855,8 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
     // What could not be kept is lost to the copy alone: the exporter's rows went on.
   }
   endSession()
+  // After a /clear or a resume the process goes on under a new session id, with no `session.start`: its own rows start over.
+  if ((e.reason === 'clear' || e.reason === 'resume') && isCopying()) await nextSession($).catch(() => undefined)
   return next(e)
 }
 
@@ -788,8 +874,11 @@ export const register: Register = (on, options) => {
   own = []
   serversSent = new Set()
   serversRead = null
-  skillTexts = new Map()
+  endedSession = undefined
+  textIds = new Map()
+  textsSent = new Set()
   argsInFlight = 0
+  pendingArgs = new Map()
   recentArgs = []
   configure(options)
 
