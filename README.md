@@ -4,6 +4,9 @@ The Mainwave plugin for Claude Code and Cowork. It reports Claude sessions to [M
 
 It is a Claude Code mod: TypeScript that runs inside Claude Code and Cowork. Nothing needs installing on the machine: no Node, Python or CLI.
 
+> [!IMPORTANT]
+> Requires Claude Code 2.1.317 or later, in every place a session runs: a remote machine, a script, an IDE extension or the desktop app can run an older copy than the terminal does. `claude --version` shows the version; `claude update` updates it. Older versions send less or nothing; see [Install](#install).
+
 ## What it does today
 
 The plugin does two things.
@@ -168,7 +171,23 @@ In rough order, each in a later version:
 
 ## Install
 
-Needs Claude Code 2.1.317 or later. On an older version the session is unaffected, as the plugin fails open, but the plugin sends less or nothing: below 2.1.299 its hooks module does not load, so it stamps and sends nothing; from 2.1.299 to 2.1.316 its copy's spans lack `gen_ai.provider.name`, and on early versions of that range its keyless copy has gaps too (rows that name the wrong parent span, subagents' requests missing). `plugin.json` states the floor as `engines`, which Claude Code reads only from 2.1.323 on, so today it turns no version away: every version that reads it is above the floor.
+Needs Claude Code 2.1.317 or later.
+
+`claude --version` shows the version; `claude update` updates it. On an older version the session is unaffected, as the plugin fails open, but the plugin sends less or nothing:
+
+- Below 2.1.299, its hooks module does not load, so it stamps and sends nothing.
+- From 2.1.299 to 2.1.316, its copy's spans lack `gen_ai.provider.name`, and on early versions of that range its keyless copy has gaps too (rows that name the wrong parent span, subagents' requests missing).
+
+The version that counts is the one each session runs, and a person who has updated Claude Code in their terminal may still run older copies elsewhere:
+
+- **Remote machines.** A session over SSH, or in a container or VM, runs the Claude Code installed on that machine. Update it there.
+- **Scripts and CI.** A `claude -p` run uses the binary its job installs, often a pinned version. Raise the pin.
+- **IDE extensions.** The VS Code extension runs a copy of Claude Code it bundles, and its version number is that copy's: update the extension. The JetBrains plugin runs the `claude` on the machine's `PATH`, or the one its settings name: update that.
+- **The desktop app.** Its Code tab runs the Claude Code that comes with the app, not the one in the terminal. Update the app: **Claude › Check for Updates…** on macOS, **Help › Check for Updates…** on Windows.
+
+An organization can turn older versions away: the managed setting `requiredMinimumVersion`, set to the floor, makes Claude Code below it exit at startup (Claude Code 2.1.163 and later read it).
+
+`plugin.json` states the floor too, as `engines`. Claude Code reads `engines` only from 2.1.323 on, so today it turns no version away: every version that reads it is above the floor.
 
 ### For a whole organization (org sync)
 
