@@ -1,4 +1,5 @@
-// Where the plugin's dev ingest key may come from, and the shape it must have. Pure: tests call it directly.
+// Where the plugin's dev ingest key and the person's opt-in to more data points may come from, and the shape the key must have. Pure:
+// tests call it directly.
 //
 // Without a key the copy goes keyless; the key, where the person sets one, sends it with that key instead. The key is the person's
 // own: `claude plugin configure` keeps a sensitive option in secure storage, and the engine hands it to `register` as `options`. A
@@ -23,6 +24,14 @@ export const KEY_OPTION = 'devIngestKey'
 /** The options only the person's own settings may set. */
 export const SENDING_OPTIONS: readonly string[] = [KEY_OPTION]
 
+/**
+ * The option that lists the data points the person opts in to (gate.ts, `optInOf`). The manifest doesn't declare it: the engine
+ * refuses to load a hooks module whose declared option holds a value of the wrong type, and a typo here must never stop the plugin.
+ * Nor does the plugin take it from `options`, which merge `--settings` and managed settings in: it reads the person's user settings
+ * alone (`optionValues` on the `user` layer), never a repository's (`project`, `local`), `--settings` or managed settings.
+ */
+export const OPT_IN_OPTION = 'extraDataPoints'
+
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v)
 const has = (o: Record<string, unknown>, k: string) => Object.prototype.hasOwnProperty.call(o, k)
 
@@ -38,6 +47,20 @@ export function namesOption(layer: Layer, options: readonly string[] = SENDING_O
     if (isObject(opts) && options.some(o => has(opts, o))) return true
   }
   return false
+}
+
+/** The values a layer gives the option under each of the plugin's ids, in their order; none from a layer that cannot be read. */
+export function optionValues(layer: Layer, option: string): unknown[] {
+  if (layer === 'unreadable' || !has(layer, 'pluginConfigs')) return []
+  const configs = layer['pluginConfigs']
+  if (!isObject(configs)) return []
+  const out: unknown[] = []
+  for (const [id, entry] of Object.entries(configs)) {
+    if (!PLUGIN_ID.test(id) || !isObject(entry)) continue
+    const opts = entry['options']
+    if (isObject(opts) && has(opts, option)) out.push(opts[option])
+  }
+  return out
 }
 
 // Printable ASCII, no spaces: what a header value can carry as it is.

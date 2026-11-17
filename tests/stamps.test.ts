@@ -49,12 +49,25 @@ describe('filterStamps', () => {
     ['user.email', 'dev@example.com'],
     ['mainwave.plugin.name', 7],
     ['mainwave.plugin.name', 'x'.repeat(300)],
+    ['mainwave.telemetry.opt_in', ''],
+    ['mainwave.telemetry.opt_in', 'tool.input'],
+    ['mainwave.telemetry.opt_in', 'mcp.url,mcp.url'],
+    ['mainwave.telemetry.opt_in', 'mcp.url, skill.text'],
+    ['mainwave.telemetry.opt_in', 'usage'],
   ]
   for (const [key, value] of bad) {
     test(`drops ${key}=${JSON.stringify(value).slice(0, 30)}`, () => {
       expect(filterStamps({ [key]: value })).toEqual({ kept: {}, dropped: [key] })
     })
   }
+})
+
+describe('the opt-in stamp', () => {
+  test('lists data points off by default, each once', () => {
+    const value = 'mcp.url,skill.text,response.thinking'
+    expect(filterStamps({ 'mainwave.telemetry.opt_in': value })).toEqual({ kept: { 'mainwave.telemetry.opt_in': value }, dropped: [] })
+    expect(filterStamps({ 'mainwave.telemetry.opt_in': 'response.thinking' }).dropped).toEqual([])
+  })
 })
 
 describe('applyStamps', () => {
