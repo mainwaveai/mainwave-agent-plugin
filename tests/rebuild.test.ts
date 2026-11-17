@@ -9,7 +9,7 @@ import {
   agentSpawned, commandEnd, commandStart, commonOf, isCoherent, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, takeReady, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart,
   type Emit, type Rebuild, type RowIn, type Settings,
 } from '../hooks/rebuild.ts'
-import { ORG } from './rig.ts'
+import { CAPTURES_ON, ORG } from './rig.ts'
 
 const TRACE = '7d2fa3029813d71c9ad4ef05815fa7d5'
 const INTERACTION = 'e4a76fb0fca33a96'
@@ -17,8 +17,8 @@ const BLOCKED = '1111111111111111'
 const AGENT_EXEC = '2222222222222222'
 const COMMON = { 'mainwave.source': 'coding_agent.claude_code', 'organization.id': ORG, 'user.id': 'device-1', 'session.id': 's-1', 'anthropic.provider': 'firstParty', 'terminal.type': 'cli' }
 
-/** The gate a session's switches and explicit settings give: with neither, the defaults. */
-const gate = (env: Record<string, string> = {}, overrides: Overrides = {}) => {
+/** The gate a session's switches and explicit settings give: by default, settings that turn on what the org-wide setup captures. */
+const gate = (env: Record<string, string> = {}, overrides: Overrides = CAPTURES_ON) => {
   const g = resolveGate(env, overrides)
   return () => g
 }
@@ -133,11 +133,13 @@ describe('one turn', () => {
     expect(measures.filter(m => m.name === 'claude_code.active_time.total')).toEqual([{ name: 'claude_code.active_time.total', value: 0.15, attributes: { ...COMMON, type: 'cli' }, atMs: 230 }])
   })
 
-  test('with OTEL_LOG_TOOL_DETAILS set to 0 a tool span carries no command, but still its class, as in Claude Code', () => {
-    const { spans } = turn(rebuild({ gate: gate({ OTEL_LOG_TOOL_DETAILS: '0' }) }))
-    const [tool] = named(spans, 'tool')
-    expect(tool!.attributes['full_command']).toBeUndefined()
-    expect(tool!.attributes['bash_argv0']).toBe('echo')
+  test('with no settings, or OTEL_LOG_TOOL_DETAILS set to 0 too, a tool span carries no command, but still its class', () => {
+    for (const env of [{}, { OTEL_LOG_TOOL_DETAILS: '0' }] as Record<string, string>[]) {
+      const { spans } = turn(rebuild({ gate: gate(env, {}) }))
+      const [tool] = named(spans, 'tool')
+      expect(tool!.attributes['full_command']).toBeUndefined()
+      expect(tool!.attributes['bash_argv0']).toBe('echo')
+    }
   })
 
   test('interactions count up, and the prompt row may come before its turn', () => {

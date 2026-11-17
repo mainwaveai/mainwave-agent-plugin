@@ -18,8 +18,8 @@ export type DataPointId =
 export type DataClass = 'metadata' | 'identifiers' | 'content'
 
 /**
- * The Claude Code settings Mainwave's org-wide setup turns on, which the defaults follow. `OTEL_LOG_ASSISTANT_RESPONSES` follows
- * `OTEL_LOG_USER_PROMPTS` when unset, as in Claude Code.
+ * The Claude Code settings that govern data points, which Mainwave's org-wide setup writes. One set to `0` keeps what it governs as
+ * Claude Code sends it (gate.ts). `OTEL_LOG_ASSISTANT_RESPONSES` follows `OTEL_LOG_USER_PROMPTS` when unset, as in Claude Code.
  */
 export type Switch = 'OTEL_LOG_TOOL_DETAILS' | 'OTEL_LOG_TOOL_CONTENT' | 'OTEL_LOG_USER_PROMPTS' | 'OTEL_LOG_ASSISTANT_RESPONSES' | 'OTEL_METRICS_INCLUDE_REPOSITORY'
 export const SWITCHES: readonly Switch[] = ['OTEL_LOG_TOOL_DETAILS', 'OTEL_LOG_TOOL_CONTENT', 'OTEL_LOG_USER_PROMPTS', 'OTEL_LOG_ASSISTANT_RESPONSES', 'OTEL_METRICS_INCLUDE_REPOSITORY']
@@ -77,12 +77,14 @@ export const CATALOG: readonly DataPoint[] = [
 export const DATA_POINTS: ReadonlyMap<DataPointId, DataPoint> = new Map(CATALOG.map(d => [d.id, d]))
 
 /**
- * What each data point that has a switch is with no organization settings: `on` or `off`. The rule: on where Claude Code emits it
- * with Mainwave's org-wide setup captures on (`OTEL_LOG_TOOL_DETAILS`, `OTEL_LOG_TOOL_CONTENT`, `OTEL_LOG_USER_PROMPTS`,
- * `OTEL_METRICS_INCLUDE_REPOSITORY`), in Claude Code and Cowork alike; off where it does not even then. A switch the session's
- * environment sets to `0` turns its data points to `claude` (gate.ts). Required data points are not here: they have no switch.
+ * What each data point that has a setting is with no organization settings: `on` or `off`. The one table of defaults: settings
+ * fetched for the organization go in front of it. The rule: metadata on, identifiers and content off, in Claude Code and Cowork alike,
+ * until the organization's settings turn them on. Claude Code's switches don't turn a data point on: one the session's environment
+ * sets to `0` turns the data points it governs that are on here to `claude` (gate.ts). Required data points are not here: they are
+ * always sent.
  */
 export const DEFAULTS: Readonly<Record<Exclude<DataPointId, 'session.identity' | 'session.links' | 'session.client' | 'usage'>, 'on' | 'off'>> = {
+  // Metadata.
   'tool.call': 'on',
   'tool.mcp': 'on',
   'skill.name': 'on',
@@ -92,18 +94,18 @@ export const DEFAULTS: Readonly<Record<Exclude<DataPointId, 'session.identity' |
   'bash.outcome': 'on',
   'file.kind': 'on',
   'web.domain': 'on',
-  repo: 'on',
-  'file.path': 'on',
-  'web.url': 'on',
-  'bash.command': 'on',
-  'tool.input': 'on',
-  'tool.result': 'on',
-  // Claude Code never exports these two.
+  // Identifiers.
+  repo: 'off',
+  'file.path': 'off',
+  'web.url': 'off',
   'mcp.url': 'off',
+  // Content.
+  'bash.command': 'off',
+  'tool.input': 'off',
+  'tool.result': 'off',
   'skill.text': 'off',
-  'prompt.text': 'on',
-  'response.text': 'on',
-  // Claude Code never exports it.
+  'prompt.text': 'off',
+  'response.text': 'off',
   'response.thinking': 'off',
 }
 

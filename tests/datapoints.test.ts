@@ -7,7 +7,7 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
 import type { Overrides } from '../hooks/gate.ts'
-import { boot, contractViolations, EMAIL, LOGGED_AT, memoryStore, network, optInOption, ORG, STAMPED, type Layers, type Post } from './rig.ts'
+import { boot, CAPTURES_ON, contractViolations, EMAIL, LOGGED_AT, memoryStore, network, optInOption, ORG, STAMPED, type Layers, type Post } from './rig.ts'
 
 const keyless = { options: {} }
 const START = 1_800_000_000_000
@@ -80,9 +80,41 @@ async function session($: Engine, on: On, opts: { env?: Record<string, string>; 
   return posts
 }
 
-describe('with no settings, as Claude Code with the org-wide setup captures on', () => {
-  test("a device_bash call's span carries its command, its class, its MCP names and its output, and counts its commit", keyless, async ($, on) => {
+describe('with no settings: required and metadata data points only', () => {
+  test("a device_bash call's span carries its class and its MCP names, not its command or its output, and its commit is counted", keyless, async ($, on) => {
     const posts = await session($, on)
+    const tool = spansOf(posts).find(s => s.name === 'claude_code.tool')!
+    expect(tool.attrs).toEqual(expect.objectContaining({ tool_name: DEVICE_BASH, 'gen_ai.tool.name': 'device_bash', 'anthropic.mcp.server.name': 'remote-devices', bash_command_class: 'vcs', bash_argv0: 'git' }))
+    expect(tool.attrs['full_command']).toBeUndefined()
+    expect(tool.events).toEqual([])
+    expect(metricNames(posts)).toContain('claude_code.commit.count')
+  })
+
+  test('no command, prompt, response, output or thinking is in any request the plugin sends, though Cowork withheld none of it from the plugin', keyless, async ($, on) => {
+    const posts = await session($, on)
+    const all = posts.map(p => p.body).join('\n')
+    for (const text of ['commit -m', 'ship it', 'Done.', '1a2b3c', 'Commit first.', 'Ship']) expect([text, all.includes(text)]).toEqual([text, false])
+    const rows = rowsOf(posts)
+    const by = (ev: string) => rows.find(r => r['event.name'] === ev)!
+    expect(by('user_prompt')).toEqual(expect.objectContaining({ prompt: '<REDACTED>', prompt_text: '<REDACTED>', prompt_length: '7' }))
+    expect(by('assistant_response')['response']).toBe('<REDACTED>')
+    // Its parameters keep the MCP names, metadata, and nothing more; there is no input.
+    expect(JSON.parse(by('tool_result')['tool_parameters'] as string)).toEqual({ mcp_server_name: 'remote-devices', mcp_tool_name: 'device_bash' })
+    expect(by('tool_result')['tool_input']).toBeUndefined()
+    expect(spansOf(posts).find(s => s.name === 'claude_code.interaction')!.attrs['user_prompt']).toBe('<REDACTED>')
+  })
+
+  test('the turn still goes: its request with model, tokens and cost, its call with name, outcome and decision', keyless, async ($, on) => {
+    const posts = await session($, on)
+    expect(spansOf(posts).find(s => s.name === 'claude_code.llm_request')!.attrs).toEqual(expect.objectContaining({ model: 'claude-haiku-5-5', input_tokens: 1201, output_tokens: 20 }))
+    const rows = rowsOf(posts)
+    expect(rows.find(r => r['event.name'] === 'tool_decision')).toEqual(expect.objectContaining({ decision: 'accept', source: 'config' }))
+  })
+})
+
+describe("with the org-wide setup's captures as the organization's settings", () => {
+  test("a device_bash call's span carries its command, its class, its MCP names and its output, and counts its commit", keyless, async ($, on) => {
+    const posts = await session($, on, { overrides: CAPTURES_ON })
     const tool = spansOf(posts).find(s => s.name === 'claude_code.tool')!
     expect(tool.attrs).toEqual(expect.objectContaining({
       tool_name: DEVICE_BASH, 'gen_ai.tool.name': 'device_bash', 'anthropic.mcp.server.name': 'remote-devices',
@@ -95,7 +127,7 @@ describe('with no settings, as Claude Code with the org-wide setup captures on',
   })
 
   test("Cowork's rows carry what its export withheld: the prompt, the response, the call's parameters and input", keyless, async ($, on) => {
-    const rows = rowsOf(await session($, on))
+    const rows = rowsOf(await session($, on, { overrides: CAPTURES_ON }))
     const by = (ev: string) => rows.find(r => r['event.name'] === ev)!
     expect(by('user_prompt')).toEqual(expect.objectContaining({ prompt: 'ship it', prompt_text: 'ship it' }))
     expect(by('assistant_response')['response']).toBe('Done.')
@@ -106,7 +138,7 @@ describe('with no settings, as Claude Code with the org-wide setup captures on',
   })
 
   test('the interaction carries its prompt, and no request its thinking: Claude Code never exports thinking', keyless, async ($, on) => {
-    const spans = spansOf(await session($, on))
+    const spans = spansOf(await session($, on, { overrides: CAPTURES_ON }))
     expect(spans.find(s => s.name === 'claude_code.interaction')!.attrs['user_prompt']).toBe('ship it')
     expect(spans.find(s => s.name === 'claude_code.llm_request')!.attrs['response.thinking']).toBeUndefined()
   })
@@ -146,12 +178,12 @@ describe('an explicit setting', () => {
   })
 
   test('turned off after a record was queued: it goes without it, as the gate is read again as it is sent', keyless, async ($, on) => {
-    // The records were queued under the defaults, prompt and command included.
+    // The records were queued under settings that turn prompts and commands on.
     // Nothing is answered until the session's end, so every record waits in the queue.
-    const { posts, store } = world(on)
+    const { posts, store } = world(on, {}, CAPTURES_ON)
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
     await turn($)
-    store.data.set('dataPoints', { 'prompt.text': 'off', 'bash.command': 'off' })
+    store.data.set('dataPoints', { ...CAPTURES_ON, 'prompt.text': 'off', 'bash.command': 'off' })
     await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
     const all = posts.map(p => p.body).join('\n')
     expect(all).not.toContain('ship it')
@@ -359,26 +391,41 @@ describe("the person's opt-in, in their own user settings", () => {
     expect(thinkingOf(await session($, on, { layers: { user: optInOption('response.thinking', 'mainwave') } }))).toBe('Commit first.')
   })
 
-  test('only adds: one on by default, an unknown ID, a required one and a value of the wrong type change nothing, and turn nothing off', keyless, async ($, on) => {
-    const posts = await session($, on, { layers: { user: optInOption(['prompt.text', 'tool.input', 'everything', 'usage', 7]) } })
+  test('turns on the prompt and the command, off by default, and every record says so', keyless, async ($, on) => {
+    const posts = await session($, on, { layers: { user: optInOption(['prompt.text', 'bash.command']) } })
+    const rows = rowsOf(posts)
+    expect(rows.find(r => r['event.name'] === 'user_prompt')!['prompt']).toBe('ship it')
+    expect(spansOf(posts).find(s => s.name === 'claude_code.tool')!.attrs['full_command']).toBe(COMMAND)
+    for (const r of rows) expect(r['mainwave.telemetry.opt_in']).toBe('bash.command,prompt.text')
+    // Neither response nor output was asked for.
     const all = posts.map(p => p.body).join('\n')
-    expect(all).toContain('ship it')
-    expect(all).toContain('commit -m')
+    expect(all).not.toContain('Done.')
+    expect(all).not.toContain('1a2b3c')
+  })
+
+  test('only adds: one on by default, an unknown ID, a required one and a value of the wrong type change nothing, and turn nothing off', keyless, async ($, on) => {
+    const posts = await session($, on, { layers: { user: optInOption(['bash.class', 'tool.mcp', 'everything', 'usage', 7]) } })
+    const all = posts.map(p => p.body).join('\n')
+    expect(all).not.toContain('ship it')
+    expect(all).not.toContain('commit -m')
     expect(all).not.toContain('mainwave.telemetry.opt_in')
+    expect(spansOf(posts).find(s => s.name === 'claude_code.tool')!.attrs).toEqual(expect.objectContaining({ 'anthropic.mcp.server.name': 'remote-devices', bash_argv0: 'git' }))
     expect(thinkingOf(posts)).toBeUndefined()
   })
 
   for (const [name, value] of [['a number', 42], ['true', true], ['an object', { 'response.thinking': true }], ['null', null]] as const) {
     test(`a value of the wrong type (${name}) is ignored, and the plugin goes on as without it`, keyless, async ($, on) => {
       const posts = await session($, on, { layers: { user: optInOption(value) } })
-      expect(rowsOf(posts).find(r => r['event.name'] === 'user_prompt')!['prompt']).toBe('ship it')
+      expect(rowsOf(posts).find(r => r['event.name'] === 'user_prompt')!['prompt']).toBe('<REDACTED>')
+      expect(posts.map(p => p.body).join('\n')).not.toContain('mainwave.telemetry.opt_in')
       expect(thinkingOf(posts)).toBeUndefined()
     })
   }
 
   test("user settings that can't be read opt in to nothing, and the plugin goes on", keyless, async ($, on) => {
     const posts = await session($, on, { layers: { user: 'reject' } })
-    expect(rowsOf(posts).find(r => r['event.name'] === 'user_prompt')!['prompt']).toBe('ship it')
+    expect(rowsOf(posts).find(r => r['event.name'] === 'user_prompt')!['prompt']).toBe('<REDACTED>')
+    expect(spansOf(posts).find(s => s.name === 'claude_code.tool')!.attrs['bash_argv0']).toBe('git')
     expect(thinkingOf(posts)).toBeUndefined()
   })
 

@@ -5,12 +5,13 @@
 //   on      sent, by the plugin's own reading where Claude Code's row or span leaves it out.
 //   off     never sent: removed from every record, or `<REDACTED>` where Claude Code marks withheld text so.
 //   claude  sent exactly where Claude Code sends it under the session's own settings, and nowhere more.
-// With no organization settings, each takes its default (catalog.ts, `DEFAULTS`); a Claude Code switch the session's environment
-// sets to `0` (`false`, `no`, `off`) turns the data points it governs to `claude`, so an admin who turned a capture off in Mainwave's
-// org-wide setup keeps that choice. The person can opt in to data points still at a default of `off` (`setOptIn`, from their own user
-// settings): each turns `on`. An explicit setting for a data point (`setOverrides`, for organization settings) wins over all three,
-// and the opt-in never raises a data point a switch at `0` governs (thinking counts as governed by the responses' switch, for this).
-// It only adds: it never turns anything off. Required data points are always sent.
+// With no organization settings, each takes its default (catalog.ts, `DEFAULTS`: metadata on, identifiers and content off); a Claude
+// Code switch the session's environment sets to `0` (`false`, `no`, `off`) turns the data points it governs that are on by default to
+// `claude`, so an admin who turned a capture off in Mainwave's org-wide setup keeps that choice. The person can opt in to data points
+// still at a default of `off` (`setOptIn`, from their own user settings): each turns `on`. An explicit setting for a data point
+// (`setOverrides`, for organization settings) wins over all three, and the opt-in never raises a data point a switch at `0` governs
+// (thinking counts as governed by the responses' switch, for this). It only adds: it never turns anything off. Required data points
+// are always sent.
 //
 // Whatever the gate says, every identifier and content value goes through the always-on protections (protect.ts) before it is queued.
 

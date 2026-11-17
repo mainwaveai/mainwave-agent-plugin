@@ -19,14 +19,17 @@
 // refusal, and checks that the spans make one trace per interaction: the interaction a root, the main loop's requests and calls its
 // children, each call's decision and run the call's, and a subagent's requests and calls under its Agent call's run. The session runs
 // on an API key, so its rows name an organization and an email only through OTEL_RESOURCE_ATTRIBUTES, which stands in for what an
-// account's login puts on them. It also checks the plugin's defaults: with no settings at all, the copy carries the commands, file
-// paths, subagent types, tool output, prompts and responses the exporter carries with Mainwave's org-wide setup captures on.
+// account's login puts on them. It also checks the plugin's defaults: with no settings at all, the copy carries required and metadata
+// data points (a command's class, a subagent's type, a failed call's error class) and no identifier or content: no command, file
+// path, tool input or output, repository, prompt or response.
 //
 // The mock model answers each request after a different delay (300 to 900 ms), so a request paired with the wrong step, or timed
 // from the wrong start, lands outside the tolerance; and it refuses one request once as overloaded, so Claude Code retries it. The
 // session runs twice: once with Mainwave's org-wide setup captures on (OTEL_LOG_TOOL_DETAILS, OTEL_LOG_TOOL_CONTENT,
 // OTEL_LOG_USER_PROMPTS, OTEL_METRICS_INCLUDE_REPOSITORY), once with each set to 0, as the setup writes a capture an admin turns off,
-// so both sides of those settings are compared. The first runs in auto mode, so auto mode's classifier judges the command no rule
+// so both sides of those settings are compared. Both run with explicit settings in the plugin's store that turn on the identifiers
+// and content those captures govern (on, then as Claude Code sends them), as an organization's settings would: off by default, they
+// would otherwise leave nothing of them to compare. The first runs in auto mode, so auto mode's classifier judges the command no rule
 // allows, and the mock blocks it. Claude Code logs no row for the classifier's requests, so the plugin cannot see them: the
 // exporter's spans of a request it logged no row for are a known difference, and so is its count of them in cost.usage and
 // token.usage, where it counts them (the tokens checked against those spans'); the pass fails if the classifier asked nothing.
@@ -35,9 +38,10 @@
 //   node tests/e2e/compare.mjs --keep     # keep the captures and the session's config folder, and print where
 //
 // Needs `claude` and `git` on PATH. The session runs in a fresh CLAUDE_CONFIG_DIR with an API key, so no login and no
-// organization's settings reach it.
+// organization's settings reach it but the explicit settings above.
 
 import { execFileSync, spawn } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
@@ -71,6 +75,16 @@ const STARTUP = new Set(['managed_settings_resolved', ...(atLeast(CLAUDE_VERSION
 const CLASSIFIERS = new Set(['auto_mode', 'agent_classifier'])
 /** The captures Mainwave's org-wide setup sets in the env block. */
 const CAPTURES = ['OTEL_LOG_TOOL_DETAILS', 'OTEL_LOG_TOOL_CONTENT', 'OTEL_LOG_USER_PROMPTS', 'OTEL_METRICS_INCLUDE_REPOSITORY']
+/**
+ * The identifiers and content Claude Code sends with those captures on, all off by default. With the env block, the session runs
+ * with explicit settings that turn them on, as an organization's settings would, so the copy carries what the exporter does.
+ */
+const CAPTURED_DATA_POINTS = ['repo', 'file.path', 'web.url', 'bash.command', 'tool.input', 'tool.result', 'prompt.text', 'response.text']
+/**
+ * Where Claude Code keeps a plugin's store in a config folder: `plugins/store/<name>_<marketplace>-<first 12 hex of the plugin id's
+ * SHA-256>.json`, one JSON object of its keys. The plugin, loaded from a folder, is `mainwave@inline`.
+ */
+const storeFile = (config, id = 'mainwave@inline') => join(config, 'plugins', 'store', `${id.replace('@', '_')}-${createHash('sha256').update(id).digest('hex').slice(0, 12)}.json`)
 /** An example organization, put on every record through the resource so the plugin's stamping path runs as in a real organization. */
 const ORG = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
 /** An example person in it, put on every record in the keyless pass, as a login would. */
@@ -281,8 +295,14 @@ async function session(details, envBlock, auto) {
   const git = (...a) => execFileSync('git', a, { cwd: work, env: { PATH: process.env.PATH, HOME: work, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' } })
   git('init', '-q', '-b', 'main')
   git('-c', 'user.name=e2e', '-c', 'user.email=e2e@example.com', 'commit', '-q', '--allow-empty', '-m', 'init')
-  // Without the env block, the plugin's defaults: no key, so keyless.
+  // Without the env block, the plugin's defaults: no key, so keyless, and no settings.
   const options = envBlock ? { devIngestKey: PLUGIN_KEY } : {}
+  // With it, settings that turn on the identifiers and content the captures turn on in Claude Code: on with the captures on; as Claude
+  // Code sends them with each set to 0, where the exporter is the reference for what a switch at 0 leaves.
+  if (envBlock) {
+    mkdirSync(dirname(storeFile(config)), { recursive: true })
+    writeFileSync(storeFile(config), JSON.stringify({ dataPoints: Object.fromEntries(CAPTURED_DATA_POINTS.map(id => [id, details ? 'on' : 'claude'])) }))
+  }
   const settings = JSON.stringify({ pluginConfigs: { 'mainwave@inline': { options }, mainwave: { options } } })
 
   const env = {
@@ -804,25 +824,38 @@ function checkKeyless(pass, { captured, run }, reference) {
     if (!points.some(p => p.name === m)) problems.push(`no ${m} point was sent`)
   }
 
-  // With no settings, the plugin's defaults are Claude Code's with Mainwave's org-wide setup captures on, though no switch is set:
-  // the copy carries what the exporter carries in the first pass. Each kind of value is looked for at least once.
+  // With no settings, the plugin's defaults: required and metadata data points, and no identifier or content. Each kind of value is
+  // looked for at least once, and each the defaults leave out looked for nowhere.
   const redacted = v => v === undefined || v === '<REDACTED>'
   const tool = n => spans.filter(s => s.name === 'claude_code.tool' && s.attrs.tool_name?.v === n)
   const rowsOf = ev => rows.filter(r => r.attributes['event.name']?.v === ev)
   const expectations = [
-    ['a Bash call with its command and class', tool('Bash').some(s => s.attrs.full_command?.v === 'echo e2e' && s.attrs.bash_argv0?.v === 'echo')],
-    ['a Write call with its file path', tool('Write').some(s => String(s.attrs.file_path?.v ?? '').endsWith('a.txt'))],
+    ['a Bash call with its class', tool('Bash').some(s => s.attrs.bash_argv0?.v === 'echo')],
     ['an Agent call with its subagent type', tool('Agent').some(s => s.attrs.subagent_type?.v === 'general-purpose')],
-    ["a Bash call's output", tool('Bash').some(s => (s.events ?? []).some(e => e.name === 'tool.output' && kvs(e.attributes).output?.v === 'e2e'))],
-    ["a failed call's error text", spans.some(s => s.name === 'claude_code.tool.execution' && /e2e-missing-file/.test(String(s.attrs.error?.v ?? '')))],
-    ['an interaction with its prompt', spans.some(s => s.name === 'claude_code.interaction' && /^E2E_MAINTASK/.test(String(s.attrs.user_prompt?.v ?? '')))],
-    ['a user_prompt row with its prompt', rowsOf('user_prompt').some(r => /^E2E_MAINTASK/.test(String(r.attributes.prompt?.v ?? '')))],
-    ['an assistant_response row with its text', rowsOf('assistant_response').some(r => !redacted(r.attributes.response?.v))],
-    ['a tool_result row with its parameters and input', rowsOf('tool_result').some(r => /"full_command":"echo e2e"/.test(String(r.attributes.tool_parameters?.v ?? '')) && r.attributes.tool_input !== undefined)],
+    ['a Write call', tool('Write').length > 0],
+    ["a failed call's run with its error class", spans.some(s => s.name === 'claude_code.tool.execution' && s.attrs.success?.v === false && s.attrs.error_class !== undefined)],
+    ['an interaction', interactions.length > 0],
+    ['a user_prompt row', rowsOf('user_prompt').length > 0],
+    ['an assistant_response row', rowsOf('assistant_response').length > 0],
+    ['a tool_result row', rowsOf('tool_result').length > 0],
   ]
   for (const [what, ok] of expectations) if (!ok) problems.push(`defaults: no ${what} was sent`)
-  // What Claude Code never sends is off by default: no row of the plugin's own for MCP server addresses or skill text.
-  for (const ev of ['mcp_server_configured', 'skill_prompt']) if (rowsOf(ev).length > 0) problems.push(`defaults: ${ev} rows were sent`)
+  const withheld = [
+    ['a command', spans.some(s => s.attrs.full_command !== undefined || s.attrs.bash_command !== undefined)],
+    ['a file path', spans.some(s => s.attrs.file_path !== undefined)],
+    ['a tool output', spans.some(s => (s.events ?? []).some(e => e.name === 'tool.output'))],
+    ["a failed call's error text", spans.some(s => /e2e-missing-file/.test(String(s.attrs.error?.v ?? '')))],
+    ['a prompt', spans.some(s => !redacted(s.attrs.user_prompt?.v)) || rowsOf('user_prompt').some(r => !redacted(r.attributes.prompt?.v) || !redacted(r.attributes.prompt_text?.v))],
+    ['a response', rowsOf('assistant_response').some(r => !redacted(r.attributes.response?.v))],
+    ['tool input', rows.some(r => r.attributes.tool_input !== undefined) || rows.some(r => /full_command|file_path|"description"/.test(String(r.attributes.tool_parameters?.v ?? '')))],
+    ['a repository', [...rows.map(r => r.attributes), ...spans.map(s => s.attrs)].some(a => Object.keys(a).some(k => k.startsWith('vcs.')) || /git_commit_id|git_branch/.test(String(a.tool_parameters?.v ?? '')))],
+    // What Claude Code never sends: no row of the plugin's own for MCP server addresses or skill text.
+    ...['mcp_server_configured', 'skill_prompt'].map(ev => [`${ev} rows`, rowsOf(ev).length > 0]),
+  ]
+  for (const [what, sent] of withheld) if (sent) problems.push(`defaults: ${what} was sent`)
+  // Nor anywhere in a request: the session's prompt, command and output, as text.
+  const raw = JSON.stringify(captured.plugin)
+  for (const text of ['E2E_MAINTASK', 'echo e2e', 'e2e-missing-file']) if (raw.includes(text)) problems.push(`defaults: "${text}" is in a request`)
   const requests = captured.plugin.logs.length + captured.plugin.traces.length + captured.plugin.metrics.length
   console.log(`keyless: ${requests} requests, none refused; ${rows.length} rows, ${spans.length} spans in ${new Set(spans.map(s => s.traceId)).size} traces (${interactions.length} interactions), ${points.length} metric points`)
   console.log(`  spans: ${[...got].map(([n, c]) => `${n} ${c}`).join(', ')}`)

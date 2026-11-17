@@ -4,7 +4,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { boot, IDEMPOTENCY_KEY, KEY, LOGGED_AT, memoryStore, network, ORG, type Post, type Reply } from './rig.ts'
+import { boot, CAPTURES_ON, IDEMPOTENCY_KEY, KEY, LOGGED_AT, memoryStore, network, ORG, type Post, type Reply } from './rig.ts'
 
 const withKey = { options: { devIngestKey: KEY } }
 const TRACES_URL = 'https://collector.dev.mainwave.com/v1/traces'
@@ -18,7 +18,8 @@ const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 
 
 function world(on: On, opts: { reply?: (n: number, post: Post) => Reply; store?: Record<string, unknown> } = {}) {
   const clock = mock.clock(on, { now: START })
-  const store = memoryStore(on, opts.store)
+  // The organization's settings turn on what the org-wide setup captures.
+  const store = memoryStore(on, { dataPoints: CAPTURES_ON, ...opts.store })
   const posts = network(on, opts.reply)
   // The org-wide env block's beta: Claude Code traces, and its rows name their spans.
   const rig = boot(on, { entrypoint: 'cli', env: { OTEL_LOG_TOOL_DETAILS: '1', OTEL_RESOURCE_ATTRIBUTES: 'mainwave.source=coding_agent.claude_code', CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: '1' } })

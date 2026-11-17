@@ -50,7 +50,7 @@ describe('filterStamps', () => {
     ['mainwave.plugin.name', 7],
     ['mainwave.plugin.name', 'x'.repeat(300)],
     ['mainwave.telemetry.opt_in', ''],
-    ['mainwave.telemetry.opt_in', 'tool.input'],
+    ['mainwave.telemetry.opt_in', 'tool.call'],
     ['mainwave.telemetry.opt_in', 'mcp.url,mcp.url'],
     ['mainwave.telemetry.opt_in', 'mcp.url, skill.text'],
     ['mainwave.telemetry.opt_in', 'usage'],
