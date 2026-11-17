@@ -3,7 +3,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { CATALOG, DEFAULTS, ownerOf } from '../hooks/catalog.ts'
-import { allows, gateAttributes, gateEvent, gatePoint, gateSpan, resolveGate } from '../hooks/gate.ts'
+import { allows, gateAttributes, gateEvent, gatePoint, gateRow, gateSpan, resolveGate } from '../hooks/gate.ts'
 import type { BuiltSpan } from '../hooks/otlp.ts'
 import { contentLimit, CONTENT_MAX_LENGTH, cut, redact } from '../hooks/protect.ts'
 
@@ -134,6 +134,8 @@ describe('gateAttributes on a row', () => {
   test("with MCP names off, an MCP tool's name reads mcp_tool", () => {
     const span = { tool_name: 'mcp__remote-devices__device_bash', 'gen_ai.tool.name': 'device_bash', 'anthropic.mcp.server.name': 'remote-devices' }
     expect(gateAttributes(resolveGate({}, { 'tool.mcp': 'off' }), 'claude_code.tool', span)).toEqual({ tool_name: 'mcp_tool', 'gen_ai.tool.name': 'mcp_tool' })
+    const playwright = { tool_name: 'mcp__playwright__browser_click', tool_name_safe: 'mcp__playwright__browser_click' }
+    expect(gateAttributes(resolveGate({}, { 'tool.mcp': 'off' }), 'claude_code.tool', playwright)).toEqual({ tool_name: 'mcp_tool', tool_name_safe: 'mcp_other' })
     expect(gateAttributes(resolveGate({}, { 'tool.mcp': 'off' }), 'claude_code.tool', { tool_name: 'Bash', 'gen_ai.tool.name': 'Bash' })).toEqual({ tool_name: 'Bash', 'gen_ai.tool.name': 'Bash' })
   })
 
@@ -156,6 +158,15 @@ describe('gateAttributes on a row', () => {
   })
 })
 
+describe('a record an earlier load captured', () => {
+  test("is held, where a data point follows Claude Code, to what is on: this load cannot tell the plugin's reading from Claude Code's", () => {
+    const row = { event: 'user_prompt', loggedAt: '2026-11-12T00:00:00.000Z', attributes: { prompt: 'hello', prompt_length: '5', 'vcs.repository.name': 'api' } }
+    const g = resolveGate({ OTEL_LOG_USER_PROMPTS: '0' })
+    expect(gateRow(g, row).attributes['prompt']).toBe('hello')
+    expect(gateRow(g, row, true).attributes).toEqual({ prompt: '<REDACTED>', prompt_length: '5', 'vcs.repository.name': 'api' })
+  })
+})
+
 describe('gateSpan, gateEvent and gatePoint', () => {
   const span: BuiltSpan = {
     traceId: 't', spanId: 's', name: 'claude_code.tool.execution', startMs: 0, endMs: 1,
@@ -168,6 +179,8 @@ describe('gateSpan, gateEvent and gatePoint', () => {
     expect(out.attributes['error']).toBe('ShellError')
     expect(out.status).toEqual({ code: 2, message: 'ShellError' })
     expect(gateSpan(resolveGate({}), span)).toEqual(span)
+    // It can repeat the command or the path the call was given: with tool input off, the class alone too.
+    expect(gateSpan(resolveGate({}, { 'file.path': 'off' }), span).attributes['error']).toBe('ShellError')
   })
 
   test("a tool's output event goes only with tool results on, and its path and command only with theirs", () => {
@@ -199,9 +212,20 @@ describe('protections', () => {
       ['https://example.com/?access_token=abc&x=1', 'https://example.com/?access_token=[REDACTED:assigned_secret]&x=1'],
       ['Authorization: Basic dXNlcjpwYXNz', 'Authorization: Basic [REDACTED:authorization]'],
       ['nothing to see', 'nothing to see'],
+      ['{"max_tokens":4096} at src/token.ts:42', '{"max_tokens":4096} at src/token.ts:42'],
+      ['-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\u2026[3000 chars]', '[REDACTED:private_key]\u2026[3000 chars]'],
     ]
     for (const [input, want] of cases) expect([input, redact(input).text]).toEqual([input, want])
     expect(redact('token=abc and GITHUB_TOKEN=def').count).toBe(2)
+  })
+
+  test('a long value with nothing to replace is read in linear time, cut before the rules run', () => {
+    const g = resolveGate({})
+    for (const filler of ['a.a.'.repeat(50_000), 'a-b_'.repeat(50_000), 'token'.repeat(40_000), 'https://x'.repeat(20_000)]) {
+      const started = Date.now()
+      gateAttributes(g, 'user_prompt', { prompt: filler, prompt_text: filler })
+      expect([filler.slice(0, 8), Date.now() - started < 1_000]).toEqual([filler.slice(0, 8), true])
+    }
   })
 
   test("the limit is Claude Code's, lowered by the settings Claude Code reads", () => {

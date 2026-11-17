@@ -74,6 +74,7 @@ Every span and data point starts with the attributes Claude Code puts first on a
 | Spans in flight when the plugin reloads; the interaction count across a reload | They live in the plugin's memory |
 | Spans Claude Code sends only in other modes: hook spans (detailed beta tracing), and the content Claude Code adds when `OTEL_LOG_RAW_API_BODIES` is set | Not rebuilt |
 | `tool.output` events of tools other than Read, Edit, Write, Bash and MCP tools | Not rebuilt |
+| More on some tool spans: `url.full` and `url.domain` on WebFetch calls; `full_command`, `bash_command_class` and `bash_argv0` on calls to an MCP shell tool (Cowork's `device_bash`); `response.thinking` on requests, where it is turned on | The plugin's own: Claude Code's spans carry none of them |
 | Without the env block: `git_commit_id` and `git_branch` in a Bash call's `tool_parameters`, and the text of a failed call's `error` on its `tool_result` row | Claude Code reads the first from the command's output and logs the row before the call's result reaches a plugin. The run's span carries the error the call answered |
 | `parent.source` `event` and `queued_sends` above 0 on `interaction`, and the span's links | Claude Code sets them only for a prompt that carries a trace from another session (in its own hosted environments); the plugin sends `env` or `none`, and 0 |
 | `mainwave.telemetry.route` on spans and metrics | Added by design; the exporter's spans and metrics carry no route, as the plugin cannot stamp them |
@@ -96,7 +97,13 @@ With no collector configured, the plugin has no rows to stamp, but it still send
 
 ## What it sends
 
-Everything the plugin sends belongs to one data point, named by an ID. Four are required: Mainwave can't route a record, join records or count spend without them, so they have no setting. Each of the others is on or off, and off means it never leaves the machine: the plugin removes it from every record it sends, Claude Code's rows included. A setting named in the Default column is the Claude Code switch that governs the data point (see Defaults, below).
+Everything the plugin sends belongs to one data point, named by an ID. Four are required: Mainwave can't route a record, join records or count spend without them, so they have no setting. Each of the others is on, off, or as Claude Code sends it:
+
+- **On:** the plugin sends it, adding what it read in its own hooks where Claude Code's row or span leaves it out.
+- **Off:** the plugin sends it in none of its records, its copies of Claude Code's rows included (prompts and responses read `<REDACTED>`, as Claude Code writes withheld text).
+- **As Claude Code sends it:** the plugin sends it exactly where Claude Code's own telemetry does under the session's settings, and nowhere more.
+
+These settings govern what the plugin sends. Where an organization's env block is in place, Claude Code's own exporter goes on sending its rows, spans and metrics under Claude Code's switches; the plugin only stamps the exporter's rows and cannot change what that exporter sends. A setting named in the Default column is the Claude Code switch that governs the data point (see Defaults, below).
 
 | ID | Class | What it is | Where it goes (Claude Code's names) | Default |
 | --- | --- | --- | --- | --- |
@@ -125,9 +132,11 @@ Everything the plugin sends belongs to one data point, named by an ID. Four are 
 
 Never sent, whatever the settings: images and other attachments, the system prompt, `CLAUDE.md` and memory files, and raw API request and response bodies.
 
-**Defaults.** With no settings for a data point, the plugin sends it as Claude Code's own telemetry does with Mainwave's org-wide setup captures on (`OTEL_LOG_TOOL_DETAILS`, `OTEL_LOG_TOOL_CONTENT`, `OTEL_LOG_USER_PROMPTS`, `OTEL_METRICS_INCLUDE_REPOSITORY`), in Claude Code and Cowork alike, whether or not those switches are set. Where Claude Code's row leaves a value out (Cowork's export carries no tool details, content or prompts), the plugin adds what it read in its own hooks: the call's parameters and input, the prompt, the response. A data point Claude Code doesn't send even with all four on (thinking) is off. A switch the session's environment sets to `0` (or `false`, `no`, `off`) keeps what it governs as Claude Code sends it with that switch off: Mainwave's org-wide setup writes `0` for a capture an admin turns off, and the plugin keeps that choice. An explicit setting for a data point wins over both; the plugin reads explicit settings from its store, where a later version keeps the organization's settings from Mainwave.
+**Defaults.** With no settings for a data point, the plugin sends it as Claude Code's own telemetry does with Mainwave's org-wide setup captures on (`OTEL_LOG_TOOL_DETAILS`, `OTEL_LOG_TOOL_CONTENT`, `OTEL_LOG_USER_PROMPTS`, `OTEL_METRICS_INCLUDE_REPOSITORY`), in Claude Code and Cowork alike, whether or not those switches are set. Where Claude Code's row leaves a value out (Cowork's export carries no tool details, content or prompts), the plugin adds what it read in its own hooks: the call's parameters and input, the prompt, the response. A data point Claude Code doesn't send even with all four on (thinking) is off. A switch the session's environment sets to `0` (or `false`, `no`, `off`) turns what it governs to as Claude Code sends it, which with that switch off is little or nothing: Mainwave's org-wide setup writes `0` for a capture an admin turns off, and the plugin keeps that choice. An explicit setting for a data point wins over both; the plugin reads explicit settings from its store, where a later version keeps the organization's settings from Mainwave.
 
-**When it is decided.** As a record is captured, and again as it is sent, so a record queued before a data point was turned off, or left in the outbox by an earlier session, goes without it.
+**When it is decided.** As a record is captured, and again as it is sent, so a record queued before a data point was turned off goes without it. A record an earlier session left in the outbox went through that session's settings, which this one doesn't know, so a data point set to as Claude Code sends it goes on that record only if it is on.
+
+**What Claude Code withholds whatever its switches say,** the plugin withholds too where it can see it: an account-memory tool's (`mcp__memory__memory_*`) input and output are recorded only as their length, and responses to Claude Code's memory operations and other requests outside the conversation are not filled in. Claude Code also takes account-memory text out of the prompts and responses it records; the plugin can't see the account's memory, so a prompt or response it fills in keeps such text.
 
 **Always on.** Whatever the settings, every identifier and content value but the session's identity is cleaned on the machine before it is queued:
 

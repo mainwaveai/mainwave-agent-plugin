@@ -54,6 +54,9 @@ describe('rowFill', () => {
     expect(rowFill(c, 'assistant_response', { response: '<REDACTED>', response_length: 9 })).toEqual({ attributes: { response: 'Fixed it.' } })
     expect(rowFill(c, 'assistant_response', { response: '<REDACTED>', response_length: 3 })).toEqual({})
     expect(rowFill(c, 'assistant_response', { response: '<REDACTED>', response_length: 9, agent_id: 'a1' })).toEqual({})
+    // A request outside the main loop and its subagents (a title, a memory operation) streamed nothing a hook saw.
+    expect(rowFill(c, 'assistant_response', { response: '<REDACTED>', response_length: 9, query_source: 'extract_memories' })).toEqual({})
+    expect(rowFill(c, 'assistant_response', { response: '<REDACTED>', response_length: 9, query_source: 'repl_main_thread' })).toEqual({ attributes: { response: 'Fixed it.' } })
     expect(streamedThinking(c, undefined)).toBe('hmm')
   })
 
@@ -63,5 +66,13 @@ describe('rowFill', () => {
     expect(rowFill(c, 'tool_decision', { tool_use_id: 'toolu_1' })).toEqual({ parameters: { bash_command: 'git', full_command: 'git push', mcp_server_name: 'remote-devices', mcp_tool_name: 'device_bash' } })
     expect(rowFill(c, 'tool_result', { tool_use_id: 'toolu_1' }).attributes).toEqual({ tool_input: '{"command":"git push"}' })
     expect(rowFill(c, 'tool_result', { tool_use_id: 'toolu_2' })).toEqual({})
+    // Its result row was its last: the input is let go.
+    expect(c.tools.has('toolu_1')).toBe(false)
+  })
+
+  test("an account-memory tool's input is recorded as its length alone, as Claude Code records it", () => {
+    const c = newCapture()
+    captureTool(c, 'toolu_1', 'mcp__memory__memory_write', { text: 'my dentist is Dr. Example' })
+    expect(rowFill(c, 'tool_result', { tool_use_id: 'toolu_1' }).attributes).toEqual({ tool_input: '<36 chars; not recorded>' })
   })
 })

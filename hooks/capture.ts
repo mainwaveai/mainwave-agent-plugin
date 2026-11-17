@@ -9,13 +9,22 @@
 import type { TelemetryAttribute } from 'claude-code'
 
 import type { RowFill } from './gate.ts'
-import { mcpParts } from './derive.ts'
+import { mcpParts, metricQuerySource } from './derive.ts'
 
 /**
  * MCP tools that run a shell command on the person's computer, by server and tool: their commands count as Bash commands do.
  * Cowork's `device_bash` takes `{ command, description? }`, and answers a command that exits non-zero as an error.
  */
 export const SHELL_TOOLS: readonly (readonly [string, string])[] = [['remote-devices', 'device_bash']]
+
+/**
+ * The account-memory MCP tools (`mcp__memory__memory_*`): Claude Code records their input and output only as their length, whatever
+ * its switches say, and so does the plugin.
+ */
+export const isAccountMemoryTool = (name: string): boolean => name.startsWith('mcp__memory__memory_')
+
+/** A value recorded only as its length, as Claude Code records an account-memory tool's. */
+export const notRecorded = (text: string): string => `<${text.length} chars; not recorded>`
 
 /** The command a call runs, for Bash and the MCP shell tools; undefined for any other call. */
 export function shellCommand(name: string, input: Readonly<Record<string, unknown>>): string | undefined {
@@ -161,6 +170,9 @@ export function rowFill(c: Capture, event: string, attributes: Readonly<Record<s
       return { attributes: { prompt: text!, prompt_text: text! } }
     }
     case 'assistant_response': {
+      // Only a request of the main loop or a subagent's streams through a hook: another (a title, a memory operation) has nothing here.
+      const source = metricQuerySource(attributes['query_source'])
+      if (source !== undefined && source !== 'main' && source !== 'subagent') return {}
       const s = c.streams.get(loopKey(attributes['agent_id']))
       if (!s) return {}
       // Claude Code joins a response's text blocks with a newline.
@@ -175,7 +187,10 @@ export function rowFill(c: Capture, event: string, attributes: Readonly<Record<s
       const tool = typeof id === 'string' ? c.tools.get(id) : undefined
       if (!tool) return {}
       const parameters = toolParameters(tool.name, tool.input)
-      return event === 'tool_result' ? { parameters, attributes: { tool_input: toolInputPreview(tool.input) } } : { parameters }
+      if (event !== 'tool_result') return { parameters }
+      // The call's last row: its input is let go.
+      c.tools.delete(id as string)
+      return { parameters, attributes: { tool_input: isAccountMemoryTool(tool.name) ? notRecorded(JSON.stringify(tool.input)) : toolInputPreview(tool.input) } }
     }
     default:
       return {}

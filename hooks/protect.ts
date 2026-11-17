@@ -43,27 +43,34 @@ const SECRETS: readonly Rule[] = [
   { name: 'slack_token', pattern: /(?:xox[abcdprs]|xapp)-[A-Za-z0-9-]{10,256}/g },
   { name: 'private_key', pattern: /-----BEGIN (?:[A-Z]{1,16} ){0,4}PRIVATE KEY(?: BLOCK)?-----[\s\S]{0,8192}?-----END (?:[A-Z]{1,16} ){0,4}PRIVATE KEY(?: BLOCK)?-----/g },
   { name: 'jwt', pattern: /eyJ[A-Za-z0-9_-]{10,1024}\.[A-Za-z0-9_-]{10,8192}\.[A-Za-z0-9_-]{10,8192}/g },
+  // A private key cut short before its END line (a preview, a value cut at the limit): its body to where it stops.
+  { name: 'private_key', pattern: /-----BEGIN (?:[A-Z]{1,16} ){0,4}PRIVATE KEY(?: BLOCK)?-----[A-Za-z0-9+/=\s:,-]{0,8192}/g },
 ]
 
 const marker = (name: string) => `[REDACTED:${name}]`
 const isMarker = (value: string) => value.startsWith('[REDACTED')
+/** A value no secret is: a marker already, or a plain number (`max_tokens: 4096`, `token.ts:42`). */
+const notSecret = (value: string) => isMarker(value) || /^\d+$/.test(value)
 
-/** The plugin's own rules beside them: header values, passwords in web addresses, values of names that say they are secret. */
+/**
+ * The plugin's own rules beside them: header values, passwords in web addresses, values of names that say they are secret. Every run
+ * of characters is bounded, so a long value without a match is read in time linear in its length.
+ */
 const ASSIGNED: readonly Rule[] = [
   {
     name: 'authorization',
-    pattern: /\b((?:proxy-)?authorization["']?\s*[:=]\s*["']?(?:(?:bearer|basic|token|digest)\s+)?)([^\s"',;]+)/gi,
-    replace: (m, head: string, value: string) => (isMarker(value) ? m : `${head}${marker('authorization')}`),
+    pattern: /\b((?:proxy-)?authorization["']?[ \t]{0,8}[:=][ \t]{0,8}["']?(?:(?:bearer|basic|token|digest)[ \t]{1,8})?)([^\s"',;]{1,4096})/gi,
+    replace: (m, head: string, value: string) => (notSecret(value) ? m : `${head}${marker('authorization')}`),
   },
   {
     name: 'url_password',
-    pattern: /(\b[a-z][a-z0-9+.-]*:\/\/[^\s:@/]+:)([^\s@/]+)(@)/gi,
+    pattern: /(\b[a-z][a-z0-9+.-]{0,31}:\/\/[^\s:@/]{1,256}:)([^\s@/]{1,1024})(@)/gi,
     replace: (m, head: string, value: string, at: string) => (isMarker(value) ? m : `${head}${marker('url_password')}${at}`),
   },
   {
     name: 'assigned_secret',
-    pattern: /\b([A-Za-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)[A-Za-z0-9_.-]*)(["']?\s*[:=]\s*["']?)([^\s"'&,;]+)/gi,
-    replace: (m, name: string, sep: string, value: string) => (isMarker(value) ? m : `${name}${sep}${marker('assigned_secret')}`),
+    pattern: /((?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)[A-Za-z0-9_.-]{0,64})(["']?[ \t]{0,8}[:=][ \t]{0,8}["']?)([^\s"'&,;)\]}]{1,4096})/gi,
+    replace: (m, name: string, sep: string, value: string) => (notSecret(value) ? m : `${name}${sep}${marker('assigned_secret')}`),
   },
 ]
 

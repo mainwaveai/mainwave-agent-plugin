@@ -35,7 +35,7 @@
 
 import type { TelemetryAttribute } from 'claude-code'
 
-import { shellCommand } from './capture.ts'
+import { isAccountMemoryTool, notRecorded, shellCommand } from './capture.ts'
 import { TOOL_OUTPUT_EVENT } from './catalog.ts'
 import { bashClass, CODE_EDIT_TOOLS, errorClassOf, genAiProvider, gitCounts, languageOf, linesChanged, mcpCreatesPr, mcpParts, metricQuerySource, querySourceSafe, toolNameSafe } from './derive.ts'
 import { allows, type Gate } from './gate.ts'
@@ -763,7 +763,7 @@ function interactionSpan(r: Rebuild, i: { ctx?: Ctx; prompt?: Prompt; text: stri
 export function toolStart(r: Rebuild, e: { tool: string; tool_use_id?: string; agentId?: string } & Readonly<Record<string, unknown>>, nowMs: number): void {
   const id = e.tool_use_id
   if (!id) return
-  const { tool: name, tool_use_id: _id, agentId, consent: _consent, ...input } = e
+  const { tool: name, tool_use_id: _id, agentId, consent: _consent, requestMeta: _meta, ...input } = e
   // In coherent mode a call sits under the interaction open now, or, a subagent's, under its Agent call's run (found when its spans
   // go, if the subagent is not known yet; where it was first seen, if no Agent call ever names it).
   let home: Home | undefined
@@ -816,7 +816,9 @@ export function toolEnd(r: Rebuild, id: string | undefined, result: { isError?: 
   const measures: Measure[] = []
   const ok = !tool.isError && result?.deny === undefined
   const gate = r.settings.gate()
-  if (tool.isError && typeof result?.text === 'string' && result.text !== '') tool.errorText = result.text
+  // The text a failed call answered: for a built-in tool or an MCP shell tool. Another MCP tool's error can carry what it was handed
+  // (a file being uploaded, account memory), which Claude Code never records.
+  if (tool.isError && typeof result?.text === 'string' && result.text !== '' && (!mcpParts(tool.name) || shellCommand(tool.name, tool.input) !== undefined)) tool.errorText = result.text
   if (ok && allows(gate, 'tool.result', false)) {
     const output = toolOutput(r, tool, result?.result)
     if (output) tool.output = { atMs: nowMs, attributes: output }
@@ -901,7 +903,7 @@ function toolOutput(r: Rebuild, tool: Tool, data: unknown): Attrs | undefined {
   const path = input['file_path']
   if (mcpParts(tool.name)) {
     const text = mcpText(data)
-    if (text !== undefined) out.push(['output', text])
+    if (text !== undefined) out.push(['output', isAccountMemoryTool(tool.name) ? notRecorded(text) : text])
   } else if (data !== null && typeof data === 'object') {
     const d = data as Record<string, unknown>
     if (tool.name === 'Read') {
@@ -1016,7 +1018,9 @@ function sendExecution(r: Rebuild, tool: Tool): Emit {
   // tool results on beyond Claude Code's switches, the text is the one the call answered.
   const gate = r.settings.gate()
   const text = allows(gate, 'tool.result', true) ? tool.result?.error : undefined
-  const error = text ?? (allows(gate, 'tool.result', false) ? tool.errorText : undefined) ?? tool.result?.errorType
+  // The text can repeat what the call read and ran: it goes with tool input too.
+  const own = allows(gate, 'tool.result', false) && allows(gate, 'tool.input', false) ? tool.errorText : undefined
+  const error = text ?? own ?? tool.result?.errorType
   const spanId = (tool.spawned && r.execOfAgent.get(tool.spawned)) || r.mint(16)
   const traceId = retrace(r, tool.decision?.ctx?.traceId ?? tool.result?.ctx?.traceId ?? homeOfTool(r, tool)?.traceId ?? r.mint(32))
   return {

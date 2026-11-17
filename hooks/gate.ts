@@ -106,7 +106,7 @@ const put = (out: Attrs, key: string, value: TelemetryAttribute) => Object.defin
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v)
 
 /** `tool_parameters`, its keys gated one by one and what the plugin read added; undefined when nothing is left. */
-function gateParameters(gate: Gate, raw: TelemetryAttribute | undefined, fill: Readonly<Record<string, unknown>> | undefined): string | undefined {
+function gateParameters(gate: Gate, raw: TelemetryAttribute | undefined, fill: Readonly<Record<string, unknown>> | undefined, sent = true): string | undefined {
   let parsed: Record<string, unknown> | undefined
   if (typeof raw === 'string') {
     try {
@@ -116,13 +116,13 @@ function gateParameters(gate: Gate, raw: TelemetryAttribute | undefined, fill: R
       parsed = undefined
     }
     // Not an object Claude Code would write: it goes whole, or not at all, as tool input.
-    if (parsed === undefined) return allows(gate, 'tool.input', true) ? raw : undefined
+    if (parsed === undefined) return allows(gate, 'tool.input', sent) ? raw : undefined
   }
   const out: Record<string, unknown> = {}
   let changed = false
   for (const [k, v] of Object.entries(parsed ?? {})) {
     const id = PARAMETER_OWNERS[k]
-    if (id === undefined || allows(gate, id, true)) out[k] = v
+    if (id === undefined || allows(gate, id, sent)) out[k] = v
     else changed = true
   }
   for (const [k, v] of Object.entries(fill ?? {})) {
@@ -154,13 +154,14 @@ export function protect(gate: Gate, record: string, attributes: Attrs, all = fal
       put(out, key, value)
       continue
     }
-    const r = redact(value)
+    // Cut first, so the secret rules read a value of bounded length.
+    const c = cut(value, gate.limit)
+    const r = redact(c.text)
     count += r.count
-    const c = cut(r.text, gate.limit)
-    put(out, key, c.text)
+    put(out, key, r.text)
     if (c.truncated) {
       put(out, `${key}_truncated`, true)
-      put(out, `${key}_original_length`, r.text.length)
+      put(out, `${key}_original_length`, value.length)
     }
   }
   return { attributes: out, count }
@@ -180,26 +181,30 @@ function withCount(attributes: Attrs, count: number): Attrs {
  * what the plugin read added where its data point is on, then the protections. `record` is a row's event, or a span's or a metric's
  * name.
  */
-export function gateAttributes(gate: Gate, record: string, attributes: Readonly<Attrs>, fill: RowFill = {}): Attrs {
+export function gateAttributes(gate: Gate, record: string, attributes: Readonly<Attrs>, fill: RowFill = {}, strict = false): Attrs {
   const out: Attrs = {}
-  const mcpOff = !allows(gate, 'tool.mcp', true)
+  // What is there goes where Claude Code would have sent it; `strict`, for a record whose capture this load did not see, only where
+  // the data point is on.
+  const sent = !strict
+  const mcpOff = !allows(gate, 'tool.mcp', sent)
   for (const [key, value] of Object.entries(attributes)) {
     if (key === 'tool_parameters') {
-      const p = gateParameters(gate, value, fill.parameters)
+      const p = gateParameters(gate, value, fill.parameters, sent)
       if (p !== undefined) put(out, key, p)
       continue
     }
     if (key === 'tool_input') {
-      if (allows(gate, 'tool.input', true)) put(out, key, value)
+      if (allows(gate, 'tool.input', sent)) put(out, key, value)
       continue
     }
     // An MCP tool's name names its server and tool: with those off, it reads as Claude Code writes it when it withholds them.
-    if (mcpOff && (key === 'tool_name' || (key === 'gen_ai.tool.name' && attributes['anthropic.mcp.server.name'] !== undefined)) && typeof value === 'string' && (value.startsWith('mcp__') || key === 'gen_ai.tool.name')) {
-      if (allows(gate, 'tool.call', true)) put(out, key, 'mcp_tool')
+    const mcpName = typeof value === 'string' && (value.startsWith('mcp__') || (key === 'gen_ai.tool.name' && attributes['anthropic.mcp.server.name'] !== undefined))
+    if (mcpOff && mcpName && (key === 'tool_name' || key === 'gen_ai.tool.name' || key === 'tool_name_safe')) {
+      if (allows(gate, 'tool.call', sent)) put(out, key, key === 'tool_name_safe' ? 'mcp_other' : 'mcp_tool')
       continue
     }
     const owner = ownerOf(record, key)
-    if (owner === undefined || allows(gate, owner.id, true)) put(out, key, value)
+    if (owner === undefined || allows(gate, owner.id, sent)) put(out, key, value)
     else if (owner.redact) put(out, key, '<REDACTED>')
   }
   // What the plugin read, where Claude Code left it out or withheld it, and its data point is on.
@@ -221,14 +226,14 @@ export function gateAttributes(gate: Gate, record: string, attributes: Readonly<
 }
 
 /** A span event through the gate: its attributes, or null when its data point is off. A tool's output is all content. */
-export function gateEvent(gate: Gate, event: { name: string; timeMs: number; attributes: Readonly<Attrs> }): { event: typeof event; count: number } | null {
+export function gateEvent(gate: Gate, event: { name: string; timeMs: number; attributes: Readonly<Attrs> }, strict = false): { event: typeof event; count: number } | null {
   if (event.name !== TOOL_OUTPUT_EVENT) return { event, count: 0 }
-  if (!allows(gate, 'tool.result', true)) return null
+  if (!allows(gate, 'tool.result', !strict)) return null
   const kept: Attrs = {}
   for (const [key, value] of Object.entries(event.attributes)) {
     const base = key.replace(/_(truncated|original_length)$/, '')
     const id = OUTPUT_OWNERS[base]
-    if (id === undefined || allows(gate, id, true)) put(kept, key, value)
+    if (id === undefined || allows(gate, id, !strict)) put(kept, key, value)
   }
   const { attributes, count } = protect(gate, event.name, kept, true)
   return { event: { ...event, attributes }, count }
@@ -238,16 +243,18 @@ export function gateEvent(gate: Gate, event: { name: string; timeMs: number; att
 const COUNTED_BY: Readonly<Record<string, DataPointId>> = { 'claude_code.commit.count': 'bash.outcome', 'claude_code.pull_request.count': 'bash.outcome' }
 
 /** Whether a metric's points may go at all. */
-export const metricAllowed = (gate: Gate, name: string): boolean => COUNTED_BY[name] === undefined || allows(gate, COUNTED_BY[name]!, true)
+export const metricAllowed = (gate: Gate, name: string, strict = false): boolean => COUNTED_BY[name] === undefined || allows(gate, COUNTED_BY[name]!, !strict)
 
 /**
  * A span the plugin rebuilt, through the gate: its attributes and events, and its status message, which repeats a failed run's
  * `error`. A run's error text is a tool result: with those off, the run keeps only the error's class, as Claude Code's does.
  */
-export function gateSpan(gate: Gate, span: BuiltSpan): BuiltSpan {
-  let attributes = gateAttributes(gate, span.name, span.attributes)
+export function gateSpan(gate: Gate, span: BuiltSpan, strict = false): BuiltSpan {
+  let attributes = gateAttributes(gate, span.name, span.attributes, {}, strict)
   let status = span.status
-  if (span.name === 'claude_code.tool.execution' && !allows(gate, 'tool.result', true) && attributes['error'] !== undefined && attributes['error'] !== attributes['error_class']) {
+  // A failed run's error text can repeat what the call read and ran: it goes with tool results and tool input alone.
+  const errorText = allows(gate, 'tool.result', !strict) && allows(gate, 'tool.input', !strict)
+  if (span.name === 'claude_code.tool.execution' && !errorText && attributes['error'] !== undefined && attributes['error'] !== attributes['error_class']) {
     const { error: _text, ...rest } = attributes
     const cls = attributes['error_class']
     attributes = cls === undefined ? rest : gateAttributes(gate, span.name, { ...attributes, error: cls })
@@ -259,7 +266,7 @@ export function gateSpan(gate: Gate, span: BuiltSpan): BuiltSpan {
   let count = 0
   const events: NonNullable<BuiltSpan['events']> = []
   for (const e of span.events ?? []) {
-    const g = gateEvent(gate, e)
+    const g = gateEvent(gate, e, strict)
     if (g === null) continue
     events.push(g.event)
     count += g.count
@@ -268,11 +275,11 @@ export function gateSpan(gate: Gate, span: BuiltSpan): BuiltSpan {
 }
 
 /** A copied row through the gate again, as it is sent: nothing is added, only what the gate in force now holds back is removed. */
-export function gateRow(gate: Gate, row: CopiedRow): CopiedRow {
-  return { ...row, attributes: gateAttributes(gate, row.event, row.attributes) }
+export function gateRow(gate: Gate, row: CopiedRow, strict = false): CopiedRow {
+  return { ...row, attributes: gateAttributes(gate, row.event, row.attributes, {}, strict) }
 }
 
 /** A metric point through the gate: null when its metric's data point is off. */
-export function gatePoint(gate: Gate, point: MetricPoint): MetricPoint | null {
-  return metricAllowed(gate, point.name) ? { ...point, attributes: gateAttributes(gate, point.name, point.attributes) } : null
+export function gatePoint(gate: Gate, point: MetricPoint, strict = false): MetricPoint | null {
+  return metricAllowed(gate, point.name, strict) ? { ...point, attributes: gateAttributes(gate, point.name, point.attributes, {}, strict) } : null
 }

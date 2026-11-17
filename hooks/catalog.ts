@@ -147,7 +147,7 @@ export const PARAMETER_OWNERS: Readonly<Record<string, DataPointId>> = {
 
 /** The span event that carries a tool's result (`OTEL_LOG_TOOL_CONTENT`), and the data points of its attributes. */
 export const TOOL_OUTPUT_EVENT = 'tool.output'
-export const OUTPUT_OWNERS: Readonly<Record<string, DataPointId>> = { file_path: 'file.path', bash_command: 'bash.command' }
+export const OUTPUT_OWNERS: Readonly<Record<string, DataPointId>> = { file_path: 'file.path', bash_command: 'bash.command', diff: 'tool.input' }
 
 const byKey = new Map<string, Owned[]>()
 for (const o of OWNED) byKey.set(o.key, [...(byKey.get(o.key) ?? []), o])

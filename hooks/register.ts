@@ -434,7 +434,8 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
   try {
     r = await rebuildOf($)
     if (r !== null) {
-      const { tool, tool_use_id: id, agentId: _agent, consent: _consent, ...input } = e as unknown as { tool: string; tool_use_id?: string; agentId?: string; consent?: string } & Record<string, unknown>
+      // The call's own arguments: what the engine adds beside them is not the tool's input.
+      const { tool, tool_use_id: id, agentId: _agent, consent: _consent, requestMeta: _meta, ...input } = e as unknown as { tool: string; tool_use_id?: string; agentId?: string; consent?: string; requestMeta?: unknown } & Record<string, unknown>
       captureTool(capture, id, tool, input)
       toolStart(r, e as never, await $.clock.now())
     }
