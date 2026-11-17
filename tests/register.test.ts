@@ -50,7 +50,7 @@ describe('stamping', () => {
 
   test('keys under the old mainwave.mod. prefix are removed, on a row with an organization or without', async ($, on) => {
     const rig = boot(on, { entrypoint: 'cli' })
-    const old = { 'mainwave.mod.name': 'mainwave-telemetry', 'mainwave.mod.version': '0.20.1', 'mainwave.mod.entrypoint': 'cli' }
+    const old = { 'mainwave.mod.name': 'old-plugin', 'mainwave.mod.version': '0.9.0', 'mainwave.mod.entrypoint': 'cli' }
     const a = await log(rig, $, { ...inOrg, ...old })
     expect(ownedKeys(a)).toEqual(STAMPED)
     expect(contractViolations(a)).toEqual([])

@@ -35,7 +35,7 @@ describe('filterStamps', () => {
   })
 
   const bad: [string, unknown][] = [
-    ['mainwave.plugin.name', 'mainwave-telemetry'],
+    ['mainwave.plugin.name', 'mainwave-other'],
     ['mainwave.plugin.version', '1.2'],
     ['mainwave.plugin.version', `1.2.3-${'a'.repeat(70)}`],
     ['mainwave.plugin.entrypoint', 'made-up'],
