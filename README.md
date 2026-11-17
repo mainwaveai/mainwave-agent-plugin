@@ -5,7 +5,7 @@ The Mainwave plugin for Claude Code and Cowork. It reports Claude sessions to [M
 It is a Claude Code mod: TypeScript that runs inside Claude Code and Cowork. Nothing needs installing on the machine: no Node, Python or CLI.
 
 > [!IMPORTANT]
-> Requires Claude Code 2.1.317 or later, in every place a session runs: a remote machine, a script, an IDE extension or the desktop app can run an older copy than the terminal does. `claude --version` shows the version; `claude update` updates a native install, and a Homebrew, WinGet or Linux package install updates through its package manager. Older versions send less or nothing; see [Install](#install).
+> Requires Claude Code 2.1.317 or later, in every place a session runs: a remote machine, a script, an IDE extension or the desktop app can run an older copy than the terminal does. `claude --version` shows the version; `claude update` updates a native install, and other installs update through their package manager. Older versions send less or nothing; see [Install](#install).
 
 ## What it does today
 
@@ -173,17 +173,19 @@ In rough order, each in a later version:
 
 Needs Claude Code 2.1.317 or later.
 
-`claude --version` shows the version. `claude update` updates a native install; a Homebrew, WinGet, apt, dnf or apk install updates through that package manager (`brew upgrade claude-code`, `winget upgrade Anthropic.ClaudeCode`, `sudo apt upgrade claude-code` and so on), and by default does not update by itself. On an older version the session is unaffected, as the plugin fails open, but the plugin sends less or nothing:
+`claude --version` shows the version, and `claude update` updates a native install. Other installs update through their package manager: `brew upgrade claude-code`, `winget upgrade Anthropic.ClaudeCode`, `sudo apt update && sudo apt upgrade claude-code` (dnf and apk alike) or `npm install -g @anthropic-ai/claude-code@latest`. Homebrew, WinGet and Linux package installs do not update by themselves by default.
+
+On an older version the session is unaffected, as the plugin fails open, but the plugin sends less or nothing:
 
 - Below 2.1.299, its hooks module does not load, so it stamps and sends nothing.
 - From 2.1.299 to 2.1.316, its copy's spans lack `gen_ai.provider.name`, and on early versions of that range its keyless copy has gaps too (rows that name the wrong parent span, subagents' requests missing).
 
 The version that counts is the one each session runs, and a person who has updated Claude Code in their terminal may still run older copies elsewhere:
 
-- **Remote machines.** A session over SSH, or in a container or VM, runs the Claude Code on that machine, not the local one: update it there. The desktop app's SSH sessions run a copy the app installs on the remote machine.
+- **Remote machines.** A session over SSH, or in a container or VM, runs the Claude Code on that machine, not the local one: update it there. The desktop app's SSH sessions are the exception: they run a copy the app installs on that machine, not its `claude`.
 - **Scripts and CI.** A `claude -p` run uses the binary its job installs, often a pinned version. Raise the pin.
-- **IDE extensions.** The VS Code extension runs a copy of Claude Code it bundles, unless `claudeProcessWrapper` points it at another, and its version number is that copy's: update the extension. The JetBrains plugin runs the `claude` on the machine's `PATH`, or the one its settings name: update that.
-- **The desktop app.** In a local session, its Code tab runs its own copy of Claude Code, which the app downloads and updates, so it can differ from the terminal's `claude`, and updating one does not update the other. Update the app: **Claude › Check for Updates…** on macOS, **Help › Check for Updates…** on Windows.
+- **IDE extensions.** The VS Code extension runs the copy of Claude Code it bundles, and its version number is that copy's: update the extension. If its `claudeProcessWrapper` setting names another `claude`, that one runs instead: update it. The JetBrains plugin runs the `claude` on the machine's `PATH`, or the one its settings name: update that.
+- **The desktop app.** In a local session, its Code tab runs its own copy of Claude Code, which the app downloads and updates, so it can differ from the terminal's `claude`, and updating one does not update the other. `/status` in a session there shows its version. Update the app (**Claude › Check for Updates…** on macOS, **Help › Check for Updates…** on Windows), then start a new session.
 
 An organization can turn older versions away: the managed setting `requiredMinimumVersion`, set to the floor, makes Claude Code below it exit at startup (it is read from Claude Code 2.1.163 on).
 
