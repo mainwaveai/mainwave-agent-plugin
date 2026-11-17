@@ -9,7 +9,7 @@
 export const PLUGIN_NAME = 'mainwave'
 
 /** Key prefixes the plugin owns. Any key under one of them that the plugin did not write this time is removed from the row. */
-export const OWNED_PREFIXES: readonly string[] = ['mainwave.mod.', 'mainwave.telemetry.']
+export const OWNED_PREFIXES: readonly string[] = ['mainwave.mod.', 'mainwave.telemetry.', 'mainwave.redaction.']
 
 /** Every key the plugin stamps. */
 export type StampKey = 'mainwave.mod.name' | 'mainwave.mod.version' | 'mainwave.mod.entrypoint' | 'mainwave.telemetry.route'
@@ -33,6 +33,14 @@ export const STAMP_RULES: Readonly<Record<StampKey, (value: string) => boolean>>
   'mainwave.mod.version': v => v.length <= 64 && SEMVER.test(v),
   'mainwave.mod.entrypoint': v => ENTRYPOINTS.includes(v),
   'mainwave.telemetry.route': v => ROUTES.includes(v),
+}
+
+/** The count of secrets the always-on protections replaced in a record's values (gate.ts), under Mainwave's SDKs' name for it. */
+export const REDACTION_COUNT = 'mainwave.redaction.count'
+
+/** The keys the plugin writes with a number, and the value each may carry. */
+export const COUNT_RULES: Readonly<Record<typeof REDACTION_COUNT, (value: number) => boolean>> = {
+  [REDACTION_COUNT]: v => Number.isInteger(v) && v >= 1 && v <= 1_000_000,
 }
 
 /** `CLAUDE_CODE_ENTRYPOINT`, normalized to the list above. */

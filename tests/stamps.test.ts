@@ -6,7 +6,7 @@ import { applyStamps, entrypointOf, filterStamps, stripOwned } from '../hooks/st
 
 describe('stripOwned', () => {
   test('removes every key under an owned prefix and keeps the rest in order', () => {
-    const out = stripOwned({ a: 1, 'mainwave.mod.name': 'x', b: 'two', 'mainwave.telemetry.anything': 'y', 'mainwave.attr.k': 'v' })
+    const out = stripOwned({ a: 1, 'mainwave.mod.name': 'x', b: 'two', 'mainwave.telemetry.anything': 'y', 'mainwave.redaction.count': 3, 'mainwave.attr.k': 'v' })
     expect(Object.keys(out)).toEqual(['a', 'b', 'mainwave.attr.k'])
   })
 

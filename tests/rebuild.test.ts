@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'claude-code/testing'
 
+import { resolveGate, type Overrides } from '../hooks/gate.ts'
 import type { BuiltSpan } from '../hooks/otlp.ts'
 import {
   agentSpawned, commandEnd, commandStart, commonOf, isCoherent, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, takeReady, sessionStarted, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart,
@@ -16,10 +17,16 @@ const BLOCKED = '1111111111111111'
 const AGENT_EXEC = '2222222222222222'
 const COMMON = { 'mainwave.source': 'coding_agent.claude_code', 'organization.id': ORG, 'user.id': 'device-1', 'session.id': 's-1', 'anthropic.provider': 'firstParty', 'terminal.type': 'cli' }
 
+/** The gate a session's switches and explicit settings give: with neither, the defaults. */
+const gate = (env: Record<string, string> = {}, overrides: Overrides = {}) => {
+  const g = resolveGate(env, overrides)
+  return () => g
+}
+
 /** A rebuild whose new ids count up, so tests can name them. */
 function rebuild(settings: Partial<Settings> = {}): Rebuild {
   let n = 0
-  return newRebuild({ toolDetails: true, claudeTraces: true, ...settings }, len => (++n).toString(16).padStart(len, 'a'))
+  return newRebuild({ gate: gate(), claudeTraces: true, ...settings }, len => (++n).toString(16).padStart(len, 'a'))
 }
 
 const row = (event: string, atMs: number, attributes: Record<string, unknown>, spanId?: string): RowIn => ({
@@ -126,8 +133,8 @@ describe('one turn', () => {
     expect(measures.filter(m => m.name === 'claude_code.active_time.total')).toEqual([{ name: 'claude_code.active_time.total', value: 0.15, attributes: { ...COMMON, type: 'cli' }, atMs: 230 }])
   })
 
-  test('without OTEL_LOG_TOOL_DETAILS a tool span carries no command, but still its class', () => {
-    const { spans } = turn(rebuild({ toolDetails: false }))
+  test('with OTEL_LOG_TOOL_DETAILS set to 0 a tool span carries no command, but still its class, as in Claude Code', () => {
+    const { spans } = turn(rebuild({ gate: gate({ OTEL_LOG_TOOL_DETAILS: '0' }) }))
     const [tool] = named(spans, 'tool')
     expect(tool!.attributes['full_command']).toBeUndefined()
     expect(tool!.attributes['bash_argv0']).toBe('echo')

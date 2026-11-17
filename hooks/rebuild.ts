@@ -35,9 +35,13 @@
 
 import type { TelemetryAttribute } from 'claude-code'
 
+import { isAccountMemoryTool, notRecorded, shellCommand } from './capture.ts'
+import { TOOL_OUTPUT_EVENT } from './catalog.ts'
 import { bashClass, CODE_EDIT_TOOLS, errorClassOf, genAiProvider, gitCounts, languageOf, linesChanged, mcpCreatesPr, mcpParts, metricQuerySource, querySourceSafe, toolNameSafe } from './derive.ts'
+import { allows, type Gate } from './gate.ts'
 import type { Measure } from './meter.ts'
 import type { BuiltSpan } from './otlp.ts'
+import { cut } from './protect.ts'
 import { stripOwned } from './stamps.ts'
 
 type Attrs = Record<string, TelemetryAttribute>
@@ -48,8 +52,11 @@ export type RowIn = { event: string; atMs: number; span?: Ctx; attributes: Reado
 
 /** What the session's environment says about the exporter, read once per load. */
 export type Settings = {
-  /** `OTEL_LOG_TOOL_DETAILS`: a tool span carries the file path, the command, the skill or the agent type. */
-  toolDetails: boolean
+  /**
+   * The gate in force (gate.ts): what the spans carry beyond Claude Code's switches, the file path, the command, the skill or the
+   * agent type, the prompt, a tool's output. Read as each span is built, so a change reaches the next span.
+   */
+  gate: () => Gate
   /** `TRACEPARENT`, when set: the trace an SDK host started, which the first interaction joins. */
   traceparent?: Ctx
   /** The longest string an attribute keeps (`OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT`, else `OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT`). */
@@ -80,7 +87,7 @@ type Req = RowIn & { home?: { traceId: string; parentId?: string; context: 'inte
 
 /** A prompt row of a slash command: its text starts with `/`, or is redacted, so nothing says it is not. */
 const slashPrompt = (p: Prompt) => typeof p.text !== 'string' || p.text === '<REDACTED>' || p.text.startsWith('/')
-type Step = { loop: string; startMs: number; endMs: number; stopReason: string | null; usage: StepUsage | null }
+type Step = { loop: string; startMs: number; endMs: number; stopReason: string | null; usage: StepUsage | null; thinking?: string }
 type StepUsage = { input_tokens: number; output_tokens: number; cache_read_input_tokens: number; cache_creation_input_tokens: number }
 type Waiting = { row: Req; heldAtMs: number }
 type Tool = {
@@ -106,6 +113,9 @@ type Tool = {
   home?: Home
   /** In coherent mode, the span id of the call's run, made when it first starts a subagent: every subagent it starts sits under it. */
   execId?: string
+  /** What the call answered, as the plugin read it: its output for `tool.output`, and the text of an error. */
+  output?: { atMs: number; attributes: Attrs }
+  errorText?: string
   /** The tool span and its children are sent; an Agent call's execution may wait for its subagent to name it. */
   sent: boolean
   execWaits: boolean
@@ -520,9 +530,9 @@ export function stepStart(r: Rebuild, agentId: string | undefined, model: string
  * A `turn.step` settled, its request having started at `startMs` (the step's own hook keeps it, so a step whose stream was closed early
  * moves no other's): its stop reason and usage pair with the request's row, now or when the row comes.
  */
-export function stepEnd(r: Rebuild, agentId: string | undefined, startMs: number, result: { stopReason: string | null; usage: StepUsage | null } | undefined, nowMs: number): Emit {
+export function stepEnd(r: Rebuild, agentId: string | undefined, startMs: number, result: { stopReason: string | null; usage: StepUsage | null } | undefined, nowMs: number, thinking?: string): Emit {
   const loop = loopOf(agentId)
-  const step: Step = { loop, startMs, endMs: nowMs, stopReason: result?.stopReason ?? null, usage: result?.usage ?? null }
+  const step: Step = { loop, startMs, endMs: nowMs, stopReason: result?.stopReason ?? null, usage: result?.usage ?? null, ...(thinking !== undefined ? { thinking } : {}) }
   const i = r.waiting.findIndex(w => loopOf(w.row.attributes['agent_id']) === loop && (w.row.event === 'api_error' ? step.usage === null : sameUsage(step.usage, w.row.attributes)))
   if (i >= 0) {
     const [w] = r.waiting.splice(i, 1)
@@ -589,6 +599,8 @@ function llmSpan(r: Rebuild, row: Req, step: Step | undefined): BuiltSpan {
       ['effort', str(a['effort'])],
       ['stop_reason', stop],
       ['gen_ai.response.finish_reasons', stop === undefined ? undefined : [stop]],
+      // Claude Code never exports thinking: only where the gate turns it on.
+      ['response.thinking', step?.thinking !== undefined && allows(r.settings.gate(), 'response.thinking', false) ? step.thinking : undefined],
     ]),
     events: [{ name: 'gen_ai.request.attempt', timeMs: startMs, attributes: { attempt: Math.trunc(attempt) } }],
     ...(failed ? { status: { code: 2 as const, ...(error ? { message: error } : {}) } } : {}),
@@ -707,6 +719,16 @@ export function turnComplete(r: Rebuild, e: { turnId: string; durationMs: number
   return interactionSpan(r, { ctx: it.prompt?.ctx ?? it.ctx, prompt: it.prompt, text: it.text, sequence: it.sequence, startMs: nowMs - durationMs, endMs: nowMs, durationMs })
 }
 
+/**
+ * The interaction's prompt: its row's, where the row carries the text; else, where prompts are on, the turn's own text, when the row's
+ * length (if a row came) says it is the same prompt.
+ */
+function promptText(r: Rebuild, i: { prompt?: Prompt; text: string }): TelemetryAttribute {
+  const row = i.prompt?.text ?? '<REDACTED>'
+  if (row !== '<REDACTED>' || i.text === '' || (i.prompt !== undefined && i.prompt.length !== i.text.length)) return row
+  return allows(r.settings.gate(), 'prompt.text', false) ? i.text : row
+}
+
 /** One `claude_code.interaction`, a turn's or a slash command's, and its time as active time. */
 function interactionSpan(r: Rebuild, i: { ctx?: Ctx; prompt?: Prompt; text: string; sequence: number; startMs: number; endMs: number; durationMs: number }): Emit {
   const ctx = i.ctx ?? { traceId: r.mint(32), spanId: r.mint(16) }
@@ -723,7 +745,7 @@ function interactionSpan(r: Rebuild, i: { ctx?: Ctx; prompt?: Prompt; text: stri
       ...head(r, 'interaction'),
       ['gen_ai.operation.name', 'invoke_agent'],
       ['gen_ai.conversation.id', conversationOf(r, undefined)],
-      ['user_prompt', i.prompt?.text ?? '<REDACTED>'],
+      ['user_prompt', promptText(r, i)],
       ['user_prompt_length', i.prompt ? i.prompt.length : i.text.length],
       ['interaction.sequence', i.sequence],
       ['parent.source', parent ? 'env' : 'none'],
@@ -741,7 +763,7 @@ function interactionSpan(r: Rebuild, i: { ctx?: Ctx; prompt?: Prompt; text: stri
 export function toolStart(r: Rebuild, e: { tool: string; tool_use_id?: string; agentId?: string } & Readonly<Record<string, unknown>>, nowMs: number): void {
   const id = e.tool_use_id
   if (!id) return
-  const { tool: name, tool_use_id: _id, agentId, ...input } = e
+  const { tool: name, tool_use_id: _id, agentId, consent: _consent, requestMeta: _meta, ...input } = e
   // In coherent mode a call sits under the interaction open now, or, a subagent's, under its Agent call's run (found when its spans
   // go, if the subagent is not known yet; where it was first seen, if no Agent call ever names it).
   let home: Home | undefined
@@ -785,7 +807,7 @@ export function agentSpawned(r: Rebuild, toolUseId: string, agentId: string, par
 }
 
 /** A tool call settled: its spans go once its result row is in, and what it did counts toward the metrics. */
-export function toolEnd(r: Rebuild, id: string | undefined, result: { isError?: boolean; deny?: string; result?: unknown } | undefined, nowMs: number): Emit {
+export function toolEnd(r: Rebuild, id: string | undefined, result: { isError?: boolean; deny?: string; result?: unknown; text?: unknown } | undefined, nowMs: number): Emit {
   const tool = id ? r.tools.get(id) : undefined
   if (!tool) return none()
   tool.endMs = nowMs
@@ -793,6 +815,14 @@ export function toolEnd(r: Rebuild, id: string | undefined, result: { isError?: 
   tool.isError = result?.isError === true || result?.deny !== undefined
   const measures: Measure[] = []
   const ok = !tool.isError && result?.deny === undefined
+  const gate = r.settings.gate()
+  // The text a failed call answered: for a built-in tool or an MCP shell tool. Another MCP tool's error can carry what it was handed
+  // (a file being uploaded, account memory), which Claude Code never records.
+  if (tool.isError && typeof result?.text === 'string' && result.text !== '' && (!mcpParts(tool.name) || shellCommand(tool.name, tool.input) !== undefined)) tool.errorText = result.text
+  if (ok && allows(gate, 'tool.result', false)) {
+    const output = toolOutput(r, tool, result?.result)
+    if (output) tool.output = { atMs: nowMs, attributes: output }
+  }
   if (ok && (tool.name === 'Edit' || tool.name === 'Write' || tool.name === 'NotebookEdit')) {
     const lines = linesChanged(result?.result)
     if (lines) {
@@ -802,33 +832,106 @@ export function toolEnd(r: Rebuild, id: string | undefined, result: { isError?: 
       }
     }
   }
-  if (ok && tool.name === 'Bash' && typeof tool.input['command'] === 'string') {
-    const { commits, pullRequests } = gitCounts(tool.input['command'])
+  const command = shellCommand(tool.name, tool.input)
+  // An MCP shell tool's commands count as Bash's do, where the gate turns their outcomes on beyond Claude Code's.
+  if (ok && command !== undefined && allows(gate, 'bash.outcome', tool.name === 'Bash')) {
+    const { commits, pullRequests } = gitCounts(command)
     if (commits > 0) measures.push({ name: 'claude_code.commit.count', value: commits, attributes: { ...r.common }, atMs: nowMs })
     if (pullRequests > 0) measures.push({ name: 'claude_code.pull_request.count', value: pullRequests, attributes: { ...r.common }, atMs: nowMs })
   }
   const mcp = mcpParts(tool.name)
-  if (ok && mcp && mcpCreatesPr(mcp.tool)) measures.push({ name: 'claude_code.pull_request.count', value: 1, attributes: { ...r.common }, atMs: nowMs })
+  if (ok && mcp && mcpCreatesPr(mcp.tool) && allows(gate, 'bash.outcome', true)) measures.push({ name: 'claude_code.pull_request.count', value: 1, attributes: { ...r.common }, atMs: nowMs })
   return merge(finishTool(r, tool, false), { spans: [], measures })
 }
 
-/** The attributes Claude Code reads from a tool's input onto its span. */
+/**
+ * The attributes Claude Code reads from a tool's input onto its span, where the gate allows each: Claude Code puts the file path, the
+ * command, the skill and the agent type there only with `OTEL_LOG_TOOL_DETAILS`, and a command's class always. An MCP shell tool's
+ * command is read as a Bash command's; a fetched page's address and site are the plugin's own.
+ */
 function inputAttrs(r: Rebuild, tool: Tool): [string, TelemetryAttribute | undefined][] {
   const out: [string, TelemetryAttribute | undefined][] = []
   const input = tool.input
-  if (r.settings.toolDetails) {
-    if ((tool.name === 'Read' || tool.name === 'Edit' || tool.name === 'Write') && input['file_path'] !== undefined) out.push(['file_path', String(input['file_path'])])
-    else if (tool.name === 'Bash' && typeof input['command'] === 'string') out.push(['full_command', input['command']])
-    else if (tool.name !== 'Read' && tool.name !== 'Edit' && tool.name !== 'Write' && tool.name !== 'Bash') {
-      if (tool.name === 'Skill') out.push(['skill_name', str(input['skill'])])
-      if (tool.name === 'Agent') out.push(['subagent_type', str(input['subagent_type'])])
-    }
+  const gate = r.settings.gate()
+  const command = shellCommand(tool.name, input)
+  const fileTool = tool.name === 'Read' || tool.name === 'Edit' || tool.name === 'Write'
+  if (fileTool && input['file_path'] !== undefined) {
+    if (allows(gate, 'file.path', false)) out.push(['file_path', String(input['file_path'])])
+  } else if (command !== undefined) {
+    if (allows(gate, 'bash.command', false)) out.push(['full_command', command])
+  } else if (!fileTool) {
+    if (tool.name === 'Skill' && allows(gate, 'skill.name', false)) out.push(['skill_name', str(input['skill'])])
+    if (tool.name === 'Agent' && allows(gate, 'agent.type', false)) out.push(['subagent_type', str(input['subagent_type'])])
   }
-  if (tool.name === 'Bash' && typeof input['command'] === 'string') {
-    const cls = bashClass(input['command'])
+  if (command !== undefined && allows(gate, 'bash.class', tool.name === 'Bash')) {
+    const cls = bashClass(command)
     out.push(['bash_command_class', cls.bash_command_class], ['bash_argv0', cls.bash_argv0])
   }
+  if (tool.name === 'WebFetch' && typeof input['url'] === 'string') {
+    if (allows(gate, 'web.url', false)) out.push(['url.full', input['url']])
+    if (allows(gate, 'web.domain', false)) out.push(['url.domain', hostOf(input['url'])])
+  }
   return out
+}
+
+/** A web address's host, or undefined when it does not parse. */
+function hostOf(url: string): string | undefined {
+  try {
+    return new URL(url).hostname || undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** The text of an MCP result as Claude Code reads it for `tool.output`: its text blocks, each other block as `[type]`. */
+function mcpText(result: unknown): string | undefined {
+  const content = result !== null && typeof result === 'object' && !Array.isArray(result) && 'content' in result ? (result as { content: unknown }).content : result
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return undefined
+  return content.map(b => (b !== null && typeof b === 'object' && (b as { type?: unknown }).type === 'text' ? String((b as { text?: unknown }).text) : `[${String((b as { type?: unknown } | null)?.type ?? 'unknown')}]`)).join('\n')
+}
+
+/**
+ * What a call that succeeded answered, as Claude Code's `tool.output` span event carries it (`OTEL_LOG_TOOL_CONTENT`): a file read's
+ * path and content, a file edit's path and patch or a file written's path and content, a Bash command and its output, an MCP call's
+ * text. Each value is cut as Claude Code cuts content. Undefined for another tool, or a result of another shape.
+ */
+function toolOutput(r: Rebuild, tool: Tool, data: unknown): Attrs | undefined {
+  const gate = r.settings.gate()
+  const input = tool.input
+  const out: [string, string][] = []
+  const path = input['file_path']
+  if (mcpParts(tool.name)) {
+    const text = mcpText(data)
+    if (text !== undefined) out.push(['output', isAccountMemoryTool(tool.name) ? notRecorded(text) : text])
+  } else if (data !== null && typeof data === 'object') {
+    const d = data as Record<string, unknown>
+    if (tool.name === 'Read') {
+      const file = d['file'] as { content?: unknown } | undefined
+      if (d['type'] === 'text') {
+        if (path !== undefined && allows(gate, 'file.path', false)) out.push(['file_path', String(path)])
+        if (file && typeof file === 'object' && file.content !== undefined) out.push(['content', String(file.content)])
+      }
+    } else if ((tool.name === 'Edit' || tool.name === 'Write') && path !== undefined) {
+      if (allows(gate, 'file.path', false)) out.push(['file_path', String(path)])
+      if (tool.name === 'Edit' && 'structuredPatch' in d && allows(gate, 'tool.input', false)) out.push(['diff', JSON.stringify(d['structuredPatch'])])
+      if (tool.name === 'Write' && 'content' in input && allows(gate, 'tool.input', false)) out.push(['content', String(input['content'])])
+    } else if (tool.name === 'Bash' && typeof input['command'] === 'string') {
+      if (allows(gate, 'bash.command', false)) out.push(['bash_command', input['command']])
+      if ('stdout' in d) out.push(['output', String(d['stdout'])])
+    }
+  }
+  if (out.length === 0) return undefined
+  const attributes: Attrs = {}
+  for (const [key, value] of out) {
+    const c = cut(value, gate.limit)
+    attributes[key] = c.text
+    if (c.truncated) {
+      attributes[`${key}_truncated`] = true
+      attributes[`${key}_original_length`] = value.length
+    }
+  }
+  return attributes
 }
 
 /**
@@ -870,6 +973,7 @@ function finishTool(r: Rebuild, tool: Tool, force: boolean): Emit {
       ['gen_ai.tool.call.id', tool.id],
       ['duration_ms', durationOf(tool.startMs, endMs)],
     ]),
+    ...(tool.output ? { events: [{ name: TOOL_OUTPUT_EVENT, timeMs: Math.min(tool.output.atMs, endMs), attributes: tool.output.attributes }] } : {}),
   }]
   const d = tool.decision
   if (d) {
@@ -910,8 +1014,13 @@ function sendExecution(r: Rebuild, tool: Tool): Emit {
   const startMs = Math.min(Math.max(tool.decision?.atMs ?? tool.startMs, tool.startMs), tool.endMs)
   const endMs = tool.endMs
   const success = tool.result?.success ?? !tool.isError
-  // Claude Code's `error` is the row's, where tool details are logged, and the error's class where they are not.
-  const error = tool.result?.error ?? tool.result?.errorType
+  // Claude Code's `error` is the row's, where tool details are logged, and the error's class where they are not. Where the gate turns
+  // tool results on beyond Claude Code's switches, the text is the one the call answered.
+  const gate = r.settings.gate()
+  const text = allows(gate, 'tool.result', true) ? tool.result?.error : undefined
+  // The text can repeat what the call read and ran: it goes with tool input too.
+  const own = allows(gate, 'tool.result', false) && allows(gate, 'tool.input', false) ? tool.errorText : undefined
+  const error = text ?? own ?? tool.result?.errorType
   const spanId = (tool.spawned && r.execOfAgent.get(tool.spawned)) || r.mint(16)
   const traceId = retrace(r, tool.decision?.ctx?.traceId ?? tool.result?.ctx?.traceId ?? homeOfTool(r, tool)?.traceId ?? r.mint(32))
   return {

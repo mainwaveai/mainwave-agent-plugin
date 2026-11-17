@@ -40,6 +40,7 @@
 
 import type { EngineInterface, PluginOptions, Timer } from 'claude-code'
 
+import { currentGate, gatePoint, gateRow, gateSpan } from './gate.ts'
 import { fetchWithin, type FetchOutcome } from './http.ts'
 import { logsBody, metricsBody, resourceOf, tracesBody, type BuiltSpan, type CopiedRow, type MetricPoint } from './otlp.ts'
 import { routingIdentityOf } from './identity.ts'
@@ -87,7 +88,7 @@ export type Item = { s: 'logs'; d: CopiedRow } | { s: 'traces'; d: BuiltSpan } |
  * A queued record: its resource as JSON, its size, without a key who it is routed to (`routingIdentityOf`), and, once it has been in a
  * batch, that batch's idempotency key (`batch`), kept until the batch is settled.
  */
-type Queued = Item & { resource: string; size: number; who?: string; batch?: string }
+type Queued = Item & { resource: string; size: number; who?: string; batch?: string; adopted?: true }
 /**
  * What the store keeps: each record's resource as an index into `resources`, and its batch's key, where it has one, as an index into
  * `batches`, so each string is stored once. Version 1 held log rows alone, as `rows`; version 2 held no batch keys.
@@ -288,34 +289,35 @@ function dropOldest(): void {
 
 /**
  * Queues one record. Called from the hooks: it waits on nothing but the resource, read once per load, and starts the timer if none
- * runs (after a /clear the session goes on without a `session.start`).
+ * runs (after a /clear the session goes on without a `session.start`). Answers whether it was queued.
  */
-export async function enqueue($: EngineInterface, item: Item): Promise<void> {
-  if (!isCopying()) return
+export async function enqueue($: EngineInterface, item: Item): Promise<boolean> {
+  if (!isCopying()) return false
   // Without a key, a record that names no organization and email has nowhere to go: it is held back, never queued.
   const who = mode === 'keyless' ? whoOf(item.d) : undefined
   if (mode === 'keyless' && who === undefined) {
     counts.withheld += 1
-    return
+    return false
   }
   // An organization and email keyless ingest refused this load: what is queued for it is kept, but nothing more is added, so a
   // session whose organization nobody has claimed does not grow and rewrite its outbox for nothing. A later load tries again.
   if (who !== undefined && refusedWho.has(who)) {
     counts.withheld += 1
-    return
+    return false
   }
   resource ??= readResource($)
   const res = await resource
   const size = JSON.stringify(item.d).length
   if (size > BATCH_BYTES) {
     counts.dropped += 1
-    return
+    return false
   }
   queue.push({ ...item, resource: res, size, ...(who !== undefined ? { who } : {}) } as Queued)
   queuedBytes += size
   dirty = true
   dropOldest()
   ensureTimer($)
+  return true
 }
 
 /** Starts the send timer if it is not running. */
@@ -407,12 +409,28 @@ function groups<T>(batch: readonly Queued[]): { resource: string; items: T[] }[]
   return out
 }
 
-/** A batch of one signal as that signal's request body. */
+/**
+ * A batch of one signal as that signal's request body, each record through the gate in force as it is sent: a record queued before a
+ * data point was turned off, or left in the outbox by an earlier session, goes without it.
+ */
 function bodyOf(batch: readonly Queued[], nowMs: number): string {
   const signal = batch[0]?.s ?? 'logs'
-  if (signal === 'traces') return tracesBody(groups<BuiltSpan>(batch))
-  if (signal === 'metrics') return metricsBody(groups<MetricPoint>(batch), scopeVersion)
-  return logsBody(groups<CopiedRow>(batch).map(g => ({ resource: g.resource, rows: g.items })), scopeVersion, nowMs)
+  const gate = currentGate()
+  // A record an earlier load captured went through that load's settings, not this one's: where a data point follows Claude Code's
+  // switches, it goes only where it is on.
+  const gated = batch.map(item => {
+    const strict = item.adopted === true
+    if (item.s === 'traces') return { ...item, d: gateSpan(gate, item.d, strict) }
+    if (item.s === 'metrics') {
+      const d = gatePoint(gate, item.d, strict)
+      return d === null ? null : { ...item, d }
+    }
+    const d = gateRow(gate, item.d, strict)
+    return d === null ? null : { ...item, d }
+  }).filter((item): item is Queued => item !== null)
+  if (signal === 'traces') return tracesBody(groups<BuiltSpan>(gated))
+  if (signal === 'metrics') return metricsBody(groups<MetricPoint>(gated), scopeVersion)
+  return logsBody(groups<CopiedRow>(gated).map(g => ({ resource: g.resource, rows: g.items })), scopeVersion, nowMs)
 }
 
 async function readLayer($: EngineInterface, source: 'project' | 'local'): Promise<Layer> {
@@ -663,7 +681,8 @@ export async function adopt($: EngineInterface): Promise<void> {
       await $.store.delete(k)
       if (box === null || box.items.length === 0) continue
       // Without a key, records an earlier load kept that name no organization and email are held back, as new ones are.
-      const items = mode === 'keyless' ? box.items.filter(item => item.who !== undefined) : box.items
+      // Taken over from an earlier load, whose settings this one does not know: the gate holds them to what is on (gate.ts, strict).
+      const items = (mode === 'keyless' ? box.items.filter(item => item.who !== undefined) : box.items).map(item => ({ ...item, adopted: true as const }))
       counts.withheld += box.items.length - items.length
       queue = [...items, ...queue]
       queuedBytes += items.reduce((n, r) => n + r.size, 0)
