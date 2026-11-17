@@ -2,6 +2,9 @@ version: 2
 updates:
   # The Claude Code version CI tests against (.github/claude-code/package.json). A pull request for each new release runs the
   # comparison against it; one that fails is a new release the plugin has to catch up with.
+  # Not .github/claude-code-floor: that is the oldest version the plugin supports, which CI also tests. It changes only by hand, with
+  # the README and plugin.json's `engines`, when the plugin drops support for older versions. Security updates, where they are on,
+  # read every manifest whatever this file lists; close one that bumps only the floor's pin (it fails scripts/check-version.sh).
   - package-ecosystem: npm
     directory: /.github/claude-code
     schedule:

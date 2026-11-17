@@ -1,5 +1,6 @@
 # The gate: every pull request to main, and main itself, must pass `claude plugin validate`, `claude plugin test` and the end-to-end
-# comparison of the plugin's copy with Claude Code's exporter.
+# comparison of the plugin's copy with Claude Code's exporter, on two Claude Code versions: the latest, which Dependabot keeps
+# current, and the floor, the oldest version the plugin supports.
 #
 # Not here: the TypeScript type check. It needs the declarations Claude Code writes beside a plugin it loads from disk
 # (.claude-plugin/types/), which only a session writes, so it runs locally (README, Developing).
@@ -25,8 +26,21 @@ env:
 
 jobs:
   gate:
+    name: gate (${{ matrix.claude-code }})
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    strategy:
+      # Each version's result stands on its own: a new release that breaks the comparison does not hide whether the floor passes.
+      fail-fast: false
+      matrix:
+        include:
+          # The latest release. Dependabot opens a pull request for each new one (.github/dependabot.yml).
+          - claude-code: latest
+            pin: .github/claude-code/package.json
+          # The floor: the oldest version the plugin supports, which the README and plugin.json's `engines` state. Dependabot's
+          # version updates don't watch it, so it changes only by hand, in a pull request that raises the floor and changes those two with it.
+          - claude-code: floor
+            pin: .github/claude-code-floor/package.json
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -35,10 +49,12 @@ jobs:
         with:
           node-version: 22
       - name: Install Claude Code
-        # The version is pinned in .github/claude-code/package.json, where Dependabot proposes each new release: a release that
-        # breaks the comparison shows as that pull request failing, not as every other one.
+        # The version is pinned in the matrix's package.json. For the latest, Dependabot proposes each new release there: a release
+        # that breaks the comparison shows as that pull request failing, not as every other one.
+        env:
+          PIN: ${{ matrix.pin }}
         run: |
-          version=$(node -p "require('./.github/claude-code/package.json').devDependencies['@anthropic-ai/claude-code']")
+          version=$(node -p "require('./' + process.env.PIN).devDependencies['@anthropic-ai/claude-code']")
           # An exact version only: a range would float, and a missing entry reads as "undefined".
           echo "$version" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' || { echo "no exact Claude Code version pinned: $version" >&2; exit 1; }
           npm install -g "@anthropic-ai/claude-code@${version}"
