@@ -6,6 +6,9 @@
   "author": {
     "name": "Mainwave"
   },
+  "engines": {
+    "claude-code": ">=2.1.317"
+  },
   "types": "./types/index.d.ts",
   "userConfig": {
     "devIngestKey": {

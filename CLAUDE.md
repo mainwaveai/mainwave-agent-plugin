@@ -7,13 +7,13 @@ A Claude Code mod at the repository root: `.claude-plugin/plugin.json` (manifest
 ```sh
 claude plugin validate .        # manifest, marketplace and hooks module, read the way Claude Code will
 claude plugin test .            # tests/*.test.ts against the engine
-scripts/check-version.sh        # plugin.json and hooks/version.ts agree
+scripts/check-version.sh        # plugin.json and hooks/version.ts agree; the Claude Code floor is the same in CI's pin, plugin.json and the README
 scripts/check-layout.sh         # one plugin, at the root: org sync refuses a .claude-plugin/ or plugin.json anywhere else
 scripts/check-hooks.sh          # the row, tool call, command and spawn hooks keep their fail-open .catch; the turn hooks and session.end are hooked
 node tests/e2e/compare.mjs      # real sessions, model mocked: the plugin's copy against the exporter's; without the env block, keyless and coherent
 ```
 
-CI runs all six on every pull request. The type check is local only (README, Developing).
+CI runs all six on every pull request, on the latest Claude Code and on the floor (README, Developing). The type check is local only.
 
 ## Rules
 
@@ -24,4 +24,5 @@ CI runs all six on every pull request. The type check is local only (README, Dev
 - Hooks fail open: a fault never holds a row, a tool call or the session.
 - A new stamp key needs a shape rule in `hooks/stamps.ts`, an owned prefix if it starts a new one, and an entry in the test contract in `tests/rig.ts`, which is written independently of `hooks/`.
 - A release bumps the version in `.claude-plugin/plugin.json` and `hooks/version.ts` together.
+- Raising the Claude Code floor is a pull request of its own: `.github/claude-code-floor/package.json`, `engines` in `.claude-plugin/plugin.json` and the README's Install section change together. Dependabot's version updates don't watch it.
 - The repository holds one plugin, at its root. A test that needs another plugin builds it in a temporary folder (as `tests/e2e/compare.mjs` does); org sync refuses a repository with a second manifest.
