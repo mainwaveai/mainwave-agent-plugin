@@ -26,7 +26,8 @@
 // session runs twice: once with prompts and tool details logged (OTEL_LOG_USER_PROMPTS, OTEL_LOG_TOOL_DETAILS), once with neither,
 // so both sides of those settings are compared. The first runs in auto mode, so auto mode's classifier judges the command no rule
 // allows, and the mock blocks it. Claude Code logs no row for the classifier's requests, so the plugin cannot see them: the
-// exporter's spans of a request it logged no row for are a known difference, and the pass fails if the classifier asked nothing.
+// exporter's spans of a request it logged no row for are a known difference, and so is its count of them in cost.usage and
+// token.usage, where it counts them (the tokens checked against those spans'); the pass fails if the classifier asked nothing.
 //
 //   node tests/e2e/compare.mjs            # exit 0 when the copy matches the exporter and the keyless pass is coherent
 //   node tests/e2e/compare.mjs --keep     # keep the captures and the session's config folder, and print where
@@ -51,7 +52,10 @@ const PLUGIN_KEY = 'mw_dev_e2e_key_0001'
 const HOST_ONLY = new Set(['os.type', 'os.version', 'host.arch'])
 /** Attribute keys that differ by design between the two paths. */
 const ROUTE = 'mainwave.telemetry.route'
-/** Rows Claude Code raises while it starts, before any plugin's hooks are registered: no plugin ever sees them. */
+/**
+ * Rows Claude Code raises while it starts. Those it raises before any plugin's hooks are registered no plugin sees: still
+ * `managed_settings_resolved`, and `plugin_loaded` before 2.1.326, which since hands the plugins those rows once they are loaded.
+ */
 const STARTUP = new Set(['managed_settings_resolved', 'plugin_loaded'])
 /** The classifiers whose model requests Claude Code logs no row for, which the README lists as a gap. */
 const CLASSIFIERS = new Set(['auto_mode', 'agent_classifier'])
@@ -606,7 +610,41 @@ function compare(pass, details, auto, { captured, run }) {
   }
   const exSeries = sums(exporterPoints)
   const plSeries = sums(pluginPoints)
-  for (const k of exSeries.keys()) if (!plSeries.has(k)) problems.push(`the exporter sent series ${k}, which the plugin did not`)
+  // Where the session is billed for auto mode's classifier (as through a gateway, which the mock's address stands in for), the
+  // exporter counts its requests in cost.usage and token.usage, query_source auxiliary; Claude Code logs no row for them, so the
+  // plugin has nothing to count. What the exporter counts past the plugin in such a series is a known difference only if it is the
+  // classifier's: by model, each token type's excess is exactly the tokens the exporter's spans of those requests carry, and a cost
+  // excess is of a model they ran on (the spans carry no cost). An exporter that counts none of them, as before 2.1.326, passes too.
+  const TOKEN_ATTR = { input: 'input_tokens', output: 'output_tokens', cacheRead: 'cache_read_tokens', cacheCreation: 'cache_creation_tokens' }
+  const autoModeUnlogged = exporterSpans.filter(s => unloggedClassifier(s) && s.attrs.query_source_safe?.v === 'auto_mode')
+  const classifierTokens = new Map()
+  for (const s of autoModeUnlogged) {
+    for (const [type, attr] of Object.entries(TOKEN_ATTR)) {
+      const k = `${type}|${s.attrs.model?.v}`
+      classifierTokens.set(k, (classifierTokens.get(k) ?? 0) + Number(s.attrs[attr]?.v ?? 0))
+    }
+  }
+  const classifierModels = new Set(autoModeUnlogged.map(s => s.attrs.model?.v))
+  const classifierGroup = point => {
+    if (!['claude_code.cost.usage', 'claude_code.token.usage'].includes(point.name) || point.attrs.query_source?.v !== 'auxiliary') return undefined
+    if (!classifierModels.has(point.attrs.model?.v)) return undefined
+    return `${point.name}|${point.attrs.type?.v ?? ''}|${point.attrs.model?.v}`
+  }
+  /** By metric, token type and model: what the exporter counted past the plugin in the classifier's series. */
+  const classifierExcess = new Map()
+  for (const [k, e] of exSeries) {
+    const group = classifierGroup(e.points[0])
+    if (group !== undefined) classifierExcess.set(group, (classifierExcess.get(group) ?? 0) + e.value - (plSeries.get(k)?.value ?? 0))
+  }
+  for (const [group, excess] of classifierExcess) {
+    const [name, type, model] = group.split('|')
+    const want = name === 'claude_code.token.usage' ? classifierTokens.get(`${type}|${model}`) ?? 0 : undefined
+    const ok = want === undefined ? excess > -1e-9 : excess === 0 || excess === want
+    if (!ok) problems.push(`metrics: the exporter counted ${excess} more ${name.replace('claude_code.', '')}${type ? ` ${type}` : ''} of ${model} (query_source auxiliary) than the plugin, where the requests of auto mode's classifier Claude Code logs no row for carry ${want ?? 'no cost'}`)
+    else if (excess > 1e-9) noteKnown("metrics: cost.usage and token.usage of auto mode's classifier's requests, which Claude Code logs no row for (query_source auxiliary)")
+  }
+  const isClassifierSeries = k => classifierGroup(exSeries.get(k).points[0]) !== undefined
+  for (const k of exSeries.keys()) if (!plSeries.has(k) && !isClassifierSeries(k)) problems.push(`the exporter sent series ${k}, which the plugin did not`)
   for (const k of plSeries.keys()) if (!exSeries.has(k)) problems.push(`the plugin sent series ${k}, which the exporter did not`)
   for (const name of ['claude_code.cost.usage', 'claude_code.token.usage', 'claude_code.lines_of_code.count', 'claude_code.commit.count']) {
     if (![...exSeries.keys()].some(k => k.startsWith(`${name} `) && plSeries.has(k))) problems.push(`no ${name} series was matched`)
@@ -617,6 +655,8 @@ function compare(pass, details, auto, { captured, run }) {
     const timed = k.startsWith('claude_code.active_time.total ')
     if (timed && Math.abs(e.value - p.value) * 1000 <= TIME_TOLERANCE_MS) {
       if (e.value !== p.value) noteKnown(`metrics: active_time.total is the turns' time as the plugin measures it, within ${TIME_TOLERANCE_MS} ms`)
+    } else if (isClassifierSeries(k)) {
+      // Its sum is held to the classifier's share above.
     } else if (Math.abs(e.value - p.value) > 1e-9 * Math.max(1, Math.abs(e.value))) noteDiff(`metric sum: exporter ${e.value}, plugin ${p.value}`, k)
     else if (e.value !== p.value) noteKnown('metrics: a sum differs past the 15th digit (floating point order)')
     if (e.points.length !== p.points.length) noteDiff(`metric points: exporter ${e.points.length}, plugin ${p.points.length}`, k)
@@ -683,7 +723,10 @@ function checkKeyless(pass, { captured, run }, reference) {
     }
     return out
   }
-  const wantRows = pointed(logRecordsOf(reference.exporter.logs).filter(r => !STARTUP.has(r.attributes['event.name']?.v)), spansOf(reference.exporter.traces))
+  // Startup rows the plugin never saw in the reference pass are left out; those it copied there, it copies here.
+  const copiedStartup = new Set(logRecordsOf(reference.plugin.logs).map(r => r.attributes['event.name']?.v).filter(ev => STARTUP.has(ev)))
+  const referenceRows = logRecordsOf(reference.exporter.logs).filter(r => !STARTUP.has(r.attributes['event.name']?.v) || copiedStartup.has(r.attributes['event.name']?.v))
+  const wantRows = pointed(referenceRows, spansOf(reference.exporter.traces))
   const gotRows = pointed(rows, spans)
   const kinds = m => [...m].map(([ev, k]) => `${ev}: ${[...k].sort().join(' and ')}`).sort()
   for (const ev of new Set([...wantRows.keys(), ...gotRows.keys()])) {
