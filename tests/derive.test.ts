@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from 'claude-code/testing'
 
-import { bashClass, firstCommand, genAiProvider, gitCounts, languageOf, linesChanged, mcpCreatesPr, mcpParts, metricQuerySource, querySourceSafe, toolNameSafe } from '../hooks/derive.ts'
+import { bashClass, errorClassOf, firstCommand, genAiProvider, gitCounts, languageOf, linesChanged, mcpCreatesPr, mcpParts, metricQuerySource, querySourceSafe, toolNameSafe } from '../hooks/derive.ts'
 
 describe('genAiProvider', () => {
   test('providers as gen_ai names them', () => {
@@ -12,6 +12,18 @@ describe('genAiProvider', () => {
     expect(genAiProvider('foundry')).toBe('anthropic')
     expect(genAiProvider('somewhere-new')).toBeUndefined()
     expect(genAiProvider(undefined)).toBeUndefined()
+  })
+})
+
+describe('errorClassOf', () => {
+  test("a failed run's error class, as Claude Code puts it on the run's span", () => {
+    expect(errorClassOf('ShellError')).toBe('ShellError')
+    expect(errorClassOf('Error:ENOENT')).toBe('Error_ENOENT')
+    expect(errorClassOf('a'.repeat(48))).toBe('a'.repeat(48))
+    expect(errorClassOf('a'.repeat(49))).toBeUndefined()
+    expect(errorClassOf('1Error')).toBeUndefined()
+    expect(errorClassOf('')).toBeUndefined()
+    expect(errorClassOf(undefined)).toBeUndefined()
   })
 })
 
