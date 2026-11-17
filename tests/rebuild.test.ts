@@ -115,9 +115,9 @@ describe('one turn', () => {
     expect(tool).toEqual(expect.objectContaining({ traceId: TRACE, parentSpanId: INTERACTION, startMs: 130, endMs: 181 }))
     expect(keysAfterCommon(tool!)).toEqual([
       'gen_ai.provider.name', 'span.type', 'tool_name', 'tool_name_safe', 'gen_ai.operation.name', 'gen_ai.tool.name', 'gen_ai.conversation.id', 'full_command',
-      'bash_command_class', 'bash_argv0', 'tool_use_id', 'gen_ai.tool.call.id', 'duration_ms',
+      'bash_command_class', 'bash_argv0', 'mainwave.command.counted', 'tool_use_id', 'gen_ai.tool.call.id', 'duration_ms',
     ])
-    expect(tool!.attributes).toEqual(expect.objectContaining({ full_command: 'echo e2e', bash_command_class: 'shell_builtin', bash_argv0: 'echo', duration_ms: 51 }))
+    expect(tool!.attributes).toEqual(expect.objectContaining({ full_command: 'echo e2e', bash_command_class: 'shell_builtin', bash_argv0: 'echo', 'mainwave.command.counted': 1, duration_ms: 51 }))
     expect(blocked).toEqual(expect.objectContaining({ traceId: TRACE, spanId: BLOCKED, parentSpanId: tool!.spanId, startMs: 130, endMs: 135 }))
     expect(blocked!.attributes).toEqual({ ...COMMON, 'gen_ai.provider.name': 'anthropic', 'span.type': 'tool.blocked_on_user', 'gen_ai.conversation.id': 's-1', duration_ms: 5, decision: 'accept', source: 'config' })
     expect(exec).toEqual(expect.objectContaining({ traceId: TRACE, parentSpanId: tool!.spanId, startMs: 135, endMs: 181 }))
@@ -224,6 +224,54 @@ describe('pairing', () => {
 })
 
 describe('tools', () => {
+  /** One shell call run to its end, accepted unless `decision` says otherwise: its tool span. */
+  function shellCall(command: string, opts: { tool?: string; failed?: boolean; decision?: string; overrides?: Overrides; valueLengthLimit?: number } = {}) {
+    const r = rebuild({ gate: gate({}, opts.overrides), ...(opts.valueLengthLimit ? { valueLengthLimit: opts.valueLengthLimit } : {}) })
+    const tool = opts.tool ?? 'Bash'
+    observeRow(r, row('user_prompt', 0, {}, INTERACTION))
+    turnStart(r, { turnId: 't', text: '' }, 0)
+    toolStart(r, { tool, tool_use_id: 'toolu_o', command }, 10)
+    observeRow(r, row('tool_decision', 11, { decision: opts.decision ?? 'accept', source: 'config', tool_name: tool, tool_use_id: 'toolu_o' }, BLOCKED))
+    const out = toolEnd(r, 'toolu_o', opts.failed || opts.decision === 'reject' ? { isError: true, result: 'Exit code 1' } : { result: { stdout: '' } }, 20)
+    const after = observeRow(r, row('tool_result', 21, { tool_name: tool, tool_use_id: 'toolu_o', success: opts.failed ? 'false' : 'true' }, INTERACTION))
+    return [...out.spans, ...after.spans, ...sweep(r, 10_000, true).spans].find(s => s.name === 'claude_code.tool')!.attributes
+  }
+  const stamps = (a: Record<string, unknown>) => Object.fromEntries(Object.entries(a).filter(([k]) => k.startsWith('mainwave.command.')))
+  const SHIP = 'git checkout -b feat/z && git commit -am z && git push -u origin feat/z && gh pr create --fill'
+
+  test("a shell command that succeeded: its span carries what it did, by Mainwave's rules, and the refs it names", () => {
+    expect(stamps(shellCall(SHIP))).toEqual({
+      'mainwave.command.counted': 1, 'mainwave.command.commits': 1, 'mainwave.command.pushes': 1, 'mainwave.command.prs_opened': 1, 'mainwave.command.branches_opened': 1,
+      'mainwave.command.branch_opened': 'feat/z', 'mainwave.command.push_ref': 'feat/z',
+    })
+    expect(stamps(shellCall('ls -la'))).toEqual({ 'mainwave.command.counted': 1 })
+    // An MCP shell tool's command is read as Bash's.
+    expect(stamps(shellCall('git commit -m x', { tool: 'mcp__remote-devices__device_bash' }))).toEqual({ 'mainwave.command.counted': 1, 'mainwave.command.commits': 1 })
+    // Another tool's input is no command.
+    expect(stamps(shellCall('git commit -m x', { tool: 'mcp__other__run' }))).toEqual({})
+  })
+
+  test('a command that failed, or was refused, is counted and did nothing', () => {
+    expect(stamps(shellCall(SHIP, { failed: true }))).toEqual({ 'mainwave.command.counted': 1 })
+    expect(stamps(shellCall(SHIP, { decision: 'reject' }))).toEqual({ 'mainwave.command.counted': 1 })
+  })
+
+  test('the counts go where command outcomes are on, the refs where the repository is too; as Claude Code sends them, none', () => {
+    expect(stamps(shellCall(SHIP, { overrides: { repo: 'off' } }))).toEqual({
+      'mainwave.command.counted': 1, 'mainwave.command.commits': 1, 'mainwave.command.pushes': 1, 'mainwave.command.prs_opened': 1, 'mainwave.command.branches_opened': 1,
+    })
+    expect(stamps(shellCall(SHIP, { overrides: { 'bash.outcome': 'off' } }))).toEqual({})
+    expect(stamps(shellCall(SHIP, { overrides: { 'bash.outcome': 'claude' } }))).toEqual({})
+    // The command's text off, its outcomes on: what Mainwave counts without the text.
+    const noText = shellCall(SHIP, { overrides: { 'bash.command': 'off' } })
+    expect(noText['full_command']).toBeUndefined()
+    expect(noText['mainwave.command.commits']).toBe(1)
+  })
+
+  test('a ref longer than the attribute limit is left off, not cut', () => {
+    expect(stamps(shellCall('git push origin feature/a-long-branch-name', { valueLengthLimit: 12 }))).toEqual({ 'mainwave.command.counted': 1, 'mainwave.command.pushes': 1 })
+  })
+
   test('a refused call has its decision and no run', () => {
     const r = rebuild()
     toolStart(r, { tool: 'Bash', tool_use_id: 'toolu_2', command: 'touch x' }, 10)

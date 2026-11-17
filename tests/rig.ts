@@ -22,6 +22,12 @@ export const CONTRACT: Record<string, (v: unknown) => boolean> = {
   'mainwave.redaction.count': v => typeof v === 'number' && Number.isInteger(v) && v >= 1,
   // On the plugin's own copy only, where the person opted in to data points off by default: which, each once.
   'mainwave.telemetry.opt_in': v => typeof v === 'string' && v.split(',').every(id => OPT_IN_IDS.includes(id)) && new Set(v.split(',')).size === v.split(',').length,
+  // On a shell command's tool span, in the plugin's own copy only: the command was read; then what it did, each count above 0, and a
+  // branch opened as 1; the refs it names, each a word of at most 256 characters.
+  'mainwave.command.counted': v => v === 1,
+  ...Object.fromEntries(['commits', 'reverts', 'pushes', 'prs_opened', 'prs_merged', 'prs_updated', 'merges', 'tags', 'workflow_runs'].map(c => [`mainwave.command.${c}`, (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 65_535])),
+  'mainwave.command.branches_opened': v => v === 1,
+  ...Object.fromEntries(['branch_opened', 'push_ref', 'merge_ref', 'tag_name'].map(r => [`mainwave.command.${r}`, (v: unknown) => typeof v === 'string' && /^\S{1,256}$/.test(v)])),
 }
 /** The data points a person may opt in to: those the plugin sends no record of by default. */
 export const OPT_IN_IDS = ['mcp.url', 'skill.text', 'response.thinking']
@@ -29,7 +35,7 @@ export const OPT_IN_IDS = ['mcp.url', 'skill.text', 'response.thinking']
 export const STAMPED = ['mainwave.plugin.entrypoint', 'mainwave.plugin.name', 'mainwave.plugin.version', 'mainwave.telemetry.route']
 // mainwave.mod. is the old prefix: the plugin writes nothing there, so a key under it on a row is a violation.
 export const isOwned = (k: string) =>
-  k.startsWith('mainwave.plugin.') || k.startsWith('mainwave.telemetry.') || k.startsWith('mainwave.redaction.') || k.startsWith('mainwave.mod.')
+  k.startsWith('mainwave.plugin.') || k.startsWith('mainwave.telemetry.') || k.startsWith('mainwave.redaction.') || k.startsWith('mainwave.mod.') || k.startsWith('mainwave.command.')
 
 /** A settings layer as the test answers it: an object, or `reject` for a read that fails. */
 export type Answer = Record<string, unknown> | 'reject'

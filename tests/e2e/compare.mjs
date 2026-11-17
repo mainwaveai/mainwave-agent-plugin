@@ -54,6 +54,8 @@ const PLUGIN_KEY = 'mw_dev_e2e_key_0001'
 const HOST_ONLY = new Set(['os.type', 'os.version', 'host.arch'])
 /** Attribute keys that differ by design between the two paths. */
 const ROUTE = 'mainwave.telemetry.route'
+/** What a shell command did, which the plugin stamps on the command's tool span for Mainwave and Claude Code never sends. */
+const COMMAND_STAMP = 'mainwave.command.'
 /** The Claude Code version the sessions run on, as `claude --version` prints it. */
 const CLAUDE_VERSION = execFileSync('claude', ['--version']).toString().trim().split(/\s+/)[0]
 const atLeast = (version, floor) => {
@@ -585,9 +587,12 @@ function compare(pass, details, auto, { captured, run }) {
       worstTime.span = Math.max(worstTime.span, d)
       if (d > TIME_TOLERANCE_MS) noteDiff(`span ${f} (${e.name}) ${d.toFixed(1)} ms from the exporter's`, k)
     }
-    // Every key, in order: Mainwave fingerprints a span by its whole set of attribute keys.
+    // Every key, in order: Mainwave fingerprints a span by its whole set of attribute keys. A tool span's command stamps are the
+    // plugin's own, by design: known, and on that span alone.
+    const stampsOn = e.name === 'claude_code.tool' && Object.keys(p.attrs).some(a => a.startsWith(COMMAND_STAMP))
+    if (stampsOn) noteKnown("traces: a shell command's tool span carries the plugin's own outcome stamps (mainwave.command.*), which Claude Code sends none of")
     const eKeys = Object.keys(e.attrs).filter(a => a !== ROUTE)
-    const pKeys = Object.keys(p.attrs).filter(a => a !== ROUTE)
+    const pKeys = Object.keys(p.attrs).filter(a => a !== ROUTE && !(e.name === 'claude_code.tool' && a.startsWith(COMMAND_STAMP)))
     if (!same(eKeys, pKeys)) noteDiff(`span attribute keys (${e.name}): exporter [${eKeys.join(', ')}], plugin [${pKeys.join(', ')}]`, k)
     for (const a of new Set([...eKeys, ...pKeys])) {
       if (same(e.attrs[a], p.attrs[a])) continue

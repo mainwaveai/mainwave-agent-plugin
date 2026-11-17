@@ -92,6 +92,16 @@ describe('with no settings, as Claude Code with the org-wide setup captures on',
     expect(tool.events).toEqual([{ name: 'tool.output', attrs: { output: '[main 1a2b3c] fix login [REDACTED:github_token]' } }])
     expect(tool.attrs['mainwave.redaction.count']).toBe(1)
     expect(metricNames(posts)).toContain('claude_code.commit.count')
+    // What the command did, by Mainwave's rules, for Mainwave to count where it has no command text.
+    expect(tool.attrs).toEqual(expect.objectContaining({ 'mainwave.command.counted': 1, 'mainwave.command.commits': 1, 'mainwave.command.pushes': 1 }))
+    expect(contractViolations(tool.attrs)).toEqual([])
+  })
+
+  test("with the command's text off, its span still carries what the command did", keyless, async ($, on) => {
+    const posts = await session($, on, { overrides: { 'bash.command': 'off', 'tool.input': 'off' } })
+    expect(posts.map(p => p.body).join('\n')).not.toContain('commit -m')
+    const tool = spansOf(posts).find(s => s.name === 'claude_code.tool')!
+    expect(Object.entries(tool.attrs).filter(([k]) => k.startsWith('mainwave.command.'))).toEqual([['mainwave.command.counted', 1], ['mainwave.command.commits', 1], ['mainwave.command.pushes', 1]])
   })
 
   test("Cowork's rows carry what its export withheld: the prompt, the response, the call's parameters and input", keyless, async ($, on) => {
@@ -136,6 +146,7 @@ describe('an explicit setting', () => {
     expect(all).not.toContain('remote-devices')
     expect(all).not.toContain('device_bash')
     expect(metricNames(posts)).not.toContain('claude_code.commit.count')
+    expect(all).not.toContain('mainwave.command.')
     // What is left on: the command's class.
     expect(spansOf(posts).find(s => s.name === 'claude_code.tool')!.attrs).toEqual(expect.objectContaining({ tool_name: 'mcp_tool', bash_argv0: 'git' }))
   })
