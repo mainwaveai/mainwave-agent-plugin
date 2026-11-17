@@ -13,14 +13,17 @@ export const DEVICE = '9b2c8f0e4d1a7c3b5e6f8a9d0c1b2e3f4a5b6c7d8e9f0a1b2c3d4e5f6
 export const LOGGED_AT = '2026-11-12T00:00:00.000Z'
 
 /** Every key the plugin may put on a row, with the shape its value must have. */
-export const CONTRACT: Record<string, (v: string) => boolean> = {
+export const CONTRACT: Record<string, (v: unknown) => boolean> = {
   'mainwave.mod.name': v => v === 'mainwave',
-  'mainwave.mod.version': v => /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(v),
-  'mainwave.mod.entrypoint': v => /^[a-z0-9_-]+$/.test(v),
+  'mainwave.mod.version': v => typeof v === 'string' && /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(v),
+  'mainwave.mod.entrypoint': v => typeof v === 'string' && /^[a-z0-9_-]+$/.test(v),
   'mainwave.telemetry.route': v => v === 'exporter' || v === 'plugin',
+  // On the plugin's own copy only, where the protections replaced a secret: how many.
+  'mainwave.redaction.count': v => typeof v === 'number' && Number.isInteger(v) && v >= 1,
 }
-export const STAMPED = Object.keys(CONTRACT).sort()
-export const isOwned = (k: string) => k.startsWith('mainwave.mod.') || k.startsWith('mainwave.telemetry.')
+/** The keys every stamped row carries. */
+export const STAMPED = ['mainwave.mod.entrypoint', 'mainwave.mod.name', 'mainwave.mod.version', 'mainwave.telemetry.route']
+export const isOwned = (k: string) => k.startsWith('mainwave.mod.') || k.startsWith('mainwave.telemetry.') || k.startsWith('mainwave.redaction.')
 
 /** A settings layer as the test answers it: an object, or `reject` for a read that fails. */
 export type Answer = Record<string, unknown> | 'reject'
@@ -92,7 +95,7 @@ export function contractViolations(attributes: Record<string, unknown>): string[
     const rule = CONTRACT[key]
     const value = attributes[key]
     if (rule === undefined) bad.push(`unknown owned key ${key}`)
-    else if (typeof value !== 'string' || !rule(value)) bad.push(`${key}=${JSON.stringify(value)} fails its shape`)
+    else if (!rule(value)) bad.push(`${key}=${JSON.stringify(value)} fails its shape`)
   }
   return bad
 }

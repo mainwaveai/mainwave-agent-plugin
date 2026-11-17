@@ -12,6 +12,9 @@ import { atom, update } from 'claude-code'
 import type { CatchHandler, EngineInterface, Frozen, Hook, Next, Register, StreamHook, TelemetryAttribute, TelemetryLogResult, TelemetryRecordEntry, Timer } from 'claude-code'
 
 import type { RowIdentity } from '../types'
+import { capturePrompt, captureTool, newCapture, rowFill, streamChunk, streamedThinking, streamStart, type Capture } from './capture.ts'
+import type { Switch } from './catalog.ts'
+import { configureGate, currentGate, gateAttributes, gateSpan, metricAllowed, OVERRIDES_KEY, overridesOf, setOverrides } from './gate.ts'
 import { endSession } from './http.ts'
 import { identityOf, isOrgId, mergeIdentity } from './identity.ts'
 import { add, collect, newMeter, type Meter } from './meter.ts'
@@ -19,6 +22,7 @@ import type { CopiedRow } from './otlp.ts'
 import {
   agentSpawned, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
 } from './rebuild.ts'
+import { contentLimit } from './protect.ts'
 import { adopt, configure, enqueue, ensureTimer, finish, isCopying, keyMalformed, snapshot } from './sender.ts'
 import { applyStamps, entrypointOf, filterStamps, PLUGIN_NAME, stripOwned } from './stamps.ts'
 import { VERSION } from './version.ts'
@@ -62,6 +66,8 @@ let rebuild: Promise<Rebuild> | null = null
 let meter: Meter = newMeter()
 let sweepTimer: Timer | null = null
 let meterTimer: Timer | null = null
+let gateRead: Promise<void> | null = null
+let capture: Capture = newCapture()
 
 /** `CLAUDE_CODE_ENTRYPOINT`, normalized; `other` when it cannot be read. */
 async function readEntrypoint($: EngineInterface): Promise<string> {
@@ -126,10 +132,52 @@ async function readClaudeTraces($: EngineInterface): Promise<boolean> {
   }
 }
 
+/**
+ * The gate's settings for this load, read from the environment once: Claude Code's switches (one set to `0` keeps what it governs as
+ * Claude Code sends it) and the length limit. A read that fails counts as unset.
+ */
+async function readGate($: EngineInterface): Promise<void> {
+  // Each name spelled out: the engine lists the variables a module reads from its calls.
+  const [details, content, prompts, responses, repository, contentMax, anyLimit, rowLimit, spanLimit] = await Promise.all([
+    settle($.env.get('OTEL_LOG_TOOL_DETAILS')),
+    settle($.env.get('OTEL_LOG_TOOL_CONTENT')),
+    settle($.env.get('OTEL_LOG_USER_PROMPTS')),
+    settle($.env.get('OTEL_LOG_ASSISTANT_RESPONSES')),
+    settle($.env.get('OTEL_METRICS_INCLUDE_REPOSITORY')),
+    settle($.env.get('CLAUDE_CODE_OTEL_CONTENT_MAX_LENGTH')),
+    settle($.env.get('OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT')),
+    settle($.env.get('OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT')),
+    settle($.env.get('OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT')),
+  ])
+  const switches: Partial<Record<Switch, string | undefined>> = {
+    OTEL_LOG_TOOL_DETAILS: details, OTEL_LOG_TOOL_CONTENT: content, OTEL_LOG_USER_PROMPTS: prompts, OTEL_LOG_ASSISTANT_RESPONSES: responses, OTEL_METRICS_INCLUDE_REPOSITORY: repository,
+  }
+  configureGate(switches, contentLimit({
+    CLAUDE_CODE_OTEL_CONTENT_MAX_LENGTH: contentMax, OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT: anyLimit, OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT: rowLimit, OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT: spanLimit,
+  }))
+  await readOverrides($)
+}
+
+/** The explicit settings per data point the store keeps, if any. A store that cannot be read leaves those held. */
+async function readOverrides($: EngineInterface): Promise<void> {
+  try {
+    setOverrides(overridesOf(await $.store.get(OVERRIDES_KEY)))
+  } catch {
+    // Those held stand.
+  }
+}
+
+/** The gate in force, once this load has read its settings. */
+async function gateOf($: EngineInterface) {
+  gateRead ??= readGate($).catch(() => undefined)
+  await gateRead
+  return currentGate()
+}
+
 /** The rebuild for this load, its settings read from the environment once. */
 async function makeRebuild($: EngineInterface): Promise<Rebuild> {
-  const [details, traceparent, spanLimit, anyLimit, claudeTraces] = await Promise.all([
-    settle($.env.get('OTEL_LOG_TOOL_DETAILS')),
+  await gateOf($)
+  const [traceparent, spanLimit, anyLimit, claudeTraces] = await Promise.all([
     settle($.env.get('TRACEPARENT')),
     settle($.env.get('OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT')),
     settle($.env.get('OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT')),
@@ -137,7 +185,7 @@ async function makeRebuild($: EngineInterface): Promise<Rebuild> {
   ])
   const limit = positiveInt(spanLimit) ?? positiveInt(anyLimit)
   return newRebuild({
-    toolDetails: truthy(details),
+    gate: currentGate,
     claudeTraces,
     ...(parseTraceparent(traceparent) ? { traceparent: parseTraceparent(traceparent)! } : {}),
     ...(limit !== undefined ? { valueLengthLimit: limit } : {}),
@@ -166,10 +214,19 @@ async function rebuildOf($: EngineInterface): Promise<Rebuild | null> {
   }
 }
 
-/** Queues what the rebuild produced: each span with route `plugin`, each measure added to its counter with route `plugin`. */
+/**
+ * Queues what the rebuild produced, through the gate: each span with route `plugin`, each measure added to its counter with route
+ * `plugin`, a measure of a data point that is off not at all.
+ */
 async function emit($: EngineInterface, out: Emit): Promise<void> {
-  for (const m of out.measures) add(meter, { ...m, attributes: { ...m.attributes, ...ROUTE } })
-  for (const span of out.spans) await enqueue($, { s: 'traces', d: { ...span, attributes: { ...span.attributes, ...ROUTE } } })
+  const gate = await gateOf($)
+  for (const m of out.measures) {
+    if (metricAllowed(gate, m.name)) add(meter, { ...m, attributes: { ...gateAttributes(gate, m.name, m.attributes), ...ROUTE } })
+  }
+  for (const span of out.spans) {
+    const gated = gateSpan(gate, span)
+    await enqueue($, { s: 'traces', d: { ...gated, attributes: { ...gated.attributes, ...ROUTE } } })
+  }
 }
 
 /** Sends what waited too long for its pair; at the end of a session, everything that has ended. */
@@ -241,7 +298,9 @@ export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams
       out = null
     }
     try {
-      await enqueue($, { s: 'logs', d: copyOf(e, attributes, out?.rowCtx) })
+      // The copy goes through the gate: what it holds back removed, what the plugin read and it allows added, the protections applied.
+      const gated = gateAttributes(await gateOf($), e.event, attributes, rowFill(capture, e.event, e.attributes))
+      await enqueue($, { s: 'logs', d: copyOf(e, gated, out?.rowCtx) })
     } catch {
       // Lost to the copy alone.
     }
@@ -289,6 +348,7 @@ export async function sessionStart($: SessionStartParams[0], e: SessionStartPara
 export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1], next: TurnStartParams[2]) {
   let out: Emit | null = null
   try {
+    if (e.agentId === undefined && isCopying()) capturePrompt(capture, e.text)
     const r = await rebuildOf($)
     if (r !== null) out = turnStart(r, e, await $.clock.now())
   } catch {
@@ -314,7 +374,34 @@ export async function turnCompleteHook($: TurnCompleteParams[0], e: TurnComplete
   return result
 }
 
-/** One model request: its start, and its stop reason and usage once it is whole. The stream passes through untouched. */
+/**
+ * The stream as it came, each piece shown to `see` on its way: next, return and throw go to it as `yield*` sends them. A fault in
+ * `see` is the watcher's alone.
+ */
+function watched<T, R>(inner: AsyncGenerator<T, R, unknown>, see: (chunk: T) => void): AsyncGenerator<T, R, unknown> {
+  const look = (step: IteratorResult<T, R>) => {
+    if (!step.done) {
+      try {
+        see(step.value)
+      } catch {
+        // Not read.
+      }
+    }
+    return step
+  }
+  const it: AsyncGenerator<T, R, unknown> = {
+    next: async (...v: [] | [unknown]) => look(await inner.next(...v)),
+    return: async v => inner.return(v),
+    throw: async err => look(await inner.throw(err)),
+    [Symbol.asyncIterator]: () => it,
+  } as AsyncGenerator<T, R, unknown>
+  return it
+}
+
+/**
+ * One model request: its start, and its stop reason and usage once it is whole; the text and thinking it streams are read for its
+ * rows. The stream passes through untouched.
+ */
 export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepParams[2]) {
   let r: Rebuild | null = null
   let startMs = 0
@@ -322,16 +409,18 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
     r = await rebuildOf($)
     if (r !== null) {
       stepStart(r, e.agentId, e.model)
+      streamStart(capture, e.agentId)
       startMs = await $.clock.now()
     }
   } catch {
     r = null
   }
   // A stream closed early (interrupted, or no longer read) leaves here and sends nothing: its row, if one comes, goes alone.
-  const result = yield* next(e)
+  const stream = r === null ? next(e) : watched(next(e), chunk => streamChunk(capture, e.agentId, chunk))
+  const result = yield* stream
   if (r !== null) {
     try {
-      await emit($, stepEnd(r, e.agentId, startMs, result, await $.clock.now()))
+      await emit($, stepEnd(r, e.agentId, startMs, result, await $.clock.now(), streamedThinking(capture, e.agentId)))
     } catch {
       // The request's span goes without its stop reason.
     }
@@ -344,7 +433,11 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
   let r: Rebuild | null = null
   try {
     r = await rebuildOf($)
-    if (r !== null) toolStart(r, e as never, await $.clock.now())
+    if (r !== null) {
+      const { tool, tool_use_id: id, agentId: _agent, consent: _consent, ...input } = e as unknown as { tool: string; tool_use_id?: string; agentId?: string; consent?: string } & Record<string, unknown>
+      captureTool(capture, id, tool, input)
+      toolStart(r, e as never, await $.clock.now())
+    }
   } catch {
     r = null
   }
@@ -392,7 +485,10 @@ export async function promptHook($: PromptParams[0], e: PromptParams[1], next: P
   let out: Emit | null = null
   try {
     r = await rebuildOf($)
-    if (r !== null) out = promptSubmitted(r, e, await $.clock.now())
+    if (r !== null) {
+      capturePrompt(capture, e.text)
+      out = promptSubmitted(r, e, await $.clock.now())
+    }
   } catch {
     r = null
   }
@@ -446,6 +542,8 @@ export function spawnCatch($: SpawnCatchParams[0], e: SpawnCatchParams[1], next:
 export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1], next: SessionEndParams[2]) {
   try {
     if (isCopying()) {
+      // The settings as they stand now: what is queued goes through them as it is sent.
+      await readOverrides($)
       await sweepNow($, true)
       // Claude Code's meter collects once more as the process ends; after a /clear or a resume the process goes on, and so does it.
       if (e.reason !== 'clear' && e.reason !== 'resume') await collectNow($)
@@ -475,6 +573,8 @@ export const register: Register = (on, options) => {
   meterTimer?.cancel()
   sweepTimer = null
   meterTimer = null
+  gateRead = null
+  capture = newCapture()
   configure(options)
 
   on('session.start', sessionStart)

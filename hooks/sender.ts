@@ -40,6 +40,7 @@
 
 import type { EngineInterface, PluginOptions, Timer } from 'claude-code'
 
+import { currentGate, gatePoint, gateRow, gateSpan } from './gate.ts'
 import { fetchWithin, type FetchOutcome } from './http.ts'
 import { logsBody, metricsBody, resourceOf, tracesBody, type BuiltSpan, type CopiedRow, type MetricPoint } from './otlp.ts'
 import { routingIdentityOf } from './identity.ts'
@@ -407,12 +408,19 @@ function groups<T>(batch: readonly Queued[]): { resource: string; items: T[] }[]
   return out
 }
 
-/** A batch of one signal as that signal's request body. */
+/**
+ * A batch of one signal as that signal's request body, each record through the gate in force as it is sent: a record queued before a
+ * data point was turned off, or left in the outbox by an earlier session, goes without it.
+ */
 function bodyOf(batch: readonly Queued[], nowMs: number): string {
   const signal = batch[0]?.s ?? 'logs'
-  if (signal === 'traces') return tracesBody(groups<BuiltSpan>(batch))
-  if (signal === 'metrics') return metricsBody(groups<MetricPoint>(batch), scopeVersion)
-  return logsBody(groups<CopiedRow>(batch).map(g => ({ resource: g.resource, rows: g.items })), scopeVersion, nowMs)
+  const gate = currentGate()
+  if (signal === 'traces') return tracesBody(groups<BuiltSpan>(batch).map(g => ({ ...g, items: g.items.map(s => gateSpan(gate, s)) })))
+  if (signal === 'metrics') {
+    const gated = groups<MetricPoint>(batch).map(g => ({ ...g, items: g.items.map(p => gatePoint(gate, p)).filter((p): p is MetricPoint => p !== null) }))
+    return metricsBody(gated.filter(g => g.items.length > 0), scopeVersion)
+  }
+  return logsBody(groups<CopiedRow>(batch).map(g => ({ resource: g.resource, rows: g.items.map(r => gateRow(gate, r)) })), scopeVersion, nowMs)
 }
 
 async function readLayer($: EngineInterface, source: 'project' | 'local'): Promise<Layer> {

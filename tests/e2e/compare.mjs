@@ -19,11 +19,13 @@
 // refusal, and checks that the spans make one trace per interaction: the interaction a root, the main loop's requests and calls its
 // children, each call's decision and run the call's, and a subagent's requests and calls under its Agent call's run. The session runs
 // on an API key, so its rows name an organization and an email only through OTEL_RESOURCE_ATTRIBUTES, which stands in for what an
-// account's login puts on them.
+// account's login puts on them. It also checks the plugin's defaults: with no settings at all, the copy carries the commands, file
+// paths, subagent types, tool output, prompts and responses the exporter carries with Mainwave's org-wide setup captures on.
 //
 // The mock model answers each request after a different delay (300 to 900 ms), so a request paired with the wrong step, or timed
 // from the wrong start, lands outside the tolerance; and it refuses one request once as overloaded, so Claude Code retries it. The
-// session runs twice: once with prompts and tool details logged (OTEL_LOG_USER_PROMPTS, OTEL_LOG_TOOL_DETAILS), once with neither,
+// session runs twice: once with Mainwave's org-wide setup captures on (OTEL_LOG_TOOL_DETAILS, OTEL_LOG_TOOL_CONTENT,
+// OTEL_LOG_USER_PROMPTS, OTEL_METRICS_INCLUDE_REPOSITORY), once with each set to 0, as the setup writes a capture an admin turns off,
 // so both sides of those settings are compared. The first runs in auto mode, so auto mode's classifier judges the command no rule
 // allows, and the mock blocks it. Claude Code logs no row for the classifier's requests, so the plugin cannot see them: the
 // exporter's spans of a request it logged no row for are a known difference, and the pass fails if the classifier asked nothing.
@@ -55,6 +57,8 @@ const ROUTE = 'mainwave.telemetry.route'
 const STARTUP = new Set(['managed_settings_resolved', 'plugin_loaded'])
 /** The classifiers whose model requests Claude Code logs no row for, which the README lists as a gap. */
 const CLASSIFIERS = new Set(['auto_mode', 'agent_classifier'])
+/** The captures Mainwave's org-wide setup sets in the env block. */
+const CAPTURES = ['OTEL_LOG_TOOL_DETAILS', 'OTEL_LOG_TOOL_CONTENT', 'OTEL_LOG_USER_PROMPTS', 'OTEL_METRICS_INCLUDE_REPOSITORY']
 /** An example organization, put on every record through the resource so the plugin's stamping path runs as in a real organization. */
 const ORG = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
 /** An example person in it, put on every record in the keyless pass, as a login would. */
@@ -297,7 +301,8 @@ async function session(details, envBlock, auto) {
     OTEL_TRACES_EXPORT_INTERVAL: '500',
     // The metric interval stays at its default (a minute), so each path collects once, as the session ends: one point per series.
     OTEL_RESOURCE_ATTRIBUTES: `mainwave.source=coding_agent.claude_code,service.name=claude-code,deployment.environment=e2e,organization.id=${ORG}`,
-    ...(details ? { OTEL_LOG_USER_PROMPTS: '1', OTEL_LOG_TOOL_DETAILS: '1' } : {}),
+    // Mainwave's org-wide setup's captures, all on (its default), or all turned off: it writes `0` for a capture an admin turns off.
+    ...Object.fromEntries(CAPTURES.map(k => [k, details ? '1' : '0'])),
   })
 
   const args = [
@@ -741,6 +746,24 @@ function checkKeyless(pass, { captured, run }, reference) {
   for (const m of ['claude_code.cost.usage', 'claude_code.token.usage', 'claude_code.lines_of_code.count', 'claude_code.commit.count']) {
     if (!points.some(p => p.name === m)) problems.push(`no ${m} point was sent`)
   }
+
+  // With no settings, the plugin's defaults are Claude Code's with Mainwave's org-wide setup captures on, though no switch is set:
+  // the copy carries what the exporter carries in the first pass. Each kind of value is looked for at least once.
+  const redacted = v => v === undefined || v === '<REDACTED>'
+  const tool = n => spans.filter(s => s.name === 'claude_code.tool' && s.attrs.tool_name?.v === n)
+  const rowsOf = ev => rows.filter(r => r.attributes['event.name']?.v === ev)
+  const expectations = [
+    ['a Bash call with its command and class', tool('Bash').some(s => s.attrs.full_command?.v === 'echo e2e' && s.attrs.bash_argv0?.v === 'echo')],
+    ['a Write call with its file path', tool('Write').some(s => String(s.attrs.file_path?.v ?? '').endsWith('a.txt'))],
+    ['an Agent call with its subagent type', tool('Agent').some(s => s.attrs.subagent_type?.v === 'general-purpose')],
+    ["a Bash call's output", tool('Bash').some(s => (s.events ?? []).some(e => e.name === 'tool.output' && kvs(e.attributes).output?.v === 'e2e'))],
+    ["a failed call's error text", spans.some(s => s.name === 'claude_code.tool.execution' && /e2e-missing-file/.test(String(s.attrs.error?.v ?? '')))],
+    ['an interaction with its prompt', spans.some(s => s.name === 'claude_code.interaction' && /^E2E_MAINTASK/.test(String(s.attrs.user_prompt?.v ?? '')))],
+    ['a user_prompt row with its prompt', rowsOf('user_prompt').some(r => /^E2E_MAINTASK/.test(String(r.attributes.prompt?.v ?? '')))],
+    ['an assistant_response row with its text', rowsOf('assistant_response').some(r => !redacted(r.attributes.response?.v))],
+    ['a tool_result row with its parameters and input', rowsOf('tool_result').some(r => /"full_command":"echo e2e"/.test(String(r.attributes.tool_parameters?.v ?? '')) && r.attributes.tool_input !== undefined)],
+  ]
+  for (const [what, ok] of expectations) if (!ok) problems.push(`defaults: no ${what} was sent`)
   const requests = captured.plugin.logs.length + captured.plugin.traces.length + captured.plugin.metrics.length
   console.log(`keyless: ${requests} requests, none refused; ${rows.length} rows, ${spans.length} spans in ${new Set(spans.map(s => s.traceId)).size} traces (${interactions.length} interactions), ${points.length} metric points`)
   console.log(`  spans: ${[...got].map(([n, c]) => `${n} ${c}`).join(', ')}`)
@@ -748,7 +771,7 @@ function checkKeyless(pass, { captured, run }, reference) {
 }
 
 // The keyless pass is held to the second, which runs as it does: not in auto mode.
-const passes = [['prompts and tool details logged, auto mode', true, true, true], ['prompts and tool details not logged', false, true, false], ['no env block, sent keyless', false, false, false]]
+const passes = [['captures on, auto mode', true, true, true], ['captures set to 0', false, true, false], ['no env block, sent keyless', false, false, false]]
 const results = []
 for (const [pass, details, envBlock, auto] of passes) {
   console.log(`\n${pass}:`)
