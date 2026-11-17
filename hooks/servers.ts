@@ -21,7 +21,7 @@
 //
 // A project server goes only where Claude Code would load it: approved (`enableAllProjectMcpServers`, `enabledMcpjsonServers`) and
 // not refused (`disabledMcpjsonServers`), as the settings or the project's entry in the global config say. A server whose name an
-// organization's `deniedMcpServers` lists goes nowhere.
+// organization's `deniedMcpServers` lists goes nowhere, nor, where its `allowedMcpServers` lists servers by name, one it doesn't.
 
 /** One MCP server set up for the session. */
 export type McpServer = { name: string; scope: string; transport?: string; address?: string }
@@ -83,16 +83,22 @@ export function foldersUp(root: string): string[] {
   return out
 }
 
-/** A remote server's address: scheme, host, port and path, without a user name, password (to the last `@`), query or fragment. */
+/**
+ * A remote server's address: scheme, host, port and path, without a user name, password (to the last `@`), query or fragment. One
+ * whose credentials can't be told from its host (a password holding `/`, `?` or `#` ends the host early) is its scheme alone, marked.
+ */
 export function remoteAddress(raw: string): string | undefined {
   const m = /^([a-z][a-z0-9+.-]{0,31}:\/\/)([^/?#]{0,4096})([^?#]{0,4096})/i.exec(raw.trim())
   if (!m) return undefined
   const at = m[2]!.lastIndexOf('@')
-  return `${m[1]}${at < 0 ? m[2] : m[2]!.slice(at + 1)}${m[3]}`
+  const host = at < 0 ? m[2]! : m[2]!.slice(at + 1)
+  // A host is a name or an `[IPv6]` address, then a port: a colon followed by anything but digits is part of a password.
+  if (/:(?!\d*$)/.test(host.replace(/^\[[^\]]*\]/, '')) || (at < 0 && /@/.test(raw.split(/[?#]/)[0]!))) return `${m[1]}[REDACTED:url_password]`
+  return `${m[1]}${host}${m[3]}`
 }
 
 /** A flag whose next argument is a secret, a header or an environment variable: `--api-key x`, `-H "X-Auth: x"`, `-e TOKEN=x`. */
-const SECRET_FLAG = /^--?[A-Za-z0-9_.-]{0,64}(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|auth|credential|key)$/i
+const SECRET_FLAG = /^--?[A-Za-z0-9_.-]{0,64}(?:password|passwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key|auth|authorization|credentials?|key|bearer|cookie|session)(?:[_-]?(?:token|header|id))?$/i
 const VALUE_FLAG = /^(?:-H|--header|-e|--env)$/
 
 /** A local server's command and arguments, each value a flag names as secret, a header or an environment variable replaced. */
@@ -150,8 +156,11 @@ export function globalServers(json: unknown, root: string | undefined): { user: 
   return { user: serversIn(json['mcpServers'], 'user'), local: serversIn(projectEntry(json, root)?.['mcpServers'], 'local') }
 }
 
-/** Which of a project's `.mcp.json` servers load, as the settings and the project's entry in the global config say. */
-export type Approvals = { all: boolean; enabled: ReadonlySet<string>; disabled: ReadonlySet<string>; denied: ReadonlySet<string> }
+/**
+ * Which of a project's `.mcp.json` servers load, as the settings and the project's entry in the global config say; and the servers an
+ * organization denies or, where it lists any by name, allows (`allowed`, undefined where it lists none).
+ */
+export type Approvals = { all: boolean; enabled: ReadonlySet<string>; disabled: ReadonlySet<string>; denied: ReadonlySet<string>; allowed?: ReadonlySet<string> }
 
 const names = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [])
 
@@ -159,14 +168,19 @@ const names = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is s
 export function approvalsOf(settings: unknown, project: Record<string, unknown> | undefined): Approvals {
   const s = isObject(settings) ? settings : {}
   const p = project ?? {}
-  const denied = Array.isArray(s['deniedMcpServers']) ? s['deniedMcpServers'].flatMap(d => (isObject(d) && typeof d['serverName'] === 'string' ? [d['serverName']] : [])) : []
+  const byName = (v: unknown) => (Array.isArray(v) ? v.flatMap(d => (isObject(d) && typeof d['serverName'] === 'string' ? [d['serverName']] : [])) : [])
+  const allowed = byName(s['allowedMcpServers'])
   return {
     all: s['enableAllProjectMcpServers'] === true || p['enableAllProjectMcpServers'] === true,
     enabled: new Set([...names(s['enabledMcpjsonServers']), ...names(p['enabledMcpjsonServers'])]),
     disabled: new Set([...names(s['disabledMcpjsonServers']), ...names(p['disabledMcpjsonServers'])]),
-    denied: new Set(denied),
+    denied: new Set(byName(s['deniedMcpServers'])),
+    ...(allowed.length > 0 ? { allowed: new Set(allowed) } : {}),
   }
 }
+
+/** A server the organization lets load: not denied, and allowed where it lists servers it allows by name. */
+export const permitted = (a: Approvals, name: string): boolean => !a.denied.has(name) && (a.allowed === undefined || a.allowed.has(name))
 
 /** A project server Claude Code would load: approved, and not refused. */
 export const approved = (a: Approvals, name: string): boolean => !a.disabled.has(name) && (a.all || a.enabled.has(name))

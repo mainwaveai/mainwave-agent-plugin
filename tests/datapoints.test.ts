@@ -264,6 +264,30 @@ describe("the MCP servers set up, and each skill's text: data points no Claude C
     expect(fix!['skill.text']).toBeUndefined()
   })
 
+  test("a run given arguments at its prompt, expanded later and outside its command, positionally: its text held back all the same", keyless, async ($, on) => {
+    const { posts } = engine($, on, { 'skill.text': 'on', 'prompt.text': 'off' })
+    await $.session.start({ cwd: ROOT, surface: null, isInteractive: false } as never)
+    await turn($)
+    await $.prompt.submit({ text: '/fix 12 login' } as never)
+    // The turn before it ends first; the skill expands after.
+    await $.turn.complete({ turnId: 't1', answer: 'Done.', durationMs: 40, isAborted: false, reason: 'answer' } as never)
+    await $.skill.prompt({ skill: 'fix', text: 'Fix PR 12, in the login flow.', source: 'userSettings', frontmatter: {} } as never)
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    const fix = ofEvent(posts, 'skill_prompt')[0]!
+    expect(fix['skill.has_arguments']).toBe(true)
+    expect(fix['skill.text']).toBeUndefined()
+    expect(posts.map(p => p.body).join('\n')).not.toContain('login flow')
+  })
+
+  test("runs before the session's identity is known: the text rides on the first alone", keyless, async ($, on) => {
+    const { posts } = engine($, on, { 'skill.text': 'on' })
+    await $.session.start({ cwd: ROOT, surface: null, isInteractive: false } as never)
+    for (let i = 0; i < 3; i++) await $.skill.prompt({ skill: 'review', text: 'Review it.', source: 'userSettings', frontmatter: {} } as never)
+    await turn($)
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    expect(ofEvent(posts, 'skill_prompt').map(r => r['skill.text'])).toEqual(['Review it.', undefined, undefined])
+  })
+
   test('a /clear starts a new session: its servers and skill texts are sent again, under its own id', keyless, async ($, on) => {
     const { posts } = engine($, on, { 'mcp.url': 'on', 'skill.text': 'on' })
     await $.session.start({ cwd: ROOT, surface: null, isInteractive: false } as never)

@@ -31,7 +31,7 @@ import {
 import { contentLimit } from './protect.ts'
 import { adopt, configure, enqueue, ensureTimer, finish, isCopying, keyMalformed, snapshot } from './sender.ts'
 import {
-  approvalsOf, approved, DESKTOP_UNDER_APPDATA, DESKTOP_UNDER_HOME, distinct, enabledPlugins, fileServers, foldersUp, globalServers, join, managedDirs, manifestServerFiles, MAX_PLUGINS, parse,
+  approvalsOf, approved, permitted, DESKTOP_UNDER_APPDATA, DESKTOP_UNDER_HOME, distinct, enabledPlugins, fileServers, foldersUp, globalServers, join, managedDirs, manifestServerFiles, MAX_PLUGINS, parse,
   pluginServers, projectEntry, serverAttributes, toolSpelling, type Approvals, type McpServer,
 } from './servers.ts'
 import { applyStamps, entrypointOf, filterStamps, PLUGIN_NAME, stripOwned } from './stamps.ts'
@@ -87,11 +87,15 @@ let endedSession: TelemetryAttribute | undefined
 /** The MCP servers sent this session, as a tool's name spells them; and the reading of Claude's MCP settings, once started. */
 let serversSent = new Set<string>()
 let serversRead: Promise<void> | null = null
-/** Each skill text's ID this session, and the texts queued with their text; the arguments given to runs not yet expanded. */
+/**
+ * Each skill text's ID this session, the texts a queued row carried, and those a waiting row carries; the runs given arguments not yet
+ * expanded, by name, with when each was given.
+ */
 let textIds = new Map<string, string>()
 let textsSent = new Set<string>()
+let textsWaiting = new Set<string>()
 let argsInFlight = 0
-let pendingArgs = new Map<string, number>()
+let pendingArgs = new Map<string, number[]>()
 let recentArgs: { text: string; atMs: number }[] = []
 
 /** One of the plugin's own rows; `text`, for a skill's row, the text it carries, marked sent once the row is queued. */
@@ -103,6 +107,8 @@ const MAX_SKILL_TEXTS = 200
 const ARGS_MS = 60_000
 const MAX_ARGS = 20
 const MAX_PENDING = 50
+/** How long a run given arguments waits to expand: a queued prompt waits for the turn before it. */
+const PENDING_MS = 30 * 60_000
 
 /** `CLAUDE_CODE_ENTRYPOINT`, normalized; `other` when it cannot be read. */
 async function readEntrypoint($: EngineInterface): Promise<string> {
@@ -296,6 +302,9 @@ async function flushOwn($: EngineInterface): Promise<void> {
   if (r === null || Object.keys(r.common).length === 0) return
   if (endedSession !== undefined && r.common['session.id'] === endedSession) return
   endedSession = undefined
+  // This session's sets: a /clear while a row is being queued starts new ones, which the old session's texts stay out of.
+  const sent = textsSent
+  const waiting = textsWaiting
   const gate = await gateOf($)
   entrypoint ??= readEntrypoint($)
   const ep = await entrypoint
@@ -305,17 +314,20 @@ async function flushOwn($: EngineInterface): Promise<void> {
       'mainwave.mod.name': PLUGIN_NAME, 'mainwave.mod.version': VERSION, 'mainwave.mod.entrypoint': ep, 'mainwave.telemetry.route': 'plugin',
     })
     const row = gateRow(gate, { event: o.event, loggedAt: at, attributes })
-    if (row === null) continue
-    const queued = await enqueue($, { s: 'logs', d: row })
-    // A text counts as sent once a row carrying it is queued: until then, the next run of it carries it too.
-    if (queued && o.text !== undefined && row.attributes['skill.text'] !== undefined) textsSent.add(o.text)
+    try {
+      // A text counts as sent once a row carrying it is queued; one held back or not queued is carried by the next run of it.
+      if (row !== null && (await enqueue($, { s: 'logs', d: row })) && o.text !== undefined && row.attributes['skill.text'] !== undefined) sent.add(o.text)
+    } finally {
+      if (o.text !== undefined) waiting.delete(o.text)
+    }
   }
 }
 
 /** Adds the plugin's own rows to those waiting, and queues them if the session's identity is known. */
 async function queueOwn($: EngineInterface, rows: readonly OwnRow[]): Promise<void> {
   own.push(...rows)
-  if (own.length > MAX_OWN) own.splice(0, own.length - MAX_OWN)
+  // The oldest go first; a text one carried is carried by the next run of it instead.
+  if (own.length > MAX_OWN) for (const o of own.splice(0, own.length - MAX_OWN)) if (o.text !== undefined) textsWaiting.delete(o.text)
   await flushOwn($)
 }
 
@@ -347,7 +359,7 @@ async function readServers($: EngineInterface): Promise<McpServer[]> {
   const homeDir = home || profile || undefined
   const read = async (path: string) => parse(await readText($, path))
   const settings = await mergedSettings($)
-  const notDenied = (servers: McpServer[], a: Approvals) => servers.filter(s => !a.denied.has(s.name))
+  const notDenied = (servers: McpServer[], a: Approvals) => servers.filter(s => permitted(a, s.name))
   // A managed file has exclusive control: only its servers load.
   const managed = await Promise.all(managedDirs(home || undefined, profile || undefined).map(d => read(join(d, 'managed-mcp.json'))))
   if (managed.some(m => m !== undefined)) return distinct(notDenied(managed.flatMap(m => fileServers(m, 'managed')), approvalsOf(settings, undefined)))
@@ -420,16 +432,24 @@ const sameSkill = (a: string, b: string) => a === b || a.endsWith(`:${b}`) || b.
  */
 function expectArgs(name: unknown, args: unknown, atMs: number): boolean {
   if (typeof args !== 'string' || args.trim() === '') return false
-  if (typeof name === 'string' && name !== '' && (pendingArgs.has(name) || pendingArgs.size < MAX_PENDING)) pendingArgs.set(name, (pendingArgs.get(name) ?? 0) + 1)
+  if (typeof name === 'string' && name !== '' && (pendingArgs.has(name) || pendingArgs.size < MAX_PENDING)) pendingArgs.set(name, [...(pendingArgs.get(name) ?? []), atMs].slice(-MAX_PENDING))
   recentArgs = [...recentArgs.filter(a => atMs - a.atMs < ARGS_MS), { text: args.trim(), atMs }].slice(-MAX_ARGS)
   return true
 }
 
-/** Takes one run given arguments of this skill, if one waits. */
-function takeArgs(skill: string): boolean {
-  for (const [name, n] of pendingArgs) {
+/**
+ * Takes one run given arguments of this skill, if one waits; runs that waited too long are let go. One left over (a slash command
+ * counted at its prompt and at its run) only holds the next text back.
+ */
+function takeArgs(skill: string, atMs: number): boolean {
+  for (const [name, times] of pendingArgs) {
+    const live = times.filter(t => atMs - t < PENDING_MS)
+    if (live.length === 0) pendingArgs.delete(name)
+    else pendingArgs.set(name, live)
+  }
+  for (const [name, times] of pendingArgs) {
     if (!sameSkill(name, skill)) continue
-    if (n > 1) pendingArgs.set(name, n - 1)
+    if (times.length > 1) pendingArgs.set(name, times.slice(1))
     else pendingArgs.delete(name)
     return true
   }
@@ -447,7 +467,7 @@ function slashCommand(text: unknown): { name: string; args: string } | undefined
  * holds arguments given lately, or it ends with the arguments Claude Code appends to a skill that names no placeholder.
  */
 function holdsArgs(skill: string, text: string, atMs: number): boolean {
-  const waited = takeArgs(skill)
+  const waited = takeArgs(skill, atMs)
   return waited || argsInFlight > 0 || /\nARGUMENTS: \S/.test(text) || recentArgs.some(a => atMs - a.atMs < ARGS_MS && text.includes(a.text))
 }
 
@@ -462,7 +482,8 @@ function skillRow(skill: string, source: string, text: string, atMs: number): Ow
     id = randomHex(16)
     if (textIds.size < MAX_SKILL_TEXTS) textIds.set(text, id)
   }
-  const withText = !textsSent.has(text)
+  const withText = !textsSent.has(text) && !textsWaiting.has(text)
+  if (withText) textsWaiting.add(text)
   return {
     event: SKILL_PROMPT_ROW,
     atMs,
@@ -479,6 +500,7 @@ async function nextSession($: EngineInterface): Promise<void> {
   endedSession = r?.common['session.id']
   textIds = new Map()
   textsSent = new Set()
+  textsWaiting = new Set()
   pendingArgs = new Map()
   await startServers($)
 }
@@ -581,6 +603,7 @@ export async function sessionStart($: SessionStartParams[0], e: SessionStartPara
       // are read beside the session's start, never holding it.
       textIds = new Map()
       textsSent = new Set()
+      textsWaiting = new Set()
       await startServers($)
     } catch {
       // Sending starts with the next row instead.
@@ -615,8 +638,6 @@ export async function turnCompleteHook($: TurnCompleteParams[0], e: TurnComplete
     // The turn's interaction is not rebuilt.
   }
   const result = await next(e)
-  // A main-loop turn ended: a run given arguments that was to expand has expanded, or will not.
-  if (e.agentId === undefined) pendingArgs.clear()
   if (out !== null) await emit($, out).catch(() => undefined)
   return result
 }
@@ -877,6 +898,7 @@ export const register: Register = (on, options) => {
   endedSession = undefined
   textIds = new Map()
   textsSent = new Set()
+  textsWaiting = new Set()
   argsInFlight = 0
   pendingArgs = new Map()
   recentArgs = []

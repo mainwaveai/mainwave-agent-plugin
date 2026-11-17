@@ -3,7 +3,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import {
-  approvalsOf, approved, distinct, enabledPlugins, fileServers, foldersUp, globalServers, join, localAddress, managedDirs, manifestServerFiles, pluginServers, projectEntry, remoteAddress, serverOf, toolSpelling,
+  approvalsOf, approved, distinct, permitted, enabledPlugins, fileServers, foldersUp, globalServers, join, localAddress, managedDirs, manifestServerFiles, pluginServers, projectEntry, remoteAddress, serverOf, toolSpelling,
 } from '../hooks/servers.ts'
 
 describe('addresses', () => {
@@ -13,6 +13,13 @@ describe('addresses', () => {
     expect(remoteAddress('not a url')).toBeUndefined()
     // A password with an `@` in it: all of it goes, to the last `@` before the path.
     expect(remoteAddress('https://ana:p@ss@mcp.example.com/mcp')).toBe('https://mcp.example.com/mcp')
+    // One that ends the host early: its credentials can't be told from its host, so nothing past the scheme goes.
+    expect(remoteAddress('https://ana:pa?ss@host.example.com/mcp')).toBe('https://[REDACTED:url_password]')
+    expect(remoteAddress('https://ana:pa/ss@host.example.com/mcp')).toBe('https://[REDACTED:url_password]')
+    expect(remoteAddress('https://ana:pa#ss@host.example.com/mcp')).toBe('https://[REDACTED:url_password]')
+    // A port, and an IPv6 address, are a host's.
+    expect(remoteAddress('http://[::1]:8080/mcp')).toBe('http://[::1]:8080/mcp')
+    expect(remoteAddress('https://mcp.example.com:443/mcp?q=a@b')).toBe('https://mcp.example.com:443/mcp')
   })
 
   test('a value a flag names as a secret, a header or an environment variable is replaced, the flag kept', () => {
@@ -20,6 +27,9 @@ describe('addresses', () => {
       'npx mcp-remote https://x.example.com --api-key [REDACTED:assigned_secret] --access-token [REDACTED:assigned_secret] -H [REDACTED:header_or_env] -e [REDACTED:header_or_env] --verbose',
     )
     expect(localAddress('server', ['--token'])).toBe('server --token')
+    expect(localAddress('x', ['--authorization', 'Bearer abc', '--bearer', 'zzz', '--cookie', 'c=1', '--session-token', 's'])).toBe(
+      'x --authorization [REDACTED:assigned_secret] --bearer [REDACTED:assigned_secret] --cookie [REDACTED:assigned_secret] --session-token [REDACTED:assigned_secret]',
+    )
   })
 
   test('a local server is its command and arguments; its environment and headers are never read', () => {
@@ -51,6 +61,9 @@ describe('where they are kept', () => {
     expect(['a', 'b', 'c', 'd'].map(n => approved(a, n))).toEqual([true, false, true, false])
     expect([...a.denied]).toEqual(['x'])
     expect(approved(approvalsOf({ enableAllProjectMcpServers: true }, undefined), 'd')).toBe(true)
+    // An organization's lists by name: denied goes nowhere; where it allows some by name, only those.
+    expect(['x', 'y', 'z'].map(n => permitted(approvalsOf({ allowedMcpServers: [{ serverName: 'x' }, { serverName: 'y' }], deniedMcpServers: [{ serverName: 'y' }] }, undefined), n))).toEqual([true, false, false])
+    expect(permitted(approvalsOf({ allowedMcpServers: [{ serverUrl: 'https://*' }] }, undefined), 'z')).toBe(true)
   })
 
   test('.mcp.json in the project root and each folder above it, nearest first, on any OS', () => {
