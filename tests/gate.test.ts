@@ -382,13 +382,13 @@ describe("a shell command's outcome stamps", () => {
     expect(ownerOf('claude_code.tool.execution', 'mainwave.command.commits')).toBeUndefined()
   })
 
-  test('go with the defaults; the refs only where the repository goes too', () => {
-    expect(gateAttributes(resolveGate({}), 'claude_code.tool', stamped)).toEqual(stamped)
-    expect(stamps(gateAttributes(resolveGate({}, { repo: 'off' }), 'claude_code.tool', stamped))).toEqual(['mainwave.command.counted', 'mainwave.command.commits', 'mainwave.command.pushes', 'mainwave.command.branches_opened'])
+  test('the counts go with the defaults; the refs only where the repository goes too, which is off by default', () => {
+    expect(stamps(gateAttributes(resolveGate({}), 'claude_code.tool', stamped))).toEqual(['mainwave.command.counted', 'mainwave.command.commits', 'mainwave.command.pushes', 'mainwave.command.branches_opened'])
+    expect(gateAttributes(resolveGate({}, { repo: 'on' }), 'claude_code.tool', stamped)).toEqual(stamped)
   })
 
   test('none goes with command outcomes off, the refs included, though the repository is on', () => {
-    expect(stamps(gateAttributes(resolveGate({}, { 'bash.outcome': 'off' }), 'claude_code.tool', stamped))).toEqual([])
+    expect(stamps(gateAttributes(resolveGate({}, { 'bash.outcome': 'off', repo: 'on' }), 'claude_code.tool', stamped))).toEqual([])
   })
 
   test('none goes as Claude Code sends it: Claude Code sends none of them', () => {
@@ -398,10 +398,10 @@ describe("a shell command's outcome stamps", () => {
 
   test('a ref goes through the protections, and one the limit would cut is left off, not cut', () => {
     const secret = `ghp_${'a'.repeat(36)}`
-    const out = gateAttributes(resolveGate({}), 'claude_code.tool', { ...stamped, 'mainwave.command.push_ref': secret })
+    const out = gateAttributes(resolveGate({}, { repo: 'on' }), 'claude_code.tool', { ...stamped, 'mainwave.command.push_ref': secret })
     expect(out['mainwave.command.push_ref']).toBe('[REDACTED:github_token]')
     expect(out['mainwave.redaction.count']).toBe(1)
-    const short = gateAttributes(resolveGate({}, {}, 4), 'claude_code.tool', stamped)
+    const short = gateAttributes(resolveGate({}, { repo: 'on' }, 4), 'claude_code.tool', stamped)
     expect(stamps(short)).toEqual(['mainwave.command.counted', 'mainwave.command.commits', 'mainwave.command.pushes', 'mainwave.command.branches_opened'])
     expect(Object.keys(short).filter(k => k.endsWith('_truncated'))).toEqual([])
   })
