@@ -103,6 +103,63 @@ describe('commandOutcomes, beyond the cases', () => {
     expect(commandOutcomes('git push -o "a b" origin')).toEqual({ counts: { pushes: 1 }, refs: {} })
   })
 
+  test("a quoted string cut for its separator leaves the strings after it paired as the shell pairs them: no word of a message is a ref", () => {
+    const push = (cmd: string) => expect(commandOutcomes(cmd)).toEqual({ counts: { pushes: 1 }, refs: { push_ref: 'main' } })
+    push('git push -o merge_request.create -o merge_request.title="Fix login & signup" -o merge_request.description="Fixes the login bug for acme" origin main')
+    push('git push -o "title=A & B" -o "desc=launch plan for acme" origin main')
+    push("git push -o 'ci.skip; x' -o 'merge_request.description=the secret plan here' origin main")
+    push('git push -o "a | b" -o "c\nd" -o "one two three four" origin main')
+    const merge = (cmd: string) => expect(commandOutcomes(cmd)).toEqual({ counts: { merges: 1 }, refs: { merge_ref: 'feat' } })
+    merge('git merge --no-ff -m "Merge feat; closes #12" -m "Reviewed by alice and bob" feat')
+    merge('git merge -m "multi\nline" -m "second para words here" feat')
+    merge('git merge -m "Merge feat\n\nbody" -m "second para words here" feat')
+    expect(commandOutcomes('git merge -m "a; b" feat && git push origin "x y z w"')).toEqual({ counts: { merges: 1, pushes: 1 }, refs: { merge_ref: 'feat' } })
+    expect(commandOutcomes('git checkout -q "a; b" -b "c d e" feat')).toEqual({ counts: { branches_opened: 1 }, refs: {} })
+  })
+
+  test('a redirect, with its target attached or as the next word, is no argument, before the remote or after it', () => {
+    const pushed = (cmd: string) => commandOutcomes(cmd).refs.push_ref
+    for (const cmd of [
+      'git push > /tmp/push.log origin main',
+      'git push >log origin main',
+      'git push >> log origin main',
+      'git push 2>&1 origin main',
+      'git push 2> err origin main',
+      'git push 2>err origin main',
+      'git push &>/dev/null origin main',
+      'git push &> log origin main',
+      'git push < /dev/null origin main',
+      'git push >| log origin main',
+      'git push origin > log main',
+      'git push origin main 2>&1',
+    ]) {
+      expect(pushed(cmd)).toBe('main')
+    }
+    expect(commandOutcomes('git tag 2>/dev/null v1').refs).toEqual({ tag_name: 'v1' })
+    expect(commandOutcomes('git merge < /dev/null feat').refs).toEqual({ merge_ref: 'feat' })
+    expect(commandOutcomes('git checkout > log -b feat').refs).toEqual({ branch_opened: 'feat' })
+    expect(commandOutcomes('git checkout -b > log feat').refs).toEqual({ branch_opened: 'feat' })
+    // A redirect's `&` ends no command, and a background `&` still does.
+    expect(commandOutcomes('git push 2>&1 | tail')).toEqual({ counts: { pushes: 1 }, refs: {} })
+    expect(commandOutcomes('git push origin & echo a b')).toEqual({ counts: { pushes: 1 }, refs: {} })
+    // A quoted operator is a word.
+    expect(pushed('git push ">" main')).toBe('main')
+  })
+
+  test('no ref is read past a heredoc the rules leave in place, or from a command with an ANSI-C string holding an escaped quote; counts stay', () => {
+    expect(commandOutcomes('cat <<msg\ngit push origin hunter2\nmsg')).toEqual({ counts: { pushes: 1 }, refs: {} })
+    expect(commandOutcomes('git commit -F- <<end\nfix stuff\ngit tag s3cret\nend')).toEqual({ counts: { commits: 1, tags: 1 }, refs: {} })
+    expect(commandOutcomes("git commit -F- <<'Msg'\nfix\ngit merge secretword\nMsg")).toEqual({ counts: { commits: 1, merges: 1 }, refs: {} })
+    expect(commandOutcomes('cat <<EOF\ngit push origin main')).toEqual({ counts: { pushes: 1 }, refs: {} })
+    expect(commandOutcomes("echo $'it\\'s; git push origin hunter2 '")).toEqual({ counts: { pushes: 1 }, refs: {} })
+    // Before the heredoc, refs are read; a merge's is the last one's, so one in the body leaves none.
+    expect(commandOutcomes('git push origin main && cat <<msg\nx\nmsg')).toEqual({ counts: { pushes: 1 }, refs: { push_ref: 'main' } })
+    expect(commandOutcomes('git merge feat && cat <<msg\ngit merge s3cret\nmsg')).toEqual({ counts: { merges: 2 }, refs: {} })
+    // A heredoc the rules cut, and an ANSI-C string with no escaped quote, take nothing away.
+    expect(commandOutcomes("cat <<'EOF' > f\nx\nEOF\ngit push origin main")).toEqual({ counts: { pushes: 1 }, refs: { push_ref: 'main' } })
+    expect(commandOutcomes("git commit -m $'a\\nb' && git push origin main")).toEqual({ counts: { commits: 1, pushes: 1 }, refs: { push_ref: 'main' } })
+  })
+
   test('a ref never starts at a separator, so no word of the next command is one', () => {
     expect(commandOutcomes('git push origin |grep password')).toEqual({ counts: { pushes: 1 }, refs: {} })
     expect(commandOutcomes('git push origin ;curl secret-host')).toEqual({ counts: { pushes: 1 }, refs: {} })
@@ -203,6 +260,12 @@ describe('commandOutcomes, beyond the cases', () => {
       'git tag v\\|'.repeat(mb / 10),
       'git checkout -q '.repeat(mb / 16),
       'git worktree add -b\n'.repeat(mb / 20),
+      `git push ${'> '.repeat(mb / 2)}`,
+      `git push ${'2>&'.repeat(mb / 3)}`,
+      `git merge -m ${'"a;b" '.repeat(mb / 6)}`,
+      `echo ${"$'\\".repeat(mb / 3)}`,
+      `${'<<a '.repeat(mb / 4)}`,
+      `git push origin ${'"a;b"'.repeat(mb / 5)}`,
     ]
     const started = Date.now()
     for (const input of inputs) commandOutcomes(input)
