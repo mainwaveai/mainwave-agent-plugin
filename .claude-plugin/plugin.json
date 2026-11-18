@@ -2,21 +2,12 @@
   "name": "mainwave",
   "displayName": "Mainwave",
   "version": "0.1.0",
-  "description": "Reports your Claude Code and Cowork sessions to Mainwave. It adds the plugin's name, version, entry point and route to the telemetry rows Claude Code already sends to your organization's collector, and reads the organization, account, email and device ID those rows carry. It asks Mainwave for the organization's data collection settings, sending the organization ID and email alone, and applies them to what it sends. It also sends its own copy of those rows to Mainwave's dev collector, with Claude Code's spans and metrics rebuilt beside them: without a key, routed by the Claude organization and email on each record, or with a Mainwave dev ingest key where one is set.",
+  "description": "Reports your Claude Code and Cowork sessions to Mainwave. It adds the plugin's name, version, entry point and route to the telemetry rows Claude Code already sends to your organization's collector, and reads the organization, account, email and device ID those rows carry. It asks Mainwave for the organization's data collection settings, sending the organization ID and email alone, and applies them to what it sends. It also sends its own copy of those rows to Mainwave's production collector, with Claude Code's spans and metrics rebuilt beside them, without a key: routed by the Claude organization and email on each record.",
   "author": {
     "name": "Mainwave"
   },
   "engines": {
     "claude-code": ">=2.1.317"
   },
-  "types": "./types/index.d.ts",
-  "userConfig": {
-    "devIngestKey": {
-      "type": "string",
-      "title": "Mainwave dev ingest key",
-      "description": "An ingest key for Mainwave's dev collector. Set: the plugin sends its copy of Claude Code's telemetry rows, spans and metrics with this key. Unset: it sends the copy without a key, routed by the Claude organization and email on each record. Only your own settings count: a repository's settings that name this option stop the copy.",
-      "sensitive": true,
-      "default": ""
-    }
-  }
+  "types": "./types/index.d.ts"
 }

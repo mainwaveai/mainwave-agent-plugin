@@ -1,14 +1,16 @@
 // The plugin's own path to Mainwave: a copy of each Claude Code log row, and the spans and metrics the plugin rebuilds beside them
-// (spans.ts, metrics.ts), sent to Mainwave's dev collector while Claude Code's exporter goes on sending the originals wherever the
-// organization pointed it. The two land in different places, so nothing is counted twice, and the copy can be compared with the
+// (spans.ts, metrics.ts), sent to Mainwave's production collector (or the one the person's own settings name) while Claude Code's
+// exporter goes on sending the originals wherever the organization pointed it. The two land in different places, so nothing is counted twice, and the copy can be compared with the
 // original record for record.
 //
 // The hooks only queue (`enqueue`): they never wait on the network. One queue holds all three signals, each entry tagged with its own,
 // so they share the caps, the outbox and the end of the session; each signal waits on its own after a failure, so a path that fails
 // holds back only its own records. A timer sends the queue in batches every few seconds, each batch one
 // signal to that signal's path, and `session.end` sends one more batch of each signal at once within its short bound. A batch that fails for a reason that can pass (no network, a timeout, the
-// collector busy) goes back to the head of the queue and the timer waits longer before the next try. A batch the collector refuses
-// as malformed is dropped. A refused key stops sending until the plugin loads again, keeping the queue.
+// collector busy) goes back to the head of the queue and the timer waits longer before the next try: a random share of a wait that
+// doubles, or what the collector's `Retry-After` asks, so that many machines refused at once do not all come back at once. A batch the
+// collector refuses as malformed is dropped. A refusal of the whole request stops sending, and queuing, until the plugin loads again,
+// keeping what was queued.
 //
 // Each batch carries an idempotency key (the `idempotency-key` header), made when the batch is first formed and kept, with the batch's
 // exact records, until the batch is settled: through every retry, in the outbox, and by a later load that takes the outbox over. The
@@ -21,12 +23,12 @@
 // seen, so they may be stored twice, never lost.
 //
 // A batch formed keyless has its organization and email's hash in its key, so it goes under the same header whichever way a later
-// load sends it. A batch formed with a key goes keyless as one batch per person, each under its key with that person's hash after
+// load sends it. A batch an earlier version formed with a dev ingest key goes keyless as one batch per person, each under its key with that person's hash after
 // it: a header the collector has not seen, so such a batch may be stored twice, never lost.
 //
-// Two ways to send: keyless, with no `Authorization` header at all, or, where the person set a dev ingest key, with that key as a
-// bearer token. Keyless ingest routes each request by the `organization.id` and `user.email` on every record,
-// span and data point in it, and takes one pair per request. So without a key the plugin queues only records that carry both (a
+// The copy goes keyless, with no `Authorization` header at all. Keyless ingest routes each request by the `organization.id` and
+// `user.email` on every record, span and data point in it, and takes one pair per request. So the plugin queues only records that
+// carry both (a
 // session on an API key or a cloud provider names no organization: its records are held back, never sent), and each batch holds one
 // pair's records alone, so a batch the collector refuses holds back or drops no other person's. A refusal of the pair (403
 // `unclaimed`: no Mainwave workspace has claimed the organization; `email_domain`: the email's domain is not the workspace's) stops
@@ -38,29 +40,29 @@
 //
 // Fail open: nothing here holds a row, a tool call or the session. Every outcome is caught.
 
-import type { EngineInterface, PluginOptions, Timer } from 'claude-code'
+import type { EngineInterface, Timer } from 'claude-code'
 
 import { combinePacks, currentGate, gatePoint, gateResource, gateRow, gateSpan, optInOf, packsOf, setOptIn, setOrgPacks, setPersonPacks } from './gate.ts'
 import { fetchWithin, type FetchOutcome } from './http.ts'
 import { applyStoredSettings } from './orgsettings.ts'
 import { logsBody, metricsBody, resourceOf, tracesBody, type BuiltSpan, type CopiedRow, type MetricPoint } from './otlp.ts'
 import { routingIdentityOf } from './identity.ts'
-import { ingestKeyOf, KEY_OPTION, namesOption, OPT_IN_OPTION, optionValues, PACKS_OPTION, type Layer } from './settings.ts'
+import { COLLECTOR_OPTION, collectorUrlOf, namesOption, OPT_IN_OPTION, optionValues, PACKS_OPTION, type Layer } from './settings.ts'
 
-/** The one place the copy goes, a path per signal. Nothing reads another URL from settings or the environment. */
-export const DEV_COLLECTOR = 'https://collector.dev.mainwave.com'
+/**
+ * Where the copy goes, a path per signal after it, unless the person's own user settings name another collector (`collectorUrl`).
+ * Nothing reads a URL from the environment or from the organization's settings.
+ */
+export const PROD_COLLECTOR = 'https://collector.mainwave.com'
 export type Signal = 'logs' | 'traces' | 'metrics'
 export const SIGNALS: readonly Signal[] = ['logs', 'traces', 'metrics']
-export const DEV_URLS: Readonly<Record<Signal, string>> = {
-  logs: `${DEV_COLLECTOR}/v1/logs`,
-  traces: `${DEV_COLLECTOR}/v1/traces`,
-  metrics: `${DEV_COLLECTOR}/v1/metrics`,
-}
-export const DEV_LOGS_URL = DEV_URLS.logs
 
 export const FLUSH_MS = 5_000
 export const SEND_TIMEOUT_MS = 10_000
 export const BACKOFF_MAX_MS = 60_000
+/** The longest wait a collector's `Retry-After` may ask for; and the spread added to it, a share of what it asks. */
+export const RETRY_AFTER_MAX_MS = 600_000
+export const RETRY_AFTER_SPREAD = 0.2
 /** A batch: at most this many records of one signal and about this many bytes of JSON. */
 export const BATCH_ROWS = 200
 export const BATCH_BYTES = 1_000_000
@@ -152,6 +154,28 @@ export function verdictOf(outcome: FetchOutcome): Verdict {
   return 'retry'
 }
 
+/** A number in [0, 1), or 0.5 where the runtime has no source of chance. */
+function chance(): number {
+  try {
+    const r = Math.random()
+    return r >= 0 && r < 1 ? r : 0.5
+  } catch {
+    return 0.5
+  }
+}
+
+/**
+ * How long a collector that answered 429 or 503 asks to be left alone (`Retry-After`, in seconds or as an HTTP date), capped at
+ * `RETRY_AFTER_MAX_MS`; undefined when it asks nothing that can be read.
+ */
+export function retryAfterOf(outcome: FetchOutcome, nowMs: number): number | undefined {
+  if (outcome.ok || outcome.reason !== 'status' || (outcome.status !== 429 && outcome.status !== 503)) return undefined
+  const raw = outcome.headers?.['retry-after']?.trim()
+  if (raw === undefined || raw === '') return undefined
+  const ms = /^\d+$/.test(raw) ? Number(raw) * 1000 : Date.parse(raw) - nowMs
+  return Number.isFinite(ms) && ms > 0 ? Math.min(ms, RETRY_AFTER_MAX_MS) : undefined
+}
+
 /** Why keyless ingest refused a request's organization and email (a 403 that names it), or undefined for any other answer. */
 export function refusalOf(outcome: FetchOutcome): 'unclaimed' | 'email_domain' | undefined {
   if (outcome.ok || outcome.reason !== 'status' || outcome.status !== 403) return undefined
@@ -164,9 +188,10 @@ export function refusalOf(outcome: FetchOutcome): 'unclaimed' | 'email_domain' |
 }
 
 // Per load of the module; `configure` starts them over.
-let key: string | null = null
-/** How the copy is sent: with the key, keyless, or (a key set but of the wrong shape) not at all. */
-let mode: 'key' | 'keyless' | 'off' = 'keyless'
+/** Whether the copy is sent: keyless, or (a `collectorUrl` set but of the wrong shape) not at all. */
+let mode: 'keyless' | 'off' = 'keyless'
+/** Where it goes, as the person's user settings name it at the last send, else production's collector. */
+let collector = PROD_COLLECTOR
 /** The organizations and emails keyless ingest refused this load: their records are kept, not sent. */
 let refusedWho = new Set<string>()
 let outboxKey = ''
@@ -200,13 +225,11 @@ function newId(): string {
   }
 }
 
-/** Starts the sender over for a load of the module: with the key from the plugin's options where one is set, else keyless. */
-export function configure(options: PluginOptions | undefined): void {
+/** Starts the sender over for a load of the module. Where the copy goes is read from the person's settings before each send. */
+export function configure(): void {
   timer?.cancel()
-  key = ingestKeyOf(options?.[KEY_OPTION])
-  const raw = options?.[KEY_OPTION]
-  // No key set: keyless. A key set but of the wrong shape: the person meant the key path, so nothing is sent rather than guessed.
-  mode = key !== null ? 'key' : raw === undefined || raw === null || (typeof raw === 'string' && raw.trim() === '') ? 'keyless' : 'off'
+  mode = 'keyless'
+  collector = PROD_COLLECTOR
   refusedWho = new Set()
   outboxKey = `${OUTBOX_PREFIX}${newId()}`
   queue = []
@@ -227,10 +250,13 @@ export function configure(options: PluginOptions | undefined): void {
   counts = { sent: 0, dropped: 0, withheld: 0 }
 }
 
-/** Whether the key option holds a key of the wrong shape, which turns the copy off. */
-export const keyMalformed = (): boolean => mode === 'off'
+/** Whether the person's `collectorUrl` has not the shape of a collector, which turns the copy off. */
+export const collectorMalformed = (): boolean => mode === 'off'
 
-/** Whether rows are copied at all: unless a key of the wrong shape is set, or a repository named the key option. */
+/** Where the copy goes now: production's collector, or the one the person's settings name. */
+export const collectorOf = (): string => collector
+
+/** Whether rows are copied at all: unless the person's `collectorUrl` has not the shape, or a repository named it. */
 export const isCopying = (): boolean => mode !== 'off' && !refused
 
 /** Who a record is routed to without a key: the `organization.id` and `user.email` on the record itself. */
@@ -293,7 +319,9 @@ function dropOldest(): void {
  * runs (after a /clear the session goes on without a `session.start`). Answers whether it was queued.
  */
 export async function enqueue($: EngineInterface, item: Item): Promise<boolean> {
-  if (!isCopying()) return false
+  // A refusal of the whole request (a collector that takes no keyless rows): what is queued is kept for a later load, and
+  // nothing more is added, so a session does not grow and rewrite its outbox for a collector that will not take it.
+  if (!isCopying() || stopped) return false
   // Without a key, a record that names no organization and email has nowhere to go: it is held back, never queued.
   const who = mode === 'keyless' ? whoOf(item.d) : undefined
   if (mode === 'keyless' && who === undefined) {
@@ -477,11 +505,41 @@ export async function readOptions($: EngineInterface): Promise<void> {
   }
 }
 
-/** A repository that names the key option stops the copy for this load, and what was queued for it is let go. */
+/**
+ * Where the copy goes, from the person's user settings: the first `collectorUrl` the layer gives under any of the plugin's ids, else
+ * production's collector. One that has not the shape turns the copy off for this load, and what was queued is let go: the person
+ * meant it to go somewhere else, so it goes nowhere rather than to a guess. A layer that cannot be read names none.
+ */
+async function readCollector($: EngineInterface): Promise<boolean> {
+  const [raw] = optionValues(await readLayer($, 'user'), COLLECTOR_OPTION)
+  if (raw === undefined || raw === null || (typeof raw === 'string' && raw.trim() === '')) {
+    collector = PROD_COLLECTOR
+    return false
+  }
+  const url = collectorUrlOf(raw)
+  if (url !== null) {
+    collector = url
+    return false
+  }
+  mode = 'off'
+  return stopCopying()
+}
+
+/** A repository that names the collector option stops the copy for this load, and what was queued for it is let go. */
 async function repositoryNamesKey($: EngineInterface): Promise<boolean> {
   const [project, local] = await Promise.all([readLayer($, 'project'), readLayer($, 'local')])
   if (!namesOption(project) && !namesOption(local)) return false
   refused = true
+  return stopCopying()
+}
+
+/** Whether this load sends nowhere, as a repository or the person's settings say: then what it holds is let go. */
+async function settingsStopCopy($: EngineInterface): Promise<boolean> {
+  const [repository, person] = await Promise.all([repositoryNamesKey($), readCollector($)])
+  return repository || person
+}
+
+function stopCopying(): true {
   queue = []
   queuedBytes = 0
   dirty = true
@@ -502,12 +560,11 @@ async function send($: EngineInterface, batch: readonly Queued[], limit: number,
     return 'unwritable'
   }
   try {
-    const keyless = mode === 'keyless'
-    // Without a key, no Authorization header at all: any one sends the request down the key path, where it is refused.
-    const headers: Record<string, string> = keyless ? { 'content-type': 'application/json' } : { 'content-type': 'application/json', authorization: `Bearer ${key}` }
-    const idempotencyKey = idempotencyKeyOf(batch, keyless)
+    // No Authorization header at all: any one sends the request down the key path, where it is refused.
+    const headers: Record<string, string> = { 'content-type': 'application/json' }
+    const idempotencyKey = idempotencyKeyOf(batch, true)
     if (idempotencyKey !== undefined) headers['idempotency-key'] = idempotencyKey
-    return await fetchWithin($, DEV_URLS[batch[0]!.s], {
+    return await fetchWithin($, `${collector}/v1/${batch[0]!.s}`, {
       method: 'POST',
       headers,
       body,
@@ -546,8 +603,12 @@ function settle(batch: Queued[], outcome: FetchOutcome | 'unwritable', now: numb
   else if (verdict === 'off') off.add(signal)
   // A request cut off by the session's end says nothing about the collector: the next session tries again at once.
   else if (outcome.ok || outcome.reason !== 'stopped') {
+    // The wait doubles, but each try waits a random share of it (full jitter), and at least what the collector asks, spread a little:
+    // machines a collector turned away together come back apart.
     const backoffMs = Math.min(Math.max(waits[signal].backoffMs * 2, FLUSH_MS), BACKOFF_MAX_MS)
-    waits[signal] = { backoffMs, nextTryAt: now + backoffMs }
+    const asked = retryAfterOf(outcome, now)
+    const waitMs = Math.max(chance() * backoffMs, asked === undefined ? 0 : asked * (1 + chance() * RETRY_AFTER_SPREAD))
+    waits[signal] = { backoffMs, nextTryAt: now + waitMs }
   }
 }
 
@@ -564,7 +625,7 @@ export async function flush($: EngineInterface, opts: { timeoutMs: number | (() 
     const at = await $.clock.now()
     if (!SIGNALS.some(sig => ready(sig, at) && queue.some(item => item.s === sig && sendable(item)))) return
     // The options are read beside the repository's settings, not after: the end of a session leaves little time.
-    const [refusedNow] = await Promise.all([repositoryNamesKey($), readOptions($)])
+    const [refusedNow] = await Promise.all([settingsStopCopy($), readOptions($)])
     if (refusedNow) return
     const limitNow = () => (typeof opts.timeoutMs === 'function' ? opts.timeoutMs() : opts.timeoutMs)
     if (opts.together) {
@@ -708,8 +769,8 @@ export async function adopt($: EngineInterface): Promise<void> {
     const keys = (await $.store.keys()).filter(k => k.startsWith(OUTBOX_PREFIX) && k !== outboxKey)
     // Nothing to take over: no settings read.
     if (keys.length === 0) return
-    // A load a repository refuses takes over nothing: other sessions' rows stay where they are for a load that may send them.
-    if (await repositoryNamesKey($)) return
+    // A load a repository refuses, or that sends nowhere, takes over nothing: other sessions' rows stay for a load that may send them.
+    if (await settingsStopCopy($)) return
     for (const k of keys) {
       const raw = await $.store.get(k)
       // An outbox a later version wrote is left for that version to send.
@@ -718,9 +779,9 @@ export async function adopt($: EngineInterface): Promise<void> {
       if (box !== null && now - box.updatedAt < STALE_MS) continue
       await $.store.delete(k)
       if (box === null || box.items.length === 0) continue
-      // Without a key, records an earlier load kept that name no organization and email are held back, as new ones are.
-      // Taken over from an earlier load, whose settings this one does not know: the gate holds them to what is on (gate.ts, strict).
-      const items = (mode === 'keyless' ? box.items.filter(item => item.who !== undefined) : box.items).map(item => ({ ...item, adopted: true as const }))
+      // Records an earlier load kept that name no organization and email are held back, as new ones are (an earlier version sent them
+      // with a key). Taken over from an earlier load, whose settings this one does not know: the gate holds them to what is on (gate.ts, strict).
+      const items = box.items.filter(item => item.who !== undefined).map(item => ({ ...item, adopted: true as const }))
       counts.withheld += box.items.length - items.length
       queue = [...items, ...queue]
       queuedBytes += items.reduce((n, r) => n + r.size, 0)

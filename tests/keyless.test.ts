@@ -6,9 +6,9 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
 import { whoHash } from '../hooks/sender.ts'
-import { boot, CAPTURES_ON, EMAIL, IDEMPOTENCY_KEY, itemAttributes, KEY, keylessAnswer, LOGGED_AT, memoryStore, network, optInOption, ORG, type KeylessAnswer, type Layers, type Post, type Reply } from './rig.ts'
+import { boot, CAPTURES_ON, collectorOption, EMAIL, IDEMPOTENCY_KEY, itemAttributes, keylessAnswer, LOGGED_AT, memoryStore, network, optInOption, ORG, type KeylessAnswer, type Layers, type Post, type Reply } from './rig.ts'
 
-/** No options: the plugin's defaults, so no key, so keyless. */
+/** No options: the plugin's defaults, keyless to Mainwave's production collector. */
 const keyless = { options: {} }
 const START = 1_800_000_000_000
 const TICK = 5_000
@@ -22,7 +22,7 @@ const PATH = (url: string) => new URL(url).pathname
 type Seen = { post: Post; answer: KeylessAnswer }
 
 /**
- * The world without Mainwave's env block: Claude Code neither traces nor exports, its rows name no span, and the dev collector answers
+ * The world without Mainwave's env block: Claude Code neither traces nor exports, its rows name no span, and the collector answers
  * as keyless ingest does. `answer` overrides it for a request.
  */
 function world(on: On, opts: { refused?: Record<string, 'unclaimed' | 'email_domain'>; answer?: (a: KeylessAnswer, post: Post) => Reply | undefined; store?: Record<string, unknown>; layers?: Layers } = {}) {
@@ -336,42 +336,74 @@ describe('the idempotency key, keyless', () => {
   })
 })
 
-describe('the key option', () => {
-  test('unset, the copy goes keyless with no option at all', async ($, on) => {
+describe('where the copy goes', () => {
+  const ORIGIN = (url: string) => new URL(url).origin
+
+  test("unset, to Mainwave's production collector, keyless, on all three paths", async ($, on) => {
     const { seen } = world(on)
     await turn($)
     await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
     expect(seen.length).toBeGreaterThan(0)
+    expect([...new Set(seen.map(s => ORIGIN(s.post.url)))]).toEqual(['https://collector.mainwave.com'])
+    expect([...new Set(seen.map(s => PATH(s.post.url)))].sort()).toEqual(['/v1/logs', '/v1/metrics', '/v1/traces'])
     for (const { post, answer } of seen) {
       expect(Object.keys(post.headers).map(h => h.toLowerCase())).toEqual(['content-type', 'idempotency-key'])
       expect(answer.status).toBe(200)
     }
   })
 
-  test('a key of the wrong shape sends nothing, keyless or not, and the debug log says why without the value', { options: { devIngestKey: 'has a space' } }, async ($, on) => {
-    const { clock, posts, logs } = world(on)
+  test("a collectorUrl in the person's own settings sends it there instead, its path kept before the signal's", keyless, async ($, on) => {
+    const { seen } = world(on, { layers: { user: collectorOption('https://collector.example.com/otlp/') } })
+    await turn($)
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    expect(seen.length).toBeGreaterThan(0)
+    expect([...new Set(seen.map(s => s.post.url))].sort()).toEqual(['https://collector.example.com/otlp/v1/logs', 'https://collector.example.com/otlp/v1/metrics', 'https://collector.example.com/otlp/v1/traces'])
+    for (const { answer } of seen) expect(answer.status).toBe(200)
+  })
+
+  test('a collectorUrl of the wrong shape sends nothing, keeps nothing, and the debug log says why without the value', keyless, async ($, on) => {
+    const { clock, posts, logs, store } = world(on, { layers: { user: collectorOption('http://collector.example.com') } })
     await turn($)
     await clock.advance(3 * TICK)
     await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
     expect(posts).toEqual([])
-    expect(logs.join('')).toContain('copy off: the devIngestKey option holds a key of the wrong shape')
-    expect(logs.join('')).not.toContain('has a space')
+    expect(store.sets.filter(s => s.key.startsWith('outbox:'))).toEqual([])
+    expect(logs.join('')).toContain('copy off: the collectorUrl option is not an https URL')
+    expect(logs.join('')).not.toContain('collector.example.com')
   })
 
-  test('set, the key is used instead: a bearer token, and records with no email go as well', { options: { devIngestKey: KEY } }, async ($, on) => {
-    // The collector's key path: any key is taken here.
-    const { clock, posts } = world(on, { answer: () => ({ status: 200 }) })
-    await row($, 'api_request', { cost_usd: 0.1 }, { 'organization.id': ORG, 'session.id': 's-1' })
-    await clock.advance(TICK)
-    const logs = posts.filter(p => PATH(p.url) === '/v1/logs')
-    expect(logs.length).toBe(1)
-    expect(logs[0]!.headers['authorization']).toBe(`Bearer ${KEY}`)
-  })
+  for (const [name, opts] of [
+    ['the plugin options (which managed settings and --settings feed)', { options: { collectorUrl: 'https://evil.example.com' } }],
+    ['a dev ingest key an earlier version used', { options: { devIngestKey: 'mw_dev_example_key_0001' } }],
+  ] as const) {
+    test(`a collectorUrl or key in ${name} is ignored: the copy goes to production, keyless`, opts, async ($, on) => {
+      const { seen } = world(on, { layers: { flag: collectorOption('https://evil.example.com'), policy: collectorOption('https://evil.example.com') } })
+      await turn($)
+      await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+      expect(seen.length).toBeGreaterThan(0)
+      expect([...new Set(seen.map(s => ORIGIN(s.post.url)))]).toEqual(['https://collector.mainwave.com'])
+      for (const { post } of seen) expect(Object.keys(post.headers).map(h => h.toLowerCase())).not.toContain('authorization')
+    })
+  }
 
-  test("a repository's settings that name the key stop the copy, keyless included", keyless, async ($, on) => {
-    const { clock, posts } = world(on, { layers: { project: { pluginConfigs: { mainwave: { options: { devIngestKey: 'mw_dev_attacker_key_01' } } } } } })
+  test("a repository's settings that name collectorUrl stop the copy", keyless, async ($, on) => {
+    const { clock, posts } = world(on, { layers: { project: collectorOption('https://evil.example.com', 'mainwave') } })
     await turn($)
     await clock.advance(3 * TICK)
     expect(posts).toEqual([])
+  })
+
+  test('a collector that takes no keyless rows yet (401 with no reason) is asked once a session; what was queued is kept, and nothing more', keyless, async ($, on) => {
+    const { clock, posts, store } = world(on, { answer: () => ({ status: 401, text: '{"error":"unauthorized"}' }) })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await row($, 'user_prompt', { prompt: 'go', prompt_length: '2' })
+    await clock.advance(TICK)
+    expect(posts.length).toBe(1)
+    const kept = lastOutbox(store.sets)!.items.length
+    await turn($)
+    await clock.advance(20 * TICK)
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    expect(posts.length).toBe(1)
+    expect(lastOutbox(store.sets)!.items.length).toBe(kept)
   })
 })

@@ -234,15 +234,16 @@ export async function fetchNow($: EngineInterface, collector: string): Promise<O
 }
 
 /** Asks after `ms`, then again on the outcome's wait, for as long as the load runs; one timer at a time. */
-function schedule($: EngineInterface, collector: string, ms: number): void {
+function schedule($: EngineInterface, collector: () => string, ms: number): void {
   timer?.cancel()
   try {
     timer = $.clock.after(Math.max(1, ms), () => {
       timer = null
-      // The copy turned off (a repository named the key option): nothing is sent, so nothing is asked, until the plugin loads again.
+      // The copy turned off (a repository named the collector option, or the person's is malformed): nothing is sent, so nothing is
+      // asked, until the plugin loads again.
       if (!copying()) return
       const asked = `${org} ${email}`
-      void fetchNow($, collector).then(outcome => {
+      void fetchNow($, collector()).then(outcome => {
         // Not asked (a request already out, or nothing to ask with): the request out schedules the next.
         if (outcome === undefined) return
         wait = nextWait(outcome, wait, retryAfterMs)
@@ -257,9 +258,10 @@ function schedule($: EngineInterface, collector: string, ms: number): void {
 
 /**
  * What a row said about who the session is. A new organization brings its own settings, from the store until Mainwave answers; with
- * its email known, the plugin asks at once, and every `REFRESH_MS` after, while `sending` says it sends a copy at all.
+ * its email known, the plugin asks at once, and every `REFRESH_MS` after, while `sending` says it sends a copy at all. `collector`
+ * answers where the copy goes as each request leaves, so the settings come from the Mainwave the person's settings name at that time.
  */
-export async function noteSessionIdentity($: EngineInterface, collector: string, who: { organizationId?: string; email?: string }, sending: () => boolean): Promise<void> {
+export async function noteSessionIdentity($: EngineInterface, collector: () => string, who: { organizationId?: string; email?: string }, sending: () => boolean): Promise<void> {
   copying = sending
   const orgChanged = who.organizationId !== undefined && who.organizationId !== org
   const emailChanged = who.email !== undefined && who.email !== email
@@ -274,7 +276,7 @@ export async function noteSessionIdentity($: EngineInterface, collector: string,
 }
 
 /** As a session starts: asks again at once, if the organization and email are known and no request is out. */
-export function ensureFetching($: EngineInterface, collector: string): void {
+export function ensureFetching($: EngineInterface, collector: () => string): void {
   if (!inflight && org !== undefined && email !== undefined) schedule($, collector, 0)
 }
 

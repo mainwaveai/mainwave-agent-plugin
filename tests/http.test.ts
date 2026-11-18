@@ -53,8 +53,8 @@ describe('fetchWithin', () => {
     expect(f.requests).toEqual([{ url: URL, init }])
   })
 
-  test('a non-2xx answer is a status outcome, not a throw', async () => {
-    expect(await fetchWithin(fake(respond(503, 'busy')).$, URL)).toEqual({ ok: false, reason: 'status', status: 503, headers: expect.any(Object), text: 'busy' })
+  test('a non-2xx answer is a status outcome with its headers, not a throw', async () => {
+    expect(await fetchWithin(fake(respond(503, 'busy', { 'retry-after': '30' })).$, URL)).toEqual({ ok: false, reason: 'status', status: 503, headers: { 'retry-after': '30' }, text: 'busy' })
   })
 
   test('a rejected request is a failed outcome, not a throw', async () => {

@@ -6,7 +6,7 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
 import { nextWait, REFRESH_MS, RETRY_MS, settingsOf, settingsUrlOf } from '../hooks/orgsettings.ts'
-import { boot, EMAIL, keyOption, keylessAnswer, LOGGED_AT, memoryStore, network, optInOption, ORG, packsOption, SETTINGS_URL, type Layers, type Post, type Reply } from './rig.ts'
+import { boot, collectorOption, EMAIL, keylessAnswer, LOGGED_AT, memoryStore, network, optInOption, ORG, packsOption, SETTINGS_URL, type Layers, type Post, type Reply } from './rig.ts'
 
 const keyless = { options: {} }
 const START = 1_800_000_000_000
@@ -95,7 +95,7 @@ describe('asking Mainwave', () => {
   })
 
   test('no more once a repository stops the copy', keyless, async ($, on) => {
-    const { clock, posts } = world(on, { settings: () => answer({}), layers: { project: keyOption('mw_dev_example_key_0001') } })
+    const { clock, posts } = world(on, { settings: () => answer({}), layers: { project: collectorOption('https://collector.example.com') } })
     await row($, 'api_request', { cost_usd: 0.1 })
     await clock.advance(TICK)
     await clock.advance(2 * REFRESH_MS)

@@ -49,18 +49,17 @@ export type Answer = Record<string, unknown> | 'reject'
 export type Layers = Partial<Record<'policy' | 'flag' | 'user' | 'project' | 'local', Answer>>
 export type Rig = { rows: { event: string; attributes: Record<string, unknown> }[]; reads: string[] }
 
-/** The plugin's dev key option in a settings layer, under the given plugin id. */
-export const keyOption = (value: unknown, id = 'mainwave@mainwave'): Record<string, unknown> => ({ pluginConfigs: { [id]: { options: { devIngestKey: value } } } })
+/** The person's collector override in a settings layer, under the given plugin id. */
+export const collectorOption = (value: unknown, id = 'mainwave@synced'): Record<string, unknown> => ({ pluginConfigs: { [id]: { options: { collectorUrl: value } } } })
 /** The person's opt-in to more data points in a settings layer, under the given plugin id. */
 export const optInOption = (value: unknown, id = 'mainwave@synced'): Record<string, unknown> => ({ pluginConfigs: { [id]: { options: { extraDataPoints: value } } } })
 
 /** The redaction packs option in a settings layer, under the given plugin id: an organization's in managed settings, a person's in theirs. */
 export const packsOption = (value: unknown, id = 'mainwave@synced'): Record<string, unknown> => ({ pluginConfigs: { [id]: { options: { redactionPacks: value } } } })
 
-/** A dev ingest key, as a person would set it. */
-export const KEY = 'mw_dev_example_key_0001'
-/** Where the copy may go, and nowhere else. */
-export const DEV_URL = 'https://collector.dev.mainwave.com/v1/logs'
+/** Mainwave's production collector: where the copy goes unless the person's own settings name another. */
+export const PROD = 'https://collector.mainwave.com'
+export const PROD_URL = `${PROD}/v1/logs`
 /** The collector's shape for an `idempotency-key` header: 1 to 128 of these characters. */
 export const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{1,128}$/
 
@@ -127,11 +126,11 @@ export function contractViolations(attributes: Record<string, unknown>): string[
 /** One request the plugin made, as the network received it. */
 export type Post = { url: string; method?: string; headers: Record<string, string>; body: string }
 /** How the network answers the nth request (1-based): a status, `reject` (no network), or `hang` (no answer). */
-export type Reply = { status: number; text?: string } | 'reject' | 'hang'
+export type Reply = { status: number; text?: string; headers?: Record<string, string> } | 'reject' | 'hang'
 
-/** Where the plugin reads its organization's data collection settings, on the API beside the dev collector. */
-export const SETTINGS_URL = 'https://api.dev.mainwave.com/api/plugin/data-collection-settings'
-/** The settings API's answer where its route is off, as production answers today. */
+/** Where the plugin reads its organization's data collection settings, on the API beside the production collector. */
+export const SETTINGS_URL = 'https://api.mainwave.com/api/plugin/data-collection-settings'
+/** The settings API's answer where its route is off. */
 const SETTINGS_OFF: Reply = { status: 404, text: '{"detail":"Not Found"}' }
 
 /**
@@ -151,7 +150,7 @@ export function network(
   const answer = (r: Reply) => {
     if (r === 'reject') throw new Error('network refused in test')
     if (r === 'hang') return new Promise<never>(() => undefined)
-    return { value: { status: r.status, ok: r.status >= 200 && r.status < 300, headers: {}, text: r.text ?? '' } } as never
+    return { value: { status: r.status, ok: r.status >= 200 && r.status < 300, headers: r.headers ?? {}, text: r.text ?? '' } } as never
   }
   on('http.fetch', async (_$, e) => {
     const req = e as unknown as { url: string; init?: { method?: string; headers?: Record<string, string>; body?: unknown } }
@@ -240,7 +239,7 @@ export function memoryStore(on: On, entries: Record<string, unknown> = {}, unrea
 }
 
 // ── Keyless ingest ────────────────────────────────────────────────────────────
-// The dev collector's rules for a request with no key, as its owners wrote them: routed by the `organization.id` and `user.email`
+// Keyless ingest's rules for a request with no key, as its owners wrote them: routed by the `organization.id` and `user.email`
 // on every item (a log record, a span, a metric data point), never the resource's.
 
 type KeyValues = { key: string; value: Record<string, unknown> }[]
