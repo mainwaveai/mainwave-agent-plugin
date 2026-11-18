@@ -214,8 +214,8 @@ export function mcpCreatesPr(toolName: string): boolean {
 // them from the command's text where it has it; where it does not (the text is content, and an organization may keep it), it counts
 // what the plugin stamps on the command's span from these rules. So these are Mainwave's own rules, ported as they are: the patterns
 // below are its regular expressions, and `tests/fixtures/command-outcomes.json` holds the cases both must agree on. The refs are the
-// one place the port reads less than Mainwave does: a ref is read only from a counted invocation at a command position, up to the
-// end of its simple command, so no word of a commit message, an echo or the next command is ever sent as one (see `PUSH_REF`).
+// one place the port reads less than Mainwave does: a ref is a word of a counted invocation, read with the shell's word rules, past
+// the flags that take a value, and sent only with a git ref's shape (see Refs, below).
 //
 // Mainwave evaluates them in ClickHouse, whose regular expressions are RE2's. What differs in JavaScript, and how the port keeps RE2's
 // results:
@@ -257,7 +257,6 @@ const GIT = String.raw`git(${SP}+-C${SP}+${NSP}+)?${SP}+`
 const GIT_NC = String.raw`git(?:${SP}+-C${SP}+${NSP}+)?${SP}+`
 const SUB_END = String.raw`(${SP}|$)`
 const REMOTE_REF = String.raw`(?:(?:origin|upstream)/${NSP}+|refs/remotes/${NSP}+|${NSP}*@[{](?:u|upstream)[}]|FETCH_HEAD)`
-const REF = String.raw`([^-\t\n\v\f\r ][^\t\n\v\f\r &|;]*)`
 
 const COUNTED: Readonly<Record<Exclude<CommandCount, 'merges' | 'branches_opened'>, RegExp>> = {
   commits: new RegExp(String.raw`${CMD_POS}${GIT}(commit|cherry-pick)${SUB_END}`),
@@ -272,67 +271,196 @@ const COUNTED: Readonly<Record<Exclude<CommandCount, 'merges' | 'branches_opened
 /** A branch opener up to its subcommand (`opensBranch`). */
 const OPENER_HEAD = new RegExp(String.raw`${CMD_POS_NC}${GIT_NC}(checkout|switch|worktree${SP}+add)`, 'g')
 const SPACE = new RegExp(SP)
-/**
- * The ref a branch opener, a push, a merge invocation or a tag names: the pattern's first group, as written. Mainwave's push and tag
- * patterns are searched anywhere, and its branch, push and tag patterns read across newlines and separators, so a word of a commit
- * message, or of the next command, can be read as the ref. The plugin sends a ref where the command's text may stay on the machine,
- * so here each starts at a command position, as its count does, and reads only words of its own simple command: no newline, `&`,
- * `|` or `;` within it. Where the two differ, the plugin's ref is a word of an invocation both count, or there is none.
- */
+// ── Refs ──
+//
+// Mainwave reads a ref with a pattern's group: its push and tag patterns are searched anywhere, and its patterns read across newlines,
+// separators, quotes and flags' values, so a word of a commit message, a push option or the next command can be read as a ref. The
+// plugin sends a ref where the command's text may stay on the machine, so it reads one rule instead: a ref is a word of a counted
+// invocation (a command position, `git`, the subcommand), read with the shell's own word rules (`shellWords`) from the subcommand to
+// the end of its simple command; the word Mainwave's pattern names, with each flag that takes a value skipped with its value; and sent
+// only when it has a git ref's shape (`refShaped`). Where the two differ, the plugin names no ref, or a word of an invocation both count.
+
+/** A counted invocation up to its subcommand, where the subcommand has words after it. */
+const inLine = (sub: string) => new RegExp(String.raw`${CMD_POS_NC}${GIT_IN_LINE}${sub}(?=${HSP})`, 'g')
 const GIT_IN_LINE = String.raw`git(?:${HSP}+-C${HSP}+${WORD}+)?${HSP}+`
-const OPEN_ARGS_IN_LINE = String.raw`(?:${HSP}+${WORD}+)*?`
-const BRANCH_OPENER_IN_LINE = String.raw`${GIT_IN_LINE}(?:checkout${OPEN_ARGS_IN_LINE}${HSP}+-[bB]|switch${OPEN_ARGS_IN_LINE}${HSP}+(?:-[cC]|--create|--force-create)|worktree${HSP}+add${OPEN_ARGS_IN_LINE}${HSP}+-[bB])${HSP}+`
-const BRANCH_NAME = new RegExp(String.raw`${CMD_POS_NC}${BRANCH_OPENER_IN_LINE}["']?([^-\t\n\v\f\r &|;"'${'`'}][^\t\n\v\f\r &|;"'${'`'}]*)`)
-const PUSH_REF = new RegExp(String.raw`${CMD_POS_NC}${GIT_IN_LINE}push(?:${HSP}+-${WORD}+)*${HSP}+[^-\t\n\v\f\r &|;]${WORD}*${HSP}+${REF}`)
-/** A merge's flags that take the next word as their value: a message, a message file, a strategy and its option. */
-const MERGE_VALUE_FLAGS: ReadonlySet<string> = new Set(['-m', '-F', '-s', '-X', '--message', '--file', '--strategy', '--strategy-option', '--into-name'])
-/** What a ref may be: one word that starts with no `-` and holds no separator. */
-const REF_WORD = /^[^-\t\n\v\f\r ][^\t\n\v\f\r &|;]*$/
+const PUSH_HEAD = inLine('push')
+const TAG_HEAD = inLine('tag')
+const OPENER_HEAD_IN_LINE = inLine(String.raw`(checkout|switch|worktree${HSP}+add)`)
+
+/** A subcommand's flags that take the next word as their value: short ones by letter, long ones by name. */
+type ValueFlags = { short: string; long: readonly string[] }
+const PUSH_FLAGS: ValueFlags = { short: 'o', long: ['--push-option', '--repo', '--receive-pack', '--exec', '--recurse-submodules'] }
+const MERGE_FLAGS: ValueFlags = { short: 'mFsX', long: ['--message', '--file', '--strategy', '--strategy-option', '--into-name', '--cleanup'] }
+/** A branch opener's: its branch flags, whose value is the branch, and the rest. */
+const OPENER_FLAGS: Readonly<Record<string, ValueFlags & { branch: readonly string[] }>> = {
+  checkout: { short: 'bB', long: ['--orphan', '--conflict', '--pathspec-from-file'], branch: ['-b', '-B'] },
+  switch: { short: 'cC', long: ['--create', '--force-create', '--orphan', '--conflict'], branch: ['-c', '-C', '--create', '--force-create'] },
+  worktree: { short: 'bB', long: ['--reason'], branch: ['-b', '-B'] },
+}
 
 /**
- * The ref the counted merge invocation names: its first word that is not a flag or a flag's value, as written. Mainwave's pattern
- * reads the word after any flag, so `git merge -m "fix the login" feat` gives `"fix`, a word of the message. The plugin sends a ref
- * where the message may stay on the machine, so it skips a value-taking flag's value, quoted words included, and sends no ref for
- * a word that is not one.
+ * Whether a flag takes the next word as its value: a long flag of the list, or an abbreviation of one, written without `=value`; a
+ * cluster of short flags whose first value-taking letter is its last, so no value is attached to it.
  */
-function mergeRef(invocation: string): string {
-  const head = MERGE_HEAD.exec(invocation)
-  if (!head) return ''
-  const words = shellWords(invocation.slice(head.index + head[0].length))
-  for (let i = 0; i < words.length; i++) {
-    const w = words[i]!
-    if (w.startsWith('-')) {
-      if (MERGE_VALUE_FLAGS.has(w)) i++
-      continue
+function takesValue(word: string, flags: ValueFlags): boolean {
+  if (word.startsWith('--')) return !word.includes('=') && flags.long.some(f => f === word || (word.length >= 4 && f.startsWith(word)))
+  for (let i = 1; i < word.length; i++) if (flags.short.includes(word[i]!)) return i === word.length - 1
+  return false
+}
+
+const isHsp = (c: string | undefined) => c === ' ' || c === '\t' || c === '\v' || c === '\f' || c === '\r'
+const ENDS_COMMAND = new Set(['\n', '&', '|', ';', ')'])
+
+/**
+ * The words of a simple command from `from`, each as written, quotes included, read lazily: unquoted spaces split them; `'…'` is
+ * literal; `"…"` takes `\"` and `\\` as escapes; an unquoted backslash escapes the next character; `$(…)`, `${…}` and `` `…` `` are
+ * part of the word they are in, up to their close; a quote or a substitution left open runs to the end of the text. An unquoted
+ * newline, `&`, `|`, `;` or `)` ends the command. Each character is read once. `at()` is where reading stopped.
+ */
+function shellWords(text: string, from: number): { next: () => string | undefined; at: () => number } {
+  const n = text.length
+  let p = from
+  /** The end of the substitution or quoted string opening at `q`, past its close; `n` when it is left open. */
+  const close = (q: number): number => {
+    const c = text[q]
+    if (c === "'") {
+      const e = text.indexOf("'", q + 1)
+      return e < 0 ? n : e + 1
     }
-    return REF_WORD.test(w) ? w : ''
+    if (c === '`') {
+      for (let i = q + 1; i < n; i++) {
+        if (text[i] === '\\') i++
+        else if (text[i] === '`') return i + 1
+      }
+      return n
+    }
+    if (c === '"') {
+      for (let i = q + 1; i < n; ) {
+        const d = text[i]
+        if (d === '\\') i += 2
+        else if (d === '"') return i + 1
+        else if (opens(i)) i = close(i)
+        else i++
+      }
+      return n
+    }
+    // `$(` or `${`: up to its matching close, read as opaque.
+    const [open, shut] = text[q + 1] === '(' ? ['(', ')'] : ['{', '}']
+    let depth = 0
+    for (let i = q + 1; i < n; i++) {
+      const d = text[i]
+      if (d === '\\') i++
+      else if (d === open) depth++
+      else if (d === shut && --depth === 0) return i + 1
+    }
+    return n
+  }
+  const opens = (q: number) => text[q] === '`' || (text[q] === '$' && (text[q + 1] === '(' || text[q + 1] === '{'))
+  const next = (): string | undefined => {
+    while (p < n && (isHsp(text[p]) || (text[p] === '\\' && text[p + 1] === '\n'))) p += isHsp(text[p]) ? 1 : 2
+    const start = p
+    while (p < n) {
+      const c = text[p]!
+      if (isHsp(c) || ENDS_COMMAND.has(c)) break
+      if (c === '\\') p += 2
+      else if (c === "'" || c === '"' || opens(p)) p = close(p)
+      else p++
+    }
+    p = Math.min(p, n)
+    return p > start ? text.slice(start, p) : undefined
+  }
+  return { next, at: () => p }
+}
+
+/** A git ref's characters: letters, digits, `.`, `_`, `-`, `/`, `@`, `+`, `:`, `,`, `=`, `%`, `#`, braces, and `$` opening a variable. */
+const REF_SHAPE = /^(?:[\p{L}\p{M}\p{N}._/@+:,=%#{}-]|\$(?=[A-Za-z_{]))+$/u
+/**
+ * A word as a ref, or `''` when it has no git ref's shape: at most 256 characters of a ref's own, not starting with `-`, either bare or
+ * wrapped whole in one pair of matching quotes (kept as written, unless `unquote`).
+ */
+function refShaped(word: string | undefined, unquote = false): string {
+  if (word === undefined) return ''
+  const quoted = word.length >= 2 && (word[0] === '"' || word[0] === "'") && word[word.length - 1] === word[0]
+  const name = quoted ? word.slice(1, -1) : word
+  const ref = unquote ? name : word
+  return ref.length <= 256 && !name.startsWith('-') && REF_SHAPE.test(name) ? ref : ''
+}
+
+/**
+ * Whether the command position at `at` is a separator a backslash escapes (`\;`, `\|`, `\&`, a backslash and a newline): a literal
+ * character, often of a quoted string, where Mainwave's rules still count a command. A ref is never read from one.
+ */
+function escapedAt(text: string, at: number): boolean {
+  let i = at
+  while (i > 0 && text[i - 1] === '\\') i--
+  return (at - i) % 2 === 1
+}
+
+/**
+ * The ref of the first invocation `head` finds that names one, as `named` reads its words (`undefined` when it names none, so the
+ * next is read). A head inside a word an earlier one read, or past an escaped separator, is skipped; each character is read once.
+ */
+function firstRef(head: RegExp, text: string, named: (m: RegExpExecArray, words: ReturnType<typeof shellWords>) => string | undefined): string {
+  head.lastIndex = 0
+  for (let m = head.exec(text); m !== null; m = head.exec(text)) {
+    if (escapedAt(text, m.index)) continue
+    const words = shellWords(text, m.index + m[0].length)
+    const word = named(m, words)
+    if (word !== undefined) return word
+    head.lastIndex = Math.max(words.at(), m.index + m[0].length)
   }
   return ''
 }
 
-/** The words of a simple command's arguments, split at unquoted spaces, each kept as written (its quotes too). Linear. */
-function shellWords(text: string): string[] {
-  const out: string[] = []
-  let word = ''
-  let quote: string | null = null
-  for (const c of text) {
-    if (quote) {
-      word += c
-      if (c === quote) quote = null
-    } else if (c === '"' || c === "'") {
-      word += c
-      quote = c
-    } else if (c === ' ' || c === '\t' || c === '\n' || c === '\v' || c === '\f' || c === '\r') {
-      if (word) out.push(word)
-      word = ''
-    } else {
-      word += c
+/** A push's ref, as Mainwave's pattern places it: past its flags (and their values), the word after the remote. */
+const pushRef = (x: string) =>
+  firstRef(PUSH_HEAD, x, (_m, words) => {
+    let w = words.next()
+    while (w?.startsWith('-')) {
+      if (takesValue(w, PUSH_FLAGS)) words.next()
+      w = words.next()
     }
+    if (w === undefined) return undefined
+    const ref = words.next()
+    return ref === undefined || ref.startsWith('-') ? undefined : refShaped(ref)
+  })
+
+/** A tag's name, as Mainwave's pattern places it: the word after `tag`, or after `tag -a` or `tag -s`, when it is no flag. */
+const tagName = (x: string) =>
+  firstRef(TAG_HEAD, x, (_m, words) => {
+    let w = words.next()
+    if (w === '-a' || w === '-s') w = words.next()
+    return w === undefined || w.startsWith('-') ? undefined : refShaped(w)
+  })
+
+/** The branch an opener names: its branch flag's value, quotes taken off, as Mainwave's pattern reads it. */
+const branchOpened = (x: string) =>
+  firstRef(OPENER_HEAD_IN_LINE, x, (m, words) => {
+    const flags = OPENER_FLAGS[m[1]!.split(/[\t\v\f\r ]/)[0]!]!
+    for (let w = words.next(); w !== undefined; w = words.next()) {
+      if (flags.branch.includes(w)) {
+        const name = words.next()
+        return name === undefined || name.startsWith('-') ? undefined : refShaped(name, true)
+      }
+      if (w.startsWith('-') && takesValue(w, flags)) words.next()
+    }
+    return undefined
+  })
+
+/**
+ * The ref a counted merge invocation names, at `at` in `x`: its first word that is not a flag or a flag's value. Mainwave's pattern
+ * reads the word after any flag, so `git merge -m "fix the login" feat` gives `"fix`, a word of the message.
+ */
+function mergeRef(x: string, at: number, invocation: string): string {
+  const head = MERGE_HEAD.exec(invocation)
+  if (!head || escapedAt(x, at)) return ''
+  const words = shellWords(x, at + head[0].length)
+  for (let w = words.next(); w !== undefined; w = words.next()) {
+    if (!w.startsWith('-')) return refShaped(w)
+    if (takesValue(w, MERGE_FLAGS)) words.next()
   }
-  if (word) out.push(word)
-  return out
+  return ''
 }
-const TAG_NAME = new RegExp(String.raw`${CMD_POS_NC}${GIT_IN_LINE}tag${HSP}+(?:-[as]${HSP}+)?${REF}`)
 /** Each `git merge` from its command position to the next separator; `merge-base` and `merge-tree` are not one. */
 const MERGE_INVOCATION = new RegExp(String.raw`${CMD_POS_NC}${GIT_NC}merge(?:${SP}[^&|;\n]*|$)`)
 /** A merge invocation up to its subcommand, from its start. */
@@ -432,19 +560,19 @@ function count(re: RegExp, text: string): number {
   return n
 }
 
-/** Every match of `re`, each search starting after the last match as a new string (ClickHouse's `extractAll`, for a pattern with no group). */
-function matchesOf(re: RegExp, text: string): string[] {
-  const out: string[] = []
-  let rest = text
-  for (let m = re.exec(rest); m !== null && m[0] !== ''; m = re.exec(rest)) {
-    out.push(m[0])
-    rest = rest.slice(m.index + m[0].length)
+/**
+ * Every match of `re` and where it starts, each search starting after the last match as a new string (ClickHouse's `extractAll`, for a
+ * pattern with no group).
+ */
+function matchesOf(re: RegExp, text: string): { text: string; at: number }[] {
+  const out: { text: string; at: number }[] = []
+  let from = 0
+  for (let m = re.exec(text); m !== null && m[0] !== ''; m = re.exec(text.slice(from))) {
+    out.push({ text: m[0], at: from + m.index })
+    from += m.index + m[0].length
   }
   return out
 }
-
-/** The first group of `re`'s first match, or `''` (ClickHouse's `extract`). */
-const extract = (re: RegExp, text: string): string => re.exec(text)?.[1] ?? ''
 
 const isTagStart = (c: string | undefined) => c !== undefined && ((c >= 'A' && c <= 'Z') || c === '_')
 const isTagRest = (c: string | undefined) => isTagStart(c) || (c !== undefined && c >= '0' && c <= '9')
@@ -547,7 +675,7 @@ export function executableText(command: string): string {
  */
 export function commandOutcomes(command: string): { counts: Partial<Record<CommandCount, number>>; refs: Partial<Record<CommandRef, string>> } {
   const x = executableText(command)
-  const merges = matchesOf(MERGE_INVOCATION, x).filter(m => !isSyncMerge(m))
+  const merges = matchesOf(MERGE_INVOCATION, x).filter(m => !isSyncMerge(m.text))
   const all: Record<CommandCount, number> = {
     commits: count(COUNTED.commits, x),
     reverts: count(COUNTED.reverts, x),
@@ -561,10 +689,13 @@ export function commandOutcomes(command: string): { counts: Partial<Record<Comma
     branches_opened: opensBranch(x) ? 1 : 0,
   }
   const named: Record<CommandRef, () => string> = {
-    branch_opened: () => extract(BRANCH_NAME, x),
-    push_ref: () => extract(PUSH_REF, x),
-    merge_ref: () => mergeRef(merges[merges.length - 1] ?? ''),
-    tag_name: () => extract(TAG_NAME, x),
+    branch_opened: () => branchOpened(x),
+    push_ref: () => pushRef(x),
+    merge_ref: () => {
+      const last = merges[merges.length - 1]
+      return last ? mergeRef(x, last.at, last.text) : ''
+    },
+    tag_name: () => tagName(x),
   }
   const counts: Partial<Record<CommandCount, number>> = {}
   for (const c of COMMAND_COUNTS) if (all[c] > 0) counts[c] = all[c]
