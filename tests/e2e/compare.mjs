@@ -23,6 +23,12 @@
 // data points (a command's class, a subagent's type, a failed call's error class) and no identifier or content: no command, file
 // path, tool input or output, repository, prompt or response.
 //
+// The plugin asks Mainwave for its organization's data collection settings once the rows name the organization and email; the
+// test-only hooks send that request to the receiver too, which answers as Mainwave's settings API would. Only the keyless pass's rows
+// name an email, so only it asks: the receiver answers with settings that turn a metadata data point off (`file.kind`) and add a
+// redaction pack, and the pass checks the request carried the organization and email alone, that the answer was kept in the store,
+// and that the copy went without the data point turned off, records captured before the answer included.
+//
 // The mock model answers each request after a different delay (300 to 900 ms), so a request paired with the wrong step, or timed
 // from the wrong start, lands outside the tolerance; and it refuses one request once as overloaded, so Claude Code retries it. The
 // session runs twice: once with Mainwave's org-wide setup captures on (OTEL_LOG_TOOL_DETAILS, OTEL_LOG_TOOL_CONTENT,
@@ -91,6 +97,10 @@ const storeFile = (config, id = 'mainwave@inline') => join(config, 'plugins', 's
 const ORG = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
 /** An example person in it, put on every record in the keyless pass, as a login would. */
 const EMAIL = 'e2e@example.com'
+/** Where the plugin asks for its organization's settings, as the receiver sees it: the API's path after the receiver's own. */
+const SETTINGS_PATH = '/plugin/api/plugin/data-collection-settings'
+/** What the receiver answers the keyless pass's request for settings with, as Mainwave's settings API would. */
+const SETTINGS = { revision: 5, catalog_version: 1, data_points: { 'file.kind': 'off' }, in_force: { 'file.kind': 'off' }, redaction_packs: ['secrets', 'pii.contact'], default_data_points: [], redaction_packs_default: false }
 /**
  * How far a rebuilt span's start or end may be from the exporter's: the plugin times spans from the hooks around them, and on a cold,
  * slow machine the session's first model request can start a hundred milliseconds before Claude Code's span does (its setup runs
@@ -260,6 +270,12 @@ const server = createServer(async (req, res) => {
     res.writeHead(200, { 'content-type': 'application/json', 'request-id': `req_e2e_${messageId}` })
     return res.end(JSON.stringify({ id, type: 'message', role: 'assistant', model: parsed.model, content: [block], stop_reason: stop, stop_sequence: null, usage }))
   }
+  if (req.method === 'POST' && path === SETTINGS_PATH) {
+    captured.settings.push({ headers: req.headers, body })
+    // Only the keyless pass's rows name an email to ask with; a request from any other is a problem, and answered as the route off.
+    res.writeHead(keylessRules ? 200 : 404, { 'content-type': 'application/json' })
+    return res.end(keylessRules ? JSON.stringify(SETTINGS) : '{"detail":"Not Found"}')
+  }
   const signal = SIGNALS.find(s => path === `/v1/${s}` || path === `/plugin/v1/${s}`)
   if (req.method === 'POST' && signal) {
     const who = path.startsWith('/plugin/') ? 'plugin' : 'exporter'
@@ -286,7 +302,7 @@ const base = `http://127.0.0.1:${server.address().port}`
  * env block, the plugin sending keyless; `auto` runs it in auto mode.
  */
 async function session(details, envBlock, auto) {
-  captured = { exporter: { logs: [], traces: [], metrics: [] }, plugin: { logs: [], traces: [], metrics: [] }, other: [] }
+  captured = { exporter: { logs: [], traces: [], metrics: [] }, plugin: { logs: [], traces: [], metrics: [] }, settings: [], other: [] }
   messageId = 0
   classified = { asked: 0, refused: 0 }
   overloaded = false
@@ -744,7 +760,7 @@ function compare(pass, details, auto, { captured, run }) {
  * The keyless pass: the exporter sent nothing, keyless ingest refused nothing, every signal arrived, and the spans make one coherent
  * trace per interaction, with as many spans of each kind as the exporter sent of the same session.
  */
-function checkKeyless(pass, { captured, run }, reference) {
+function checkKeyless(pass, { captured, run, config }, reference) {
   const before = problems.length
   if (run.code !== 0) problems.push(`claude exited ${run.code}:\n${run.out.slice(-2000)}`)
   for (const s of SIGNALS) {
@@ -845,6 +861,32 @@ function checkKeyless(pass, { captured, run }, reference) {
     ['a tool_result row', rowsOf('tool_result').length > 0],
   ]
   for (const [what, ok] of expectations) if (!ok) problems.push(`defaults: no ${what} was sent`)
+
+  // The organization's settings: asked for with the organization and email alone, kept in the store as they came, and applied to the
+  // copy, the records captured before the answer included.
+  if (captured.settings.length === 0) problems.push('settings: the plugin never asked for its organization\'s settings')
+  for (const { headers, body } of captured.settings) {
+    let asked
+    try {
+      asked = JSON.parse(body)
+    } catch {
+      asked = body
+    }
+    if (JSON.stringify(asked) !== JSON.stringify({ claude_org_id: ORG, email: EMAIL })) problems.push(`settings: asked with ${JSON.stringify(asked)}, not the organization and email alone`)
+    if (headers['authorization'] !== undefined) problems.push('settings: asked with an Authorization header')
+  }
+  let kept = {}
+  try {
+    kept = JSON.parse(readFileSync(storeFile(config), 'utf8'))
+  } catch {
+    problems.push('settings: the plugin kept no store')
+  }
+  const keptWant = { dataPoints: SETTINGS.data_points, redactionPacks: SETTINGS.redaction_packs, dataCollectionSettings: { organizationId: ORG, revision: SETTINGS.revision } }
+  for (const [k, v] of Object.entries(keptWant)) if (JSON.stringify(kept[k]) !== JSON.stringify(v)) problems.push(`settings: the store keeps ${k} as ${JSON.stringify(kept[k])}, not ${JSON.stringify(v)}`)
+  const decisions = points.filter(p => p.name === 'claude_code.code_edit_tool.decision')
+  if (decisions.length === 0) problems.push('settings: no code_edit_tool.decision point was sent')
+  if (decisions.some(p => p.attrs.language !== undefined)) problems.push('settings: a code_edit_tool.decision point carries the language the settings turned off')
+  console.log(`  settings: asked ${captured.settings.length} time${captured.settings.length === 1 ? '' : 's'}; ${decisions.length} code_edit_tool.decision points, none with a language`)
   const withheld = [
     ['a command', spans.some(s => s.attrs.full_command !== undefined || s.attrs.bash_command !== undefined)],
     ['a file path', spans.some(s => s.attrs.file_path !== undefined)],
@@ -876,6 +918,9 @@ for (const [pass, details, envBlock, auto] of passes) {
   results.push(result)
   if (envBlock) compare(pass, details, auto, result)
   else checkKeyless(pass, result, results[1].captured)
+  // With the env block the rows name no email (only the organization, through OTEL_RESOURCE_ATTRIBUTES), so the plugin asks nothing
+  // and the settings written in its store stand.
+  if (envBlock && result.captured.settings.length > 0) problems.push(`${pass}: the plugin asked for settings with no email to ask with`)
 }
 server.close()
 

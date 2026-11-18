@@ -40,8 +40,9 @@
 
 import type { EngineInterface, PluginOptions, Timer } from 'claude-code'
 
-import { combinePacks, currentGate, gatePoint, gateResource, gateRow, gateSpan, optInOf, PACKS_KEY, packsOf, setOptIn, setOrgPacks, setPersonPacks } from './gate.ts'
+import { combinePacks, currentGate, gatePoint, gateResource, gateRow, gateSpan, optInOf, packsOf, setOptIn, setOrgPacks, setPersonPacks } from './gate.ts'
 import { fetchWithin, type FetchOutcome } from './http.ts'
+import { applyStoredSettings } from './orgsettings.ts'
 import { logsBody, metricsBody, resourceOf, tracesBody, type BuiltSpan, type CopiedRow, type MetricPoint } from './otlp.ts'
 import { routingIdentityOf } from './identity.ts'
 import { ingestKeyOf, KEY_OPTION, namesOption, OPT_IN_OPTION, optionValues, PACKS_OPTION, type Layer } from './settings.ts'
@@ -446,16 +447,17 @@ async function readLayer($: EngineInterface, source: 'user' | 'project' | 'local
 /**
  * The plugin's options the gate reads, once per load and again before each send, so a change reaches records already queued: the data
  * points the person opts in to and the packs they add, from their own user settings (gate.ts, `setOptIn`, `setPersonPacks`), and the
- * packs the organization chooses, in its managed settings and in its data collection settings as the store keeps them (`setOrgPacks`).
+ * packs the organization chooses, in its managed settings, and its data collection settings from Mainwave, as this load had them or the
+ * store keeps them (orgsettings.ts, `applyStoredSettings`: its explicit settings per data point too).
  * A user layer that cannot be read opts in to nothing; a layer or a store that cannot be read holds identifier and content values back,
  * as its packs are not known. A batch sent again under its idempotency key goes through the gate as it is then, as with any setting:
  * the collector keeps the copy it took first.
  */
 export async function readOptions($: EngineInterface): Promise<void> {
-  const [user, policy, stored] = await Promise.all([
+  const [user, policy] = await Promise.all([
     readLayer($, 'user'),
     readLayer($, 'policy'),
-    $.store.get(PACKS_KEY).then(v => packsOf(v), () => 'unreadable' as const),
+    applyStoredSettings($).catch(() => setOrgPacks('settings', 'unreadable')),
   ])
   try {
     setOptIn(optionValues(user, OPT_IN_OPTION).flatMap(optInOf))
@@ -473,7 +475,6 @@ export async function readOptions($: EngineInterface): Promise<void> {
   } catch {
     setOrgPacks('managed', 'unreadable')
   }
-  setOrgPacks('settings', stored)
 }
 
 /** A repository that names the key option stops the copy for this load, and what was queued for it is let go. */

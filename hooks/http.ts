@@ -4,7 +4,7 @@
 // raced against the engine's clock and against the end of its session; whichever comes first answers. The request itself may still
 // finish on the host, but nothing waits for it and its answer is dropped. It never throws: every outcome is a value.
 //
-// The sender (sender.ts) makes every request through it. The wait is billed to the calling hook's own time budget (`$.clock.sleep`
+// The sender (sender.ts) and the request for the organization's settings (orgsettings.ts) make every request through it. The wait is billed to the calling hook's own time budget (`$.clock.sleep`
 // counts there), so a caller makes its requests from `session.start`, `session.end` or a timer, not from a row's hook, and names a
 // limit that fits.
 
