@@ -333,6 +333,14 @@ export default {
           "records": [
             "mcp_server_configured"
           ]
+        },
+        {
+          "keys": [
+            "error"
+          ],
+          "records": [
+            "mcp_server_connection"
+          ]
         }
       ],
       "own_rows": [
