@@ -2,15 +2,15 @@
 
 import { describe, expect, test } from 'claude-code/testing'
 
-import { applyStamps, entrypointOf, filterStamps, stripOwned } from '../hooks/stamps.ts'
+import { applyStamps, commandStamps, entrypointOf, filterStamps, stripOwned } from '../hooks/stamps.ts'
 
 describe('stripOwned', () => {
   test('removes every key under an owned prefix and keeps the rest in order', () => {
     const out = stripOwned({
       a: 1, 'mainwave.plugin.name': 'x', b: 'two', 'mainwave.telemetry.anything': 'y', 'mainwave.redaction.count': 3, 'mainwave.attr.k': 'v',
-      'mainwave.mod.name': 'old', 'mainwave.pluginx': 'kept',
+      'mainwave.mod.name': 'old', 'mainwave.pluginx': 'kept', 'mainwave.command.commits': 9, 'mainwave.command.push_ref': 'forged', 'mainwave.commandx': 'kept',
     })
-    expect(Object.keys(out)).toEqual(['a', 'b', 'mainwave.attr.k', 'mainwave.pluginx'])
+    expect(Object.keys(out)).toEqual(['a', 'b', 'mainwave.attr.k', 'mainwave.pluginx', 'mainwave.commandx'])
   })
 
   test('a key named __proto__ stays a plain key and changes no prototype', () => {
@@ -74,6 +74,30 @@ describe('applyStamps', () => {
   test('strips first, then adds only what passes', () => {
     const out = applyStamps({ 'mainwave.plugin.name': 'forged', 'mainwave.mod.name': 'old', keep: 'me' }, { 'mainwave.plugin.name': 'mainwave', 'mainwave.plugin.bogus': 'no' })
     expect(out).toEqual({ keep: 'me', 'mainwave.plugin.name': 'mainwave' })
+  })
+})
+
+describe('commandStamps', () => {
+  test('counted on every command; on one that succeeded each count above 0, and each ref beside its count where refs go', () => {
+    const found = { counts: { commits: 2, pushes: 1, branches_opened: 1 }, refs: { push_ref: 'feat/x', branch_opened: 'feat/x', merge_ref: 'feat/y' } }
+    expect(commandStamps(undefined, true)).toEqual({ 'mainwave.command.counted': 1 })
+    expect(commandStamps(found, false)).toEqual({ 'mainwave.command.counted': 1, 'mainwave.command.commits': 2, 'mainwave.command.pushes': 1, 'mainwave.command.branches_opened': 1 })
+    // `merge_ref` has no merge count beside it: left off.
+    expect(commandStamps(found, true)).toEqual({
+      'mainwave.command.counted': 1, 'mainwave.command.commits': 2, 'mainwave.command.pushes': 1, 'mainwave.command.branches_opened': 1,
+      'mainwave.command.branch_opened': 'feat/x', 'mainwave.command.push_ref': 'feat/x',
+    })
+  })
+
+  test('a value that fails its shape is dropped, and its ref with it', () => {
+    const counts = { commits: 0, reverts: 1.5, pushes: 70_000, tags: 1, branches_opened: 2 }
+    const refs = { tag_name: 'v 1', push_ref: 'x' }
+    expect(commandStamps({ counts, refs }, true)).toEqual({ 'mainwave.command.counted': 1, 'mainwave.command.tags': 1 })
+    expect(commandStamps({ counts: { tags: 1 }, refs: { tag_name: 'v'.repeat(257) } }, true)).toEqual({ 'mainwave.command.counted': 1, 'mainwave.command.tags': 1 })
+    expect(commandStamps({ counts: { tags: 1 }, refs: { tag_name: 'v1\u0007' } }, true)).toEqual({ 'mainwave.command.counted': 1, 'mainwave.command.tags': 1 })
+    // A space other than RE2's six, which the ref's pattern reads as part of a word.
+    expect(commandStamps({ counts: { tags: 1 }, refs: { tag_name: 'feat/a\u00a0b' } }, true)).toEqual({ 'mainwave.command.counted': 1, 'mainwave.command.tags': 1 })
+    expect(commandStamps({ counts: { tags: 1 }, refs: { tag_name: 'v1\u2028' } }, true)).toEqual({ 'mainwave.command.counted': 1, 'mainwave.command.tags': 1 })
   })
 })
 

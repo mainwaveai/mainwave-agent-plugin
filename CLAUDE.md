@@ -10,10 +10,11 @@ claude plugin test .            # tests/*.test.ts against the engine
 scripts/check-version.sh        # plugin.json and hooks/version.ts agree; the Claude Code floor is the same in CI's pin, plugin.json and the README
 scripts/check-layout.sh         # one plugin, at the root: org sync refuses a .claude-plugin/ or plugin.json anywhere else
 scripts/check-hooks.sh          # the row, tool call, command and spawn hooks keep their fail-open .catch; the turn hooks and session.end are hooked
+scripts/check-vendored.sh       # the copies of Mainwave's catalog and command cases (JSON) and the twins the tests import agree; --write rewrites the twins
 node tests/e2e/compare.mjs      # real sessions, model mocked: the plugin's copy against the exporter's; without the env block, keyless and coherent
 ```
 
-CI runs all six on every pull request, on the latest Claude Code and on the floor (README, Developing). The type check is local only.
+CI runs all seven on every pull request, on the latest Claude Code and on the floor (README, Developing). The type check is local only.
 
 ## Rules
 
@@ -23,6 +24,7 @@ CI runs all six on every pull request, on the latest Claude Code and on the floo
 - Never commit to `main`: branch, open a PR, and have a fresh sub-agent that didn't write the change review it before marking it ready. Don't merge without the owner's approval.
 - Hooks fail open: a fault never holds a row, a tool call or the session.
 - A new stamp key needs a shape rule in `hooks/stamps.ts`, an owned prefix if it starts a new one, and an entry in the test contract in `tests/rig.ts`, which is written independently of `hooks/`.
+- Mainwave's catalog of data points is the source of `hooks/catalog.ts`: `hooks/data-points.json` is a copy of it, which `tests/catalog.test.ts` compares field by field (all but the defaults). Its command rules are the source of `commandOutcomes` in `hooks/derive.ts`: `tests/fixtures/command-outcomes.json` is a copy of their cases, which `tests/outcomes.test.ts` runs. Neither copy is edited here: replace it with Mainwave's, then run `scripts/check-vendored.sh --write`.
 - A release bumps the version in `.claude-plugin/plugin.json` and `hooks/version.ts` together.
 - Raising the Claude Code floor is a pull request of its own: `.github/claude-code-floor/package.json`, `engines` in `.claude-plugin/plugin.json`, the README's Install section and the note at its top change together. Dependabot's version updates don't watch it.
 - The repository holds one plugin, at its root. A test that needs another plugin builds it in a temporary folder (as `tests/e2e/compare.mjs` does); org sync refuses a repository with a second manifest.
