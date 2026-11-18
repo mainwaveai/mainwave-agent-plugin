@@ -74,8 +74,11 @@ export const COMMAND_REF_KEYS: ReadonlyMap<string, string> = new Map(Object.entr
 /** Every key under the command prefix the plugin writes. */
 export const COMMAND_KEYS: readonly string[] = [COMMAND_COUNTED, ...COMMAND_COUNTS.map(commandKey), ...COMMAND_REF_KEYS.keys()]
 
-/** A ref as the plugin sends it: what Mainwave's pattern captured, at most 256 characters, no space or control character. */
-const REF_SHAPE = /^[^\x00-\x20\x7f]{1,256}$/
+/**
+ * A ref as the plugin sends it: what the ref's pattern captured, at most 256 characters, no space or control character. The pattern
+ * reads RE2's six ASCII spaces as spaces; a ref holding another space, such as U+00A0, is left off.
+ */
+const REF_SHAPE = /^[^\s\x00-\x20\x7f]{1,256}$/
 
 /** The value each command key may carry: `counted` and `branches_opened` 1, the other counts a positive integer Mainwave reads (16 bits), a ref its shape. */
 export const COMMAND_RULES: Readonly<Record<string, (value: unknown) => boolean>> = Object.fromEntries([

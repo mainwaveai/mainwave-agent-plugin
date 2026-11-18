@@ -56,8 +56,33 @@ describe('commandOutcomes, beyond the cases', () => {
   })
 
   test('a ref goes only beside its count', () => {
-    // The push ref pattern reads past an echo, but the echo is no push: with no push counted, no ref.
     expect(commandOutcomes('echo git push origin x')).toEqual({ counts: {}, refs: {} })
+  })
+
+  test('a separator a backslash escapes in a double-quoted string is none: the string is kept, as Mainwave keeps it', () => {
+    // Kept whole, the string's `;` and `|` are command positions to Mainwave's rules.
+    expect(commandOutcomes('echo "a\\; git push origin main"')).toEqual({ counts: { pushes: 1 }, refs: { push_ref: 'main"' } })
+    expect(commandOutcomes('grep "x\\|git commit -m" log')).toEqual({ counts: { commits: 1 }, refs: {} })
+  })
+
+  test('a ref is a word of the counted invocation alone: never of a quoted message, or of the next command or line', () => {
+    expect(commandOutcomes('git commit -m "note git push origin hunter2" && git push')).toEqual({ counts: { commits: 1, pushes: 1 }, refs: {} })
+    expect(commandOutcomes('git commit -m "see git tag s3cret-word" && git tag v1')).toEqual({ counts: { commits: 1, tags: 1 }, refs: { tag_name: 'v1' } })
+    expect(commandOutcomes('git push && curl https://example.com')).toEqual({ counts: { pushes: 1 }, refs: {} })
+    expect(commandOutcomes('git push -f;echo a b')).toEqual({ counts: { pushes: 1 }, refs: {} })
+    expect(commandOutcomes('git push\norigin x')).toEqual({ counts: { pushes: 1 }, refs: {} })
+    expect(commandOutcomes('git tag\nv1')).toEqual({ counts: { tags: 1 }, refs: {} })
+    expect(commandOutcomes('git checkout a\nfoo -b secret')).toEqual({ counts: { branches_opened: 1 }, refs: {} })
+    // A later push's ref, where the first names none, is still a counted push's.
+    expect(commandOutcomes('git push && git push origin v1')).toEqual({ counts: { pushes: 2 }, refs: { push_ref: 'v1' } })
+  })
+
+  test('a newline or a body keyword before a command, as Mainwave reads it, whatever the spaces around them', () => {
+    expect(commandOutcomes('\n\n  \n do  \n then git commit').counts).toEqual({ commits: 1 })
+    expect(commandOutcomes('do\ngit push origin a')).toEqual({ counts: { pushes: 1 }, refs: { push_ref: 'a' } })
+    expect(commandOutcomes('rtk\nproxy git push origin a')).toEqual({ counts: { pushes: 1 }, refs: { push_ref: 'a' } })
+    expect(commandOutcomes('git checkout a\ngit status\nx -b y').counts).toEqual({ branches_opened: 1 })
+    expect(commandOutcomes('git switch a\ngit checkout b && x -b y').counts).toEqual({})
   })
 
   test('reads in time linear in the command, however it is built', () => {
@@ -72,5 +97,23 @@ describe('commandOutcomes, beyond the cases', () => {
     const started = Date.now()
     for (const input of inputs) commandOutcomes(input)
     expect(Date.now() - started).toBeLessThan(3_000)
+  })
+
+  test('reads a megabyte of spaces, newlines, body keywords, backslashes or branch commands in time linear in it', () => {
+    const mb = 1 << 20
+    const inputs = [
+      '\n'.repeat(mb),
+      ' \n\t\r\n'.repeat(mb / 5),
+      '\ndo'.repeat(mb / 3),
+      '\nrtk'.repeat(mb / 4),
+      '\\'.repeat(mb),
+      `"${'\\'.repeat(mb)}`,
+      `printf "${'x\\n'.repeat(mb / 3)}" > f`,
+      'git checkout a\n'.repeat(mb / 15),
+      'git switch a\n'.repeat(mb / 13),
+    ]
+    const started = Date.now()
+    for (const input of inputs) commandOutcomes(input)
+    expect(Date.now() - started).toBeLessThan(10_000)
   })
 })

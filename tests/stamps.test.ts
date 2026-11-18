@@ -95,6 +95,9 @@ describe('commandStamps', () => {
     expect(commandStamps({ counts, refs }, true)).toEqual({ 'mainwave.command.counted': 1, 'mainwave.command.tags': 1 })
     expect(commandStamps({ counts: { tags: 1 }, refs: { tag_name: 'v'.repeat(257) } }, true)).toEqual({ 'mainwave.command.counted': 1, 'mainwave.command.tags': 1 })
     expect(commandStamps({ counts: { tags: 1 }, refs: { tag_name: 'v1\u0007' } }, true)).toEqual({ 'mainwave.command.counted': 1, 'mainwave.command.tags': 1 })
+    // A space other than RE2's six, which the ref's pattern reads as part of a word.
+    expect(commandStamps({ counts: { tags: 1 }, refs: { tag_name: 'feat/a\u00a0b' } }, true)).toEqual({ 'mainwave.command.counted': 1, 'mainwave.command.tags': 1 })
+    expect(commandStamps({ counts: { tags: 1 }, refs: { tag_name: 'v1\u2028' } }, true)).toEqual({ 'mainwave.command.counted': 1, 'mainwave.command.tags': 1 })
   })
 })
 
