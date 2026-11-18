@@ -77,6 +77,14 @@ describe('commandOutcomes, beyond the cases', () => {
     expect(commandOutcomes('git push && git push origin v1')).toEqual({ counts: { pushes: 2 }, refs: { push_ref: 'v1' } })
   })
 
+  test("a merge's ref is never its message: a value-taking flag's value is skipped, quoted words and all", () => {
+    expect(commandOutcomes('git merge -m "fix the login" feat')).toEqual({ counts: { merges: 1 }, refs: { merge_ref: 'feat' } })
+    expect(commandOutcomes("git merge --no-ff -m 'x y' feat/b")).toEqual({ counts: { merges: 1 }, refs: { merge_ref: 'feat/b' } })
+    expect(commandOutcomes('git merge -F notes.txt feat')).toEqual({ counts: { merges: 1 }, refs: { merge_ref: 'feat' } })
+    expect(commandOutcomes('git merge --strategy ours feat')).toEqual({ counts: { merges: 1 }, refs: { merge_ref: 'feat' } })
+    expect(commandOutcomes('git merge -m "only a message"')).toEqual({ counts: { merges: 1 }, refs: {} })
+  })
+
   test('a newline or a body keyword before a command, as Mainwave reads it, whatever the spaces around them', () => {
     expect(commandOutcomes('\n\n  \n do  \n then git commit').counts).toEqual({ commits: 1 })
     expect(commandOutcomes('do\ngit push origin a')).toEqual({ counts: { pushes: 1 }, refs: { push_ref: 'a' } })
