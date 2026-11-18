@@ -8,10 +8,15 @@
 // Every call is in its own `try`: a feature that throws is skipped for that call, and the plugin runs as if it were absent.
 //
 // A step that needs `$` can't be one of `steps`: the engine lets `$` pass only to a top-level function declaration named at the call site.
-// Such a step is an exported top-level function of the feature, `export async function tagsTurnStart($, e)`, that register.ts calls by name
-// inside the hook, in exactly this shape (scripts/check-features.sh holds every such call to it):
+// Such a step is an exported top-level function of the feature, `export async function tagsTurnStart($, e)`, that register.ts imports and
+// calls by name inside the hook, after `runSteps`, in exactly this shape:
 //
 //   if (featureOn('tags')) try { await tagsTurnStart($, e) } catch {}
+//
+// It bounds its own time (`$.clock.sleep` raced against its work), since the hook waits for it; it never runs in `turn.step`'s stream, and at
+// `session.end` it runs after the plugin's own flush.
+//
+// Pure steps are not awaited: a step that returns a promise runs on beside the hook, its rejection caught, so no step can hold an event.
 
 import type { PluginOptions, TelemetryAttribute } from 'claude-code'
 
@@ -35,8 +40,11 @@ export type Feature = {
   reset?: () => void
 }
 
-/** The prefixes the plugin itself owns (stamps.ts): no feature may take one, or one inside one. */
-const CORE_PREFIXES = ['mainwave.plugin.', 'mainwave.telemetry.', 'mainwave.redaction.', 'mainwave.mod.']
+/**
+ * Prefixes no feature may take, or one inside one: the plugin's own (stamps.ts), and those Mainwave's platform or other Mainwave plugins
+ * already write (`mainwave.mcp.`, `mainwave.command.`, `mainwave.attr.`).
+ */
+const RESERVED_PREFIXES = ['mainwave.plugin.', 'mainwave.telemetry.', 'mainwave.redaction.', 'mainwave.mod.', 'mainwave.mcp.', 'mainwave.command.', 'mainwave.attr.']
 
 /** The plugin's features, in the order they run. Adding one: its folder, one entry here, and its `userConfig` flag in plugin.json. */
 export const FEATURES: readonly Feature[] = []
@@ -45,14 +53,19 @@ let all: readonly Feature[] = FEATURES
 let active: readonly Feature[] = []
 let on: ReadonlySet<string> = new Set()
 
-const PREFIX_RULE = /^mainwave\.[a-z][a-z0-9_]*\.$/
+/** The one prefix a feature of this name owns: `mainwave.<name>.`, a hyphen read as an underscore. */
+export const prefixOf = (name: string): string => `mainwave.${name.replace(/-/g, '_')}.`
 
-/** Whether a feature list is well formed: unique names, each prefix of the `mainwave.<name>.` shape, unique, and no core prefix. */
+/** Whether a feature list is well formed: unique kebab-case names, each owning exactly `prefixOf(name)`, and none a reserved prefix. */
 export function validFeatures(list: readonly Feature[]): boolean {
-  const names = new Set(list.map(f => f.name))
-  const prefixes = new Set(list.map(f => f.prefix))
-  return names.size === list.length && prefixes.size === list.length &&
-    list.every(f => /^[a-z][a-z0-9-]*$/.test(f.name) && PREFIX_RULE.test(f.prefix) && !CORE_PREFIXES.some(c => c.startsWith(f.prefix) || f.prefix.startsWith(c)))
+  try {
+    const names = new Set(list.map(f => f.name))
+    return names.size === list.length && list.every(f =>
+      /^[a-z][a-z0-9]*(-[a-z0-9]+)*$/.test(f.name) && f.prefix === prefixOf(f.name) &&
+      !RESERVED_PREFIXES.some(r => r.startsWith(f.prefix) || f.prefix.startsWith(r)))
+  } catch {
+    return false
+  }
 }
 
 /**
@@ -84,27 +97,38 @@ export const featureOn = (name: string): boolean => on.has(name)
 /** Every prefix a feature owns, whether or not it is on: the plugin strips them all from every row (stamps.ts). */
 export const featurePrefixes = (): readonly string[] => all.map(f => f.prefix)
 
-/** Each active feature's step for this hook, each in its own `try`. Never throws or rejects. */
-export async function runSteps(hook: StepHookName, e: unknown): Promise<void> {
+/** A step's or observer's answer: a promise runs on beside the hook, its rejection caught. */
+function settle(result: unknown): void {
+  if (result !== null && (typeof result === 'object' || typeof result === 'function') && typeof (result as { then?: unknown }).then === 'function') {
+    ;(result as PromiseLike<unknown>).then(undefined, () => undefined)
+  }
+}
+
+/** Each active feature's pure step for this hook, each in its own `try`, none awaited. Never throws, and holds nothing. */
+export function runSteps(hook: StepHookName, e: unknown): void {
   for (const f of active) {
     try {
-      await f.steps?.[hook]?.(e)
+      settle(f.steps?.[hook]?.(e))
     } catch {
       // Skipped: the plugin's hook runs as if the feature were absent.
     }
   }
 }
 
-/** Each active feature learns from a row, as it came. Never throws. */
+/** Each active feature learns from a row, its owned keys (every feature's prefix included) already stripped. Never throws. */
 export function observeFeatures(attributes: Readonly<Record<string, unknown>>, event: string): void {
   for (const f of active) {
     try {
-      f.observe?.(attributes, event)
+      settle(f.observe?.(attributes, event))
     } catch {
       // This feature learns nothing from this row.
     }
   }
 }
+
+/** A stamp value of a shape the copy can carry: a string of at most 256 characters, a finite number or a boolean. */
+const stampable = (v: unknown): v is TelemetryAttribute =>
+  (typeof v === 'string' && v.length <= 256) || (typeof v === 'number' && Number.isFinite(v)) || typeof v === 'boolean'
 
 /** The active features' stamps for a row that names an organization: each key inside its feature's prefix and passing its rule. Never throws. */
 export function featureStamps(attributes: Readonly<Record<string, unknown>>, event: string): Record<string, TelemetryAttribute> {
@@ -116,9 +140,9 @@ export function featureStamps(attributes: Readonly<Record<string, unknown>>, eve
     } catch {
       continue
     }
-    if (add === undefined || add === null || typeof add !== 'object') continue
+    if (add === undefined || add === null || typeof add !== 'object' || typeof (add as { then?: unknown }).then === 'function') continue
     for (const [key, value] of Object.entries(add)) {
-      if (!key.startsWith(f.prefix) || !Object.prototype.hasOwnProperty.call(f.rules, key)) continue
+      if (!key.startsWith(f.prefix) || !Object.prototype.hasOwnProperty.call(f.rules, key) || !stampable(value)) continue
       let ok = false
       try {
         ok = f.rules[key]!(value) === true

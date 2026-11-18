@@ -185,3 +185,46 @@ describe('the list itself', () => {
     }
   })
 })
+
+describe('what the review asked for', () => {
+  test('a step that never settles holds no hook', async ($) => {
+    const never: Feature = { ...fake, steps: { 'turn.start': () => new Promise(() => undefined), 'session.end': () => new Promise(() => undefined) } }
+    await withFeatures([never], {}, async () => {
+      const next = Object.assign(async () => ({ ok: 1 }), { called: false, budget: { remainingMs: 1000 } })
+      expect(await turnStartHook($ as never, { text: 'hi' } as never, next as never)).toEqual({ ok: 1 })
+    })
+  })
+
+  test('a step or observer that rejects is caught', async () => {
+    const rejects: Feature = { ...fake, observe: () => Promise.reject(new Error('x')) as never, steps: { 'turn.start': () => Promise.reject(new Error('y')) } }
+    await withFeatures([rejects], {}, async () => {
+      runSteps('turn.start', {})
+      await Promise.resolve()
+    })
+  })
+
+  test('an observer reads the row less every owned key, forged ones of its own prefix included', async ($) => {
+    const seen: Record<string, unknown>[] = []
+    await withFeatures([{ ...fake, observe: a => void seen.push({ ...a }) }], {}, async () => {
+      await log(undefined, $, { ...inOrg, 'mainwave.fake.seen': 'forged', 'mainwave.plugin.name': 'evil', keep: 1 })
+      expect(Object.keys(seen[0]!).sort()).toEqual(['keep', 'organization.id', 'session.id'])
+    })
+  })
+
+  test('only a short string, a finite number or a boolean is stamped, whatever the rule says', () => {
+    configureFeatures({} as never, [{ ...fake, rules: { 'mainwave.fake.a': () => true, 'mainwave.fake.b': () => true, 'mainwave.fake.c': () => true, 'mainwave.fake.d': () => true, 'mainwave.fake.e': () => true },
+      stamps: () => ({ 'mainwave.fake.a': 'x'.repeat(257), 'mainwave.fake.b': Number.NaN, 'mainwave.fake.c': { o: 1 } as never, 'mainwave.fake.d': true, 'mainwave.fake.e': 'ok' }) }])
+    try {
+      expect(featureStamps(inOrg, 'api_request')).toEqual({ 'mainwave.fake.d': true, 'mainwave.fake.e': 'ok' })
+    } finally {
+      configureFeatures({} as never)
+    }
+  })
+
+  test('a prefix must be exactly mainwave.<name>., and the platform prefixes are reserved', () => {
+    expect(validFeatures([{ ...fake, name: 'mcp', prefix: 'mainwave.mcp.' }])).toBe(false)
+    expect(validFeatures([{ ...fake, name: 'command', prefix: 'mainwave.command.' }])).toBe(false)
+    expect(validFeatures([{ ...fake, name: 'fake', prefix: 'mainwave.other.' }])).toBe(false)
+    expect(validFeatures([{ ...fake, name: 'project-tags', prefix: 'mainwave.project_tags.' }])).toBe(true)
+  })
+})

@@ -23,7 +23,7 @@ CI runs all six on every pull request, on the latest Claude Code and on the floo
 - Never commit to `main`: branch, open a PR, and have a fresh sub-agent that didn't write the change review it before marking it ready. Don't merge without the owner's approval.
 - Hooks fail open: a fault never holds a row, a tool call or the session.
 - A new stamp key needs a shape rule in `hooks/stamps.ts`, an owned prefix if it starts a new one, and an entry in the test contract in `tests/rig.ts`, which is written independently of `hooks/`.
-- A feature is added through `hooks/features.ts` (README, Adding a feature): never a second hooks module, and a step that needs `$` is called by name from `hooks/register.ts`.
+- A feature is added through `hooks/features.ts` (README, Adding a feature): never a second hooks module; a step that needs `$` is called by name from `hooks/register.ts` and bounds its own time.
 - A release bumps the version in `.claude-plugin/plugin.json` and `hooks/version.ts` together.
 - Raising the Claude Code floor is a pull request of its own: `.github/claude-code-floor/package.json`, `engines` in `.claude-plugin/plugin.json`, the README's Install section and the note at its top change together. Dependabot's version updates don't watch it.
 - The repository holds one plugin, at its root. A test that needs another plugin builds it in a temporary folder (as `tests/e2e/compare.mjs` does); org sync refuses a repository with a second manifest.

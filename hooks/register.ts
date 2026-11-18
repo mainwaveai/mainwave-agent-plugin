@@ -527,7 +527,9 @@ async function observe($: EngineInterface, e: Frozen<TelemetryRecordEntry>): Pro
  */
 export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams[2]): Promise<TelemetryLogResult> {
   let attributes: Record<string, TelemetryAttribute>
-  observeFeatures(e.attributes, e.event)
+  // What a feature reads is the row less every owned key, its own prefix's included, so nothing upstream can pose as what it wrote.
+  const forFeatures = stripOwned(e.attributes)
+  observeFeatures(forFeatures, e.event)
   if (isOrgId(e.attributes['organization.id'])) {
     entrypoint ??= readEntrypoint($)
     const ep = await entrypoint
@@ -543,7 +545,7 @@ export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams
       'mainwave.telemetry.route': 'exporter',
     })
     // The features' stamps, on the exporter's row and so on the copy: each inside its own prefix, past its own rule (features.ts).
-    attributes = { ...attributes, ...featureStamps(e.attributes, e.event) }
+    attributes = { ...attributes, ...featureStamps(forFeatures, e.event) }
   } else {
     attributes = stripOwned(e.attributes)
   }
@@ -597,7 +599,7 @@ export function rowCatch($: RowCatchParams[0], e: RowCatchParams[1], next: RowCa
  * `claude_code.session.count`; the event goes on unchanged.
  */
 export async function sessionStart($: SessionStartParams[0], e: SessionStartParams[1], next: SessionStartParams[2]) {
-  await runSteps('session.start', e)
+  runSteps('session.start', e)
   if (isCopying()) {
     try {
       ensureTimer($)
@@ -621,7 +623,7 @@ export async function sessionStart($: SessionStartParams[0], e: SessionStartPara
 
 /** A main-loop turn began: an interaction opens. */
 export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1], next: TurnStartParams[2]) {
-  await runSteps('turn.start', e)
+  runSteps('turn.start', e)
   let out: Emit | null = null
   try {
     if (e.agentId === undefined && isCopying()) capturePrompt(capture, e.text)
@@ -638,7 +640,7 @@ export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1]
 
 /** A turn ended: a main-loop interaction is sent. */
 export async function turnCompleteHook($: TurnCompleteParams[0], e: TurnCompleteParams[1], next: TurnCompleteParams[2]) {
-  await runSteps('turn.complete', e)
+  runSteps('turn.complete', e)
   let out: Emit | null = null
   try {
     const r = await rebuildOf($)
@@ -680,7 +682,7 @@ function watched<T, R>(inner: AsyncGenerator<T, R, unknown>, see: (chunk: T) => 
  * rows. The stream passes through untouched.
  */
 export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepParams[2]) {
-  await runSteps('turn.step', e)
+  runSteps('turn.step', e)
   let r: Rebuild | null = null
   let startMs = 0
   try {
@@ -708,7 +710,7 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
 
 /** One tool call: when it began and ended, and what it did. The call and its result pass through untouched. */
 export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], next: ToolCallParams[2]) {
-  await runSteps('tool.call', e)
+  runSteps('tool.call', e)
   let r: Rebuild | null = null
   try {
     r = await rebuildOf($)
@@ -751,7 +753,7 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
  * counts it. The command and its result pass through untouched.
  */
 export async function commandHook($: CommandParams[0], e: CommandParams[1], next: CommandParams[2]) {
-  await runSteps('command.run', e)
+  runSteps('command.run', e)
   let r: Rebuild | null = null
   try {
     r = await rebuildOf($)
@@ -784,7 +786,7 @@ export async function commandHook($: CommandParams[0], e: CommandParams[1], next
 
 /** A prompt submitted: one that runs no slash command sends the command waiting first. The prompt goes on untouched. */
 export async function promptHook($: PromptParams[0], e: PromptParams[1], next: PromptParams[2]) {
-  await runSteps('prompt.submit', e)
+  runSteps('prompt.submit', e)
   let r: Rebuild | null = null
   let out: Emit | null = null
   try {
@@ -826,7 +828,7 @@ export function toolCatch($: ToolCatchParams[0], e: ToolCatchParams[1], next: To
 
 /** An Agent call started a subagent: which call, so the subagent's rows can name the call's execution span. */
 export async function spawnHook($: SpawnParams[0], e: SpawnParams[1], next: SpawnParams[2]) {
-  await runSteps('agent.spawn', e)
+  runSteps('agent.spawn', e)
   const result = await next(e)
   try {
     const r = await rebuildOf($)
@@ -844,7 +846,7 @@ export function spawnCatch($: SpawnCatchParams[0], e: SpawnCatchParams[1], next:
 
 /** A skill's prompt expanded for the model: its text, for `skill.text`. The text the model reads is the one `next` answers, unchanged. */
 export async function skillHook($: SkillParams[0], e: SkillParams[1], next: SkillParams[2]) {
-  await runSteps('skill.prompt', e)
+  runSteps('skill.prompt', e)
   const result = await next(e)
   try {
     if (isCopying() && typeof result.text === 'string') {
@@ -867,7 +869,7 @@ export function skillCatch($: SkillCatchParams[0], e: SkillCatchParams[1], next:
  * the ending session then answer `stopped` (http.ts); the event goes on unchanged.
  */
 export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1], next: SessionEndParams[2]) {
-  await runSteps('session.end', e)
+  runSteps('session.end', e)
   try {
     if (isCopying()) {
       // The settings as they stand now: what is queued goes through them as it is sent.
