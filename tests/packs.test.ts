@@ -3,7 +3,8 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { DEFAULT_PACKS, decodeJsonString, encodeJsonString, EXEMPT_KEYS, luhnValid, PACK_NAMES, scanPacks, tokenizeJson } from '../hooks/packs.ts'
-import { redact } from '../hooks/protect.ts'
+import { gateAttributes, resolveGate, resolveRedaction } from '../hooks/gate.ts'
+import { CONTENT_MAX_LENGTH, redact } from '../hooks/protect.ts'
 import { VECTORS } from './pack-vectors.ts'
 
 describe('the packs', () => {
@@ -26,7 +27,7 @@ describe('the packs', () => {
     expect(scanPacks('alice@example.com 4111111111111111', ['secrets'])).toEqual({ text: 'alice@example.com 4111111111111111', count: 0 })
   })
 
-  test('the secret rules run first, so a card rule never reads the digits of a secret they replaced', () => {
+  test('the secret rules run first, so a card rule never reads the digits of a secret they replaced (the CLI hooks run them second)', () => {
     const key = 'sk-ant-abcdefghij-4111111111111111-z'
     expect(redact(`key ${key}`, ['pii.payment_card'])).toEqual({ text: 'key [REDACTED:anthropic_api_key]', count: 1 })
   })
@@ -46,6 +47,31 @@ describe('luhnValid', () => {
 })
 
 describe('JSON in place', () => {
+  test('JSON cut short is scanned as text and again between its escapes: a number after \\n is found', () => {
+    const json = '{"file_path":"/tmp/a.txt","content":"phones:\\n415-555-2671\\n078-05-1120\\n4111111111111111\\t+44 20 7183 8750\\u0020bob@example.com\\n'
+    expect(tokenizeJson(json)).toBeUndefined()
+    expect(scanPacks(json, PACK_NAMES)).toEqual({
+      text: '{"file_path":"/tmp/a.txt","content":"phones:\\n[REDACTED:pii.contact.phone_nanp]\\n[REDACTED:pii.us_gov_id.ssn]\\n[REDACTED:pii.payment_card.card_number]\\t[REDACTED:pii.contact.phone_e164]\\[REDACTED:pii.contact.email]\\n',
+      // The whole-text pass, as the CLI hooks run it, takes the escape's letters into the address: it is replaced all the same.
+      count: 5,
+    })
+  })
+
+  test('a value past the limit is cut, then scanned: what is left of it is redacted', () => {
+    const value = JSON.stringify({ file_path: '/tmp/a.txt', content: `phones:\n415-555-2671\n078-05-1120\n4111111111111111\n${'x'.repeat(70_000)}` })
+    const out = gateAttributes(resolveGate({}, {}, CONTENT_MAX_LENGTH, [], resolveRedaction(['pii.contact', 'pii.us_gov_id', 'pii.payment_card'], undefined)), 'tool_result', { tool_input: value })
+    expect(out['tool_input_truncated']).toBe(true)
+    for (const p of ['415-555-2671', '078-05-1120', '4111111111111111']) expect([p, (out['tool_input'] as string).includes(p)]).toEqual([p, false])
+    expect(out['mainwave.redaction.count']).toBe(3)
+  })
+
+  test('JSON a secret rule changed is still scanned between its escapes', () => {
+    for (const input of ['{"bash_command":"TOKEN=ab\\"c ; printf \\"x\\n415-555-2671\\""}', 'curl -H "Authorization: Bearer abc\\"" ; echo "\\n078-05-1120"']) {
+      const out = redact(input, PACK_NAMES)
+      expect([input, out.text.includes('415-555-2671') || out.text.includes('078-05-1120')]).toEqual([input, false])
+    }
+  })
+
   test('finds string and number values, not keys or literals', () => {
     const text = '{"a": "x", "b": [1, true, null, "y"], "c": {"d": -2.5e3}}'
     expect(tokenizeJson(text)!.map(t => text.slice(t.start, t.end))).toEqual(['"x"', '1', '"y"', '-2.5e3'])

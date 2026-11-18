@@ -208,7 +208,8 @@ export const OVERRIDES_KEY = 'dataPoints'
 
 /**
  * Where the organization's choice of packs is kept, in the plugin's store, beside `OVERRIDES_KEY`: a value of the packs option's shape
- * (`packsOf`). Nothing writes it yet: the packs in the organization's data collection settings will be kept here.
+ * (`packsOf`). Nothing writes it yet: the packs in the organization's data collection settings will be kept here. It is read once per
+ * load and again before each send (sender.ts, `readOptions`), so a value written mid-session applies to records already queued.
  */
 export const PACKS_KEY = 'redactionPacks'
 
@@ -314,7 +315,7 @@ export function protect(gate: Gate, record: string, attributes: Attrs, all = fal
     if (Array.isArray(value)) {
       const items: string[] = []
       for (const item of value) {
-        const r = typeof item === 'string' ? protectText(gate, item, key) : null
+        const r = typeof item === 'string' ? protectText(gate, cut(item, gate.limit).text, key) : null
         if (r === null) break
         items.push(r.text)
         count += r.count
@@ -419,6 +420,34 @@ export function gateEvent(gate: Gate, event: { name: string; timeMs: number; att
   return { event: { ...event, attributes }, count }
 }
 
+/**
+ * A record's resource (JSON, as the sender keeps it) through the protections: each string value but those of the keys no pack scans,
+ * as the CLI hooks scan a resource, since `OTEL_RESOURCE_ATTRIBUTES` can hold anything. A value the protections can't clear is left
+ * out. The resource carries no count.
+ */
+export function gateResource(gate: Gate, resource: string): string {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(resource)
+  } catch {
+    // Not one the sender wrote: nothing in it is sent.
+    return '{}'
+  }
+  if (!isObject(parsed)) return resource
+  const out: Attrs = {}
+  let changed = false
+  for (const [key, value] of Object.entries(parsed)) {
+    if (typeof value !== 'string' || EXEMPT_KEYS.has(key)) {
+      put(out, key, value as TelemetryAttribute)
+      continue
+    }
+    const r = protectText(gate, cut(value, gate.limit).text, key)
+    if (r !== null) put(out, key, r.text)
+    if (r === null || r.text !== value) changed = true
+  }
+  return changed ? JSON.stringify(out) : resource
+}
+
 /** Whether a metric's points may go at all: none of a metric's a data point counts (catalog.ts, `METRIC_OWNERS`) while it is off. */
 export const metricAllowed = (gate: Gate, name: string, strict = false): boolean => METRIC_OWNERS[name] === undefined || allows(gate, METRIC_OWNERS[name]!, !strict)
 
@@ -452,9 +481,10 @@ export function gateSpan(gate: Gate, span: BuiltSpan, strict = false): BuiltSpan
     attributes = cls === undefined ? rest : gateAttributes(gate, span.name, { ...attributes, error: cls })
     if (status?.message !== undefined) status = typeof cls === 'string' ? { ...status, message: cls } : { code: status.code }
   } else if (status?.message !== undefined) {
-    // The message repeats the error: the protections apply to it as to the attribute, and it is left out where the attribute would be.
-    const r = protectText(gate, status.message)
-    status = r === null ? { code: status.code } : { ...status, message: cut(r.text, gate.limit).text }
+    // The message repeats the error: the protections apply to it as to the attribute, cut first, and it is left out where the attribute
+    // would be.
+    const r = protectText(gate, cut(status.message, gate.limit).text)
+    status = r === null ? { code: status.code } : { ...status, message: r.text }
     count += r?.count ?? 0
   }
   const events: NonNullable<BuiltSpan['events']> = []

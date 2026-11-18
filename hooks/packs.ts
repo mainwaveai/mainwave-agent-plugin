@@ -5,7 +5,12 @@
 // Each pack is a list of rules run in order; the packs run in their fixed order (`PACK_NAMES`), whatever order a setting lists them
 // in. A match is replaced with `[REDACTED:<pack>.<rule>]`. A card number is replaced only when it passes the Luhn check. A value that
 // is JSON (an object or an array, as `tool_parameters` is) is redacted in place: each string and number value is scanned on its own,
-// decoded, and only a value that changed is rewritten, as a JSON string; keys, punctuation and spacing stay byte for byte.
+// decoded, and only a value that changed is rewritten, as a JSON string; keys, punctuation and spacing stay byte for byte. A value that
+// reads as JSON but no longer parses (cut at the length limit, or changed by a secret rule) is scanned as text, and again with each
+// JSON escape (`\n`, `\"`, `\u0040`) as a boundary, so a number written after `\n` is still found.
+//
+// One difference from the CLI hooks, on purpose: there an organization's packs run before the secrets pack unless it lists it, while
+// here the secret rules always run first, so a match inside a secret is replaced as the secret, whole.
 //
 // `secrets` is the pack of secret rules (protect.ts), on whatever a setting says. The keys in `EXEMPT_KEYS` are never scanned by a
 // pack: the identity and routing keys Mainwave joins on.
@@ -107,14 +112,37 @@ function scanText(text: string, packs: readonly PackName[]): { text: string; cou
   return { text: out, count }
 }
 
+/** A JSON escape: what a JSON string writes for a quote, a backslash, a slash, a control character or any character by its code. */
+const JSON_ESCAPE = /\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4})/g
+
+/**
+ * Text that is not JSON: scanned whole, as the CLI hooks scan it, then each run between JSON escapes on its own, for text that was
+ * JSON before it was cut or changed. The second pass only finds more: a marker the first wrote is never matched again.
+ */
+function scanLoose(text: string, packs: readonly PackName[]): { text: string; count: number } {
+  const whole = scanText(text, packs)
+  if (!whole.text.includes('\\')) return whole
+  let count = whole.count
+  let out = ''
+  let last = 0
+  for (const m of whole.text.matchAll(JSON_ESCAPE)) {
+    const run = scanText(whole.text.slice(last, m.index), packs)
+    count += run.count
+    out += run.text + m[0]
+    last = m.index + m[0].length
+  }
+  const tail = scanText(whole.text.slice(last), packs)
+  return { text: out + tail.text, count: count + tail.count }
+}
+
 /**
  * A value with every match of the personal-data packs among `packs` replaced, and how many were: in place where the value is JSON,
- * else as plain text. `secrets` is not run here (protect.ts runs it first).
+ * else as text (`scanLoose`). `secrets` is not run here (protect.ts runs it first).
  */
 export function scanPacks(text: string, packs: readonly PackName[]): { text: string; count: number } {
   if (!packs.some(p => p !== 'secrets')) return { text, count: 0 }
   const tokens = tokenizeJson(text)
-  if (tokens === undefined) return scanText(text, packs)
+  if (tokens === undefined) return scanLoose(text, packs)
   let out = ''
   let last = 0
   let count = 0

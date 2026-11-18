@@ -28,11 +28,11 @@ const API_ERROR = `quota exceeded for ${AUTHOR}`
 const ALL = ['pii.contact', 'pii.us_gov_id', 'pii.payment_card']
 const PERSONAL = [MAIL, AUTHOR, PHONE, SSN, CARD, '4111111111111111']
 
-function world(on: On, layers: Layers = {}, store: Record<string, unknown> = {}) {
+function world(on: On, layers: Layers = {}, store: Record<string, unknown> = {}, env: Record<string, string> = {}) {
   mock.clock(on, { now: START })
-  memoryStore(on, store)
+  const kept = memoryStore(on, store)
   const posts = network(on)
-  const rig = boot(on, { entrypoint: 'remote_cowork', layers })
+  const rig = boot(on, { entrypoint: 'remote_cowork', layers, env })
   const logs: string[] = []
   on('session.start', (_$, e) => ({ cwd: (e as { cwd: string }).cwd }) as never)
   on('session.end', (_$, e) => ({ sessionId: (e as { sessionId: string }).sessionId }) as never)
@@ -49,7 +49,7 @@ function world(on: On, layers: Layers = {}, store: Record<string, unknown> = {})
     return { turnId: e.turnId, index: e.index, answer: ANSWER, toolUses: [], stopReason: 'end_turn', usage: { ...USAGE, model: 'claude-haiku-5-5' } } as never
   })
   on('tool.call', () => ({ result: [{ type: 'text', text: OUTPUT }] }) as never)
-  return { posts, rig, logs }
+  return { posts, rig, logs, store: kept }
 }
 
 async function row($: Engine, event: string, attributes: Record<string, unknown>) {
@@ -74,8 +74,8 @@ async function turn($: Engine) {
   await $.turn.complete({ turnId: 't1', answer: ANSWER, durationMs: 40, isAborted: false, reason: 'answer' } as never)
 }
 
-async function session($: Engine, on: On, layers: Layers = {}, store: Record<string, unknown> = {}) {
-  const w = world(on, layers, store)
+async function session($: Engine, on: On, layers: Layers = {}, store: Record<string, unknown> = {}, env: Record<string, string> = {}) {
+  const w = world(on, layers, store, env)
   await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
   await turn($)
   await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
@@ -129,6 +129,19 @@ describe("the organization's packs, in its managed settings", () => {
   test("the exporter's rows to the organization's collector go on as Claude Code wrote them", keyless, async ($, on) => {
     const { rig } = await session($, on, { policy: packsOption(ALL) })
     expect(rig.rows.find(r => r.event === 'api_error')!.attributes['error']).toBe(API_ERROR)
+  })
+
+  test("the resource's values are scanned too, but for the keys Mainwave routes and joins on", keyless, async ($, on) => {
+    const env = { OTEL_RESOURCE_ATTRIBUTES: `team.owner=lead@example.com,department=eng,user.email=${EMAIL}` }
+    const { posts } = await session($, on, { policy: packsOption(ALL) }, {}, env)
+    const resources = bodies(posts, '/v1/logs').flatMap(b => b.resourceLogs.map((r: any) => kvs(r.resource.attributes)))
+    expect(resources.length).toBeGreaterThan(0)
+    for (const r of resources) {
+      expect(r['team.owner']).toBe('[REDACTED:pii.contact.email]')
+      expect(r['department']).toBe('eng')
+      expect(r['user.email']).toBe(EMAIL)
+      expect(r['service.name']).toBe('claude-code')
+    }
   })
 
   test('under any of the plugin ids, as a string', keyless, async ($, on) => {
@@ -189,6 +202,15 @@ describe("the organization's data collection settings, kept in the plugin's stor
   test('their packs apply through the same gate input, with those of its managed settings', keyless, async ($, on) => {
     const { posts } = await session($, on, { policy: packsOption(['pii.payment_card']) }, { redactionPacks: ['pii.contact'] })
     expect(rowOf(posts, 'user_prompt')['prompt']).toBe('Email [REDACTED:pii.contact.email] the refund for card [REDACTED:pii.payment_card.card_number]')
+  })
+
+  test('written mid-session, they apply to records already queued: the store is read again before each send', keyless, async ($, on) => {
+    const { posts, store } = world(on)
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await turn($)
+    store.data.set('redactionPacks', 'pii.contact')
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    expect(sent(posts)).not.toContain(AUTHOR)
   })
 
   test('a value of the wrong type holds content back', keyless, async ($, on) => {

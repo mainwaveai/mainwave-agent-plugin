@@ -40,7 +40,7 @@
 
 import type { EngineInterface, PluginOptions, Timer } from 'claude-code'
 
-import { combinePacks, currentGate, gatePoint, gateRow, gateSpan, optInOf, packsOf, setOptIn, setOrgPacks, setPersonPacks } from './gate.ts'
+import { combinePacks, currentGate, gatePoint, gateResource, gateRow, gateSpan, optInOf, PACKS_KEY, packsOf, setOptIn, setOrgPacks, setPersonPacks } from './gate.ts'
 import { fetchWithin, type FetchOutcome } from './http.ts'
 import { logsBody, metricsBody, resourceOf, tracesBody, type BuiltSpan, type CopiedRow, type MetricPoint } from './otlp.ts'
 import { routingIdentityOf } from './identity.ts'
@@ -428,9 +428,11 @@ function bodyOf(batch: readonly Queued[], nowMs: number): string {
     const d = gateRow(gate, item.d, strict)
     return d === null ? null : { ...item, d }
   }).filter((item): item is Queued => item !== null)
-  if (signal === 'traces') return tracesBody(groups<BuiltSpan>(gated))
-  if (signal === 'metrics') return metricsBody(groups<MetricPoint>(gated), scopeVersion)
-  return logsBody(groups<CopiedRow>(gated).map(g => ({ resource: g.resource, rows: g.items })), scopeVersion, nowMs)
+  // The resource is the same for every record of a load: through the protections once per group.
+  const grouped = <T>() => groups<T>(gated).map(g => ({ ...g, resource: gateResource(gate, g.resource) }))
+  if (signal === 'traces') return tracesBody(grouped<BuiltSpan>())
+  if (signal === 'metrics') return metricsBody(grouped<MetricPoint>(), scopeVersion)
+  return logsBody(grouped<CopiedRow>().map(g => ({ resource: g.resource, rows: g.items })), scopeVersion, nowMs)
 }
 
 async function readLayer($: EngineInterface, source: 'user' | 'project' | 'local' | 'policy'): Promise<Layer> {
@@ -442,14 +444,19 @@ async function readLayer($: EngineInterface, source: 'user' | 'project' | 'local
 }
 
 /**
- * The plugin's options the gate reads from settings layers, once per load and again before each send, so a change reaches records
- * already queued: the data points the person opts in to and the packs they add, from their own user settings (gate.ts, `setOptIn`,
- * `setPersonPacks`), and the packs the organization's managed settings choose (`setOrgPacks`). A user layer that cannot be read opts in
- * to nothing; a layer that cannot be read holds identifier and content values back, as its packs are not known. A batch sent again
- * under its idempotency key goes through the gate as it is then, as with any setting: the collector keeps the copy it took first.
+ * The plugin's options the gate reads, once per load and again before each send, so a change reaches records already queued: the data
+ * points the person opts in to and the packs they add, from their own user settings (gate.ts, `setOptIn`, `setPersonPacks`), and the
+ * packs the organization chooses, in its managed settings and in its data collection settings as the store keeps them (`setOrgPacks`).
+ * A user layer that cannot be read opts in to nothing; a layer or a store that cannot be read holds identifier and content values back,
+ * as its packs are not known. A batch sent again under its idempotency key goes through the gate as it is then, as with any setting:
+ * the collector keeps the copy it took first.
  */
 export async function readOptions($: EngineInterface): Promise<void> {
-  const [user, policy] = await Promise.all([readLayer($, 'user'), readLayer($, 'policy')])
+  const [user, policy, stored] = await Promise.all([
+    readLayer($, 'user'),
+    readLayer($, 'policy'),
+    $.store.get(PACKS_KEY).then(v => packsOf(v), () => 'unreadable' as const),
+  ])
   try {
     setOptIn(optionValues(user, OPT_IN_OPTION).flatMap(optInOf))
   } catch {
@@ -466,6 +473,7 @@ export async function readOptions($: EngineInterface): Promise<void> {
   } catch {
     setOrgPacks('managed', 'unreadable')
   }
+  setOrgPacks('settings', stored)
 }
 
 /** A repository that names the key option stops the copy for this load, and what was queued for it is let go. */

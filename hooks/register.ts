@@ -20,7 +20,7 @@ import type { RowIdentity } from '../types'
 import { capturePrompt, captureTool, newCapture, rowFill, streamChunk, streamedThinking, streamStart, type Capture } from './capture.ts'
 import { MCP_SERVER_ROW, SKILL_PROMPT_ROW, type Switch } from './catalog.ts'
 import { mcpParts } from './derive.ts'
-import { allows, configureGate, currentGate, gateAttributes, gateRow, gateSpan, metricAllowed, OVERRIDES_KEY, overridesOf, PACKS_KEY, packsOf, resetPacks, setOptIn, setOrgPacks, setOverrides } from './gate.ts'
+import { allows, configureGate, currentGate, gateAttributes, gateRow, gateSpan, metricAllowed, OVERRIDES_KEY, overridesOf, resetPacks, setOptIn, setOverrides } from './gate.ts'
 import { endSession } from './http.ts'
 import { identityOf, isOrgId, mergeIdentity } from './identity.ts'
 import { add, collect, newMeter, type Meter } from './meter.ts'
@@ -201,20 +201,12 @@ async function readGate($: EngineInterface): Promise<void> {
   await readOptions($)
 }
 
-/**
- * The organization's settings the store keeps, if any: explicit settings per data point, and its choice of packs. A store that cannot
- * be read leaves the settings per data point held, and holds identifier and content values back, as the packs are not known.
- */
+/** The explicit settings per data point the store keeps, if any. A store that cannot be read leaves those held. */
 async function readOverrides($: EngineInterface): Promise<void> {
   try {
     setOverrides(overridesOf(await $.store.get(OVERRIDES_KEY)))
   } catch {
     // Those held stand.
-  }
-  try {
-    setOrgPacks('settings', packsOf(await $.store.get(PACKS_KEY)))
-  } catch {
-    setOrgPacks('settings', 'unreadable')
   }
 }
 
