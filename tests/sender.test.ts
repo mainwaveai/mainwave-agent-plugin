@@ -238,6 +238,18 @@ describe('retry', () => {
   })
 })
 
+test("a load the collector refused takes over no other session's outbox: it stays for a load that may send it", async ($, on) => {
+  const { clock, posts, rig, data } = world(on, { reply: () => ({ status: 401 }) })
+  await logRow($, rig, row(1))
+  await clock.advance(TICK)
+  expect(posts.length).toBe(1)
+  const gone = { v: 1, updatedAt: START - 120_000, resources: [JSON.stringify({ 'service.name': 'claude-code' })], rows: [{ r: 0, event: 'api_request', loggedAt: LOGGED_AT, attributes: row(7) }] }
+  data.set('outbox:gone', gone)
+  await clock.advance(30 * TICK)
+  expect(data.get('outbox:gone')).toEqual(gone)
+  expect(posts.length).toBe(1)
+})
+
 describe('the idempotency key', () => {
   const keyOf = (p: Post) => p.headers['idempotency-key']!
   const seqs = (p: Post) => records(p).map(r => r.attributes['event.sequence'])

@@ -372,6 +372,49 @@ describe('where the copy goes', () => {
     expect(logs.join('')).not.toContain('collector.example.com')
   })
 
+  test("user settings that can't be read hold the copy back, never sending it to production on a guess; the queue is kept", keyless, async ($, on) => {
+    const { clock, posts, store } = world(on, { layers: { user: 'reject' } })
+    await turn($)
+    await clock.advance(3 * TICK)
+    expect(posts).toEqual([])
+    expect(lastOutbox(store.sets)!.items.length).toBeGreaterThan(0)
+  })
+
+  test('two of the plugin ids naming different collectors send nothing', keyless, async ($, on) => {
+    const user = { pluginConfigs: { 'mainwave@synced': { options: { collectorUrl: 'https://collector.example.com' } }, mainwave: { options: { collectorUrl: 'https://other.example.com' } } } }
+    const { clock, posts } = world(on, { layers: { user } })
+    await turn($)
+    await clock.advance(3 * TICK)
+    expect(posts).toEqual([])
+  })
+
+  test('two of the plugin ids naming the same collector, written differently, send it there', keyless, async ($, on) => {
+    const user = { pluginConfigs: { 'mainwave@synced': { options: { collectorUrl: 'https://collector.example.com/' } }, mainwave: { options: { collectorUrl: 'https://Collector.example.com' } } } }
+    const { seen } = world(on, { layers: { user } })
+    await turn($)
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    expect(seen.length).toBeGreaterThan(0)
+    expect([...new Set(seen.map(s => ORIGIN(s.post.url)))]).toEqual(['https://collector.example.com'])
+  })
+
+  test('a collectorUrl found malformed as a later session of the same load starts removes the outbox this load kept', keyless, async ($, on) => {
+    const live = { v: 3, updatedAt: START, resources: [JSON.stringify({ 'service.name': 'claude-code' })], batches: [], items: [] }
+    const layers: Layers = {}
+    const { posts, store } = world(on, { layers, store: { 'outbox:live': live }, answer: () => ({ status: 503 }) })
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await row($, 'user_prompt', { prompt: 'go', prompt_length: '2' })
+    await $.session.end({ reason: 'clear', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    const mine = [...store.data.keys()].filter(k => k.startsWith('outbox:') && k !== 'outbox:live')
+    expect(mine.length).toBe(1)
+    const sent = posts.length
+    layers.user = collectorOption('http://collector.example.com')
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await $.session.end({ reason: 'other', sessionId: 's-2', resume: { id: 's-2' } } as never)
+    expect(posts.length).toBe(sent)
+    expect(store.data.has(mine[0]!)).toBe(false)
+    expect(store.data.has('outbox:live')).toBe(true)
+  })
+
   for (const [name, opts] of [
     ['the plugin options (which managed settings and --settings feed)', { options: { collectorUrl: 'https://evil.example.com' } }],
     ['a dev ingest key an earlier version used', { options: { devIngestKey: 'mw_dev_example_key_0001' } }],

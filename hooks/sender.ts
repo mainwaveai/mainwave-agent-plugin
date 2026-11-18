@@ -88,7 +88,7 @@ export const OUTBOX_PREFIX = 'outbox:'
 /** One record to send: a log row's copy, a rebuilt span, or a metric data point, tagged with its signal. */
 export type Item = { s: 'logs'; d: CopiedRow } | { s: 'traces'; d: BuiltSpan } | { s: 'metrics'; d: MetricPoint }
 /**
- * A queued record: its resource as JSON, its size, without a key who it is routed to (`routingIdentityOf`), and, once it has been in a
+ * A queued record: its resource as JSON, its size, who keyless ingest routes it to (`routingIdentityOf`), and, once it has been in a
  * batch, that batch's idempotency key (`batch`), kept until the batch is settled.
  */
 type Queued = Item & { resource: string; size: number; who?: string; batch?: string; adopted?: true }
@@ -362,7 +362,7 @@ export function ensureTimer($: EngineInterface): void {
 /** Whether a signal may be sent now: its path answers, and it is not waiting after a failure. */
 const ready = (signal: Signal, now: number) => !off.has(signal) && now >= waits[signal].nextTryAt
 
-/** Whether a record may go at all this load: with a key, any; without one, one routed to an organization and email not refused. */
+/** Whether a record may go at all this load: one routed to an organization and email not refused. */
 const sendable = (item: Queued) => mode !== 'keyless' || (item.who !== undefined && !refusedWho.has(item.who))
 
 /** The signal of the oldest queued record that may be sent now, if any. */
@@ -371,13 +371,13 @@ function nextSignal(now: number): Signal | undefined {
 }
 
 /**
- * The next batch of one signal, in order; the rest of the queue keeps its order. Without a key, of the oldest sendable record's
- * organization and email alone: keyless ingest takes one pair per request.
+ * The next batch of one signal, in order; the rest of the queue keeps its order. Of the oldest sendable record's organization and
+ * email alone: keyless ingest takes one pair per request.
  *
- * Where that record was already in a batch, the batch is that one again: the records queued under its key (without a key, those of
- * that organization and email), nothing added, so its key covers only records it was first sent with. Otherwise a new batch is formed
- * of the oldest records in no batch yet (new ones, and the rest of a batch `dropOldest` cut into), and each is given the new batch's
- * key (without a key, with the organization and email's hash in it). The key is made before the queue is touched, so a fault in making
+ * Where that record was already in a batch, the batch is that one again: the records queued under its key, of that organization and
+ * email, nothing added, so its key covers only records it was first sent with. Otherwise a new batch is formed of the oldest records
+ * in no batch yet (new ones, and the rest of a batch `dropOldest` cut into), and each is given the new batch's key, with the
+ * organization and email's hash in it. The key is made before the queue is touched, so a fault in making
  * it loses no record.
  */
 function takeBatch(signal: Signal): Queued[] {
@@ -506,18 +506,22 @@ export async function readOptions($: EngineInterface): Promise<void> {
 }
 
 /**
- * Where the copy goes, from the person's user settings: the first `collectorUrl` the layer gives under any of the plugin's ids, else
- * production's collector. One that has not the shape turns the copy off for this load, and what was queued is let go: the person
- * meant it to go somewhere else, so it goes nowhere rather than to a guess. A layer that cannot be read names none.
+ * Where the copy goes, from the person's user settings: the `collectorUrl` the layer gives under the plugin's ids, else production's
+ * collector. Answers whether to hold off. A value that has not the shape, or ids that give different values, turn the copy off for this
+ * load, and what was queued is let go: the person meant it to go somewhere else, so it goes nowhere rather than to a guess. A layer that
+ * cannot be read holds this send back, the queue kept: it may name somewhere else, so the copy does not go to production on a guess.
  */
 async function readCollector($: EngineInterface): Promise<boolean> {
-  const [raw] = optionValues(await readLayer($, 'user'), COLLECTOR_OPTION)
-  if (raw === undefined || raw === null || (typeof raw === 'string' && raw.trim() === '')) {
+  const layer = await readLayer($, 'user')
+  if (layer === 'unreadable') return true
+  const set = optionValues(layer, COLLECTOR_OPTION).filter(raw => !(raw === undefined || raw === null || (typeof raw === 'string' && raw.trim() === '')))
+  if (set.length === 0) {
     collector = PROD_COLLECTOR
     return false
   }
-  const url = collectorUrlOf(raw)
-  if (url !== null) {
+  const urls = new Set(set.map(collectorUrlOf))
+  const [url] = urls
+  if (urls.size === 1 && url !== null && url !== undefined) {
     collector = url
     return false
   }
@@ -533,7 +537,10 @@ async function repositoryNamesKey($: EngineInterface): Promise<boolean> {
   return stopCopying()
 }
 
-/** Whether this load sends nowhere, as a repository or the person's settings say: then what it holds is let go. */
+/**
+ * Whether to send nothing now: this load sends nowhere, as a repository or the person's settings say (then what it holds is let go),
+ * or the person's settings cannot be read (then it is kept for a later try).
+ */
 async function settingsStopCopy($: EngineInterface): Promise<boolean> {
   const [repository, person] = await Promise.all([repositoryNamesKey($), readCollector($)])
   return repository || person
@@ -762,7 +769,8 @@ export async function persist($: EngineInterface, force = false): Promise<void> 
 
 /** Takes over every other load's outbox that nobody has touched for `STALE_MS`, oldest rows first. */
 export async function adopt($: EngineInterface): Promise<void> {
-  if (!isCopying()) return
+  // A load the collector refused takes over nothing: other sessions' rows stay where they are, for a load that may send them.
+  if (!isCopying() || stopped) return
   try {
     const now = await $.clock.now()
     adoptedAt = now
@@ -816,7 +824,11 @@ export async function tick($: EngineInterface): Promise<void> {
  * before the requests, and keep what is left. The timer goes on: after a /clear or a resume the process goes on, and so does sending.
  */
 export async function finish($: EngineInterface, budget: { readonly remainingMs: number }): Promise<void> {
-  if (!isCopying()) return
+  // Turned off this load (a repository named the option, or the person's is malformed): its outbox goes too, if a save is owed.
+  if (!isCopying()) {
+    if (dirty) await persist($, true)
+    return
+  }
   await persist($, true)
   if (sending) return
   await flush($, { timeoutMs: () => Math.min(budget.remainingMs - END_MARGIN_MS, END_TIMEOUT_MS), maxBatches: 1, together: true })
