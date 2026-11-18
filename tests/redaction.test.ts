@@ -6,7 +6,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { boot, EMAIL, itemAttributes, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, packsOption, type Layers, type Post } from './rig.ts'
+import { boot, CAPTURES_ON, EMAIL, itemAttributes, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, packsOption, type Layers, type Post } from './rig.ts'
 
 const keyless = { options: {} }
 const START = 1_800_000_000_000
@@ -30,7 +30,8 @@ const PERSONAL = [MAIL, AUTHOR, PHONE, SSN, CARD, '4111111111111111']
 
 function world(on: On, layers: Layers = {}, store: Record<string, unknown> = {}, env: Record<string, string> = {}) {
   mock.clock(on, { now: START })
-  const kept = memoryStore(on, store)
+  // Identifiers and content on, as an organization's data collection settings turn them on: with no settings they don't go at all.
+  const kept = memoryStore(on, { dataPoints: CAPTURES_ON, ...store })
   const posts = network(on)
   const rig = boot(on, { entrypoint: 'remote_cowork', layers, env })
   const logs: string[] = []

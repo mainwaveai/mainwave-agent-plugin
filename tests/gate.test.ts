@@ -455,7 +455,8 @@ describe('protections', () => {
 
 describe('redaction packs', () => {
   const ALL = resolveRedaction(['pii.contact', 'pii.us_gov_id', 'pii.payment_card'], undefined)
-  const withPacks = (redaction = ALL) => resolveGate({}, {}, CONTENT_MAX_LENGTH, [], redaction)
+  // With identifiers and content on, as an organization's settings turn them on: with no settings they don't go at all.
+  const withPacks = (redaction = ALL) => resolveGate({}, CAPTURES_ON, CONTENT_MAX_LENGTH, [], redaction)
   const HELD = resolveRedaction('unreadable', undefined)
 
   test('packsOf: a list or one string of names, as written; unset says nothing; any other value is unreadable', () => {
@@ -511,7 +512,7 @@ describe('redaction packs', () => {
   })
 
   test('by default an email in content goes as it is: secrets alone', () => {
-    expect(gateAttributes(resolveGate({}), 'user_prompt', { prompt: 'mail bob@example.com' })).toEqual({ prompt: 'mail bob@example.com' })
+    expect(gateAttributes(resolveGate({}, CAPTURES_ON), 'user_prompt', { prompt: 'mail bob@example.com' })).toEqual({ prompt: 'mail bob@example.com' })
   })
 
   test('the routing and identity keys are never scanned, a repository and a commit included; metadata is not content', () => {
@@ -528,7 +529,7 @@ describe('redaction packs', () => {
   test('each string of a list is scanned; a list holding anything else is left out', () => {
     const g = withPacks()
     expect(gateAttributes(g, 'cowork', { 'workspace.host_paths': ['/Users/ana/bob@example.com', '/tmp'] })).toEqual({ 'workspace.host_paths': ['/Users/ana/[REDACTED:pii.contact.email]', '/tmp'], 'mainwave.redaction.count': 1 })
-    expect(gateAttributes(resolveGate({}), 'cowork', { 'workspace.host_paths': [`/x/ghp_${'a'.repeat(36)}`] })['workspace.host_paths']).toEqual(['/x/[REDACTED:github_token]'])
+    expect(gateAttributes(resolveGate({}, CAPTURES_ON), 'cowork', { 'workspace.host_paths': [`/x/ghp_${'a'.repeat(36)}`] })['workspace.host_paths']).toEqual(['/x/[REDACTED:github_token]'])
     expect(gateAttributes(g, 'cowork', { 'workspace.host_paths': ['/a', 7 as never] })).toEqual({})
   })
 

@@ -6,6 +6,7 @@ import { DEFAULT_PACKS, decodeJsonString, encodeJsonString, EXEMPT_KEYS, luhnVal
 import { gateAttributes, resolveGate, resolveRedaction } from '../hooks/gate.ts'
 import { CONTENT_MAX_LENGTH, redact } from '../hooks/protect.ts'
 import { VECTORS } from './pack-vectors.ts'
+import { CAPTURES_ON } from './rig.ts'
 
 describe('the packs', () => {
   test("the same four as Mainwave's SDKs and CLI hooks, in the order they run; secrets alone by default", () => {
@@ -59,7 +60,7 @@ describe('JSON in place', () => {
 
   test('a value past the limit is cut, then scanned: what is left of it is redacted', () => {
     const value = JSON.stringify({ file_path: '/tmp/a.txt', content: `phones:\n415-555-2671\n078-05-1120\n4111111111111111\n${'x'.repeat(70_000)}` })
-    const out = gateAttributes(resolveGate({}, {}, CONTENT_MAX_LENGTH, [], resolveRedaction(['pii.contact', 'pii.us_gov_id', 'pii.payment_card'], undefined)), 'tool_result', { tool_input: value })
+    const out = gateAttributes(resolveGate({}, CAPTURES_ON, CONTENT_MAX_LENGTH, [], resolveRedaction(['pii.contact', 'pii.us_gov_id', 'pii.payment_card'], undefined)), 'tool_result', { tool_input: value })
     expect(out['tool_input_truncated']).toBe(true)
     for (const p of ['415-555-2671', '078-05-1120', '4111111111111111']) expect([p, (out['tool_input'] as string).includes(p)]).toEqual([p, false])
     expect(out['mainwave.redaction.count']).toBe(3)
