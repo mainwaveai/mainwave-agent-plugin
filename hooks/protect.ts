@@ -1,11 +1,13 @@
 // The protections that apply to every identifier and content value the plugin sends, whatever the gate says: secrets are replaced,
-// and long values are cut. Pure: tests call it directly.
+// with the personal-data packs in force after them (packs.ts), and long values are cut. Pure: tests call it directly.
 //
 // Secrets: Mainwave's shared secret rules (AWS access key IDs, GitHub tokens, Anthropic and OpenAI-style API keys, Slack tokens,
 // private key blocks, JSON Web Tokens), plus `Authorization` header values, passwords in web addresses and values assigned to names
 // that say they are secret. Each match is replaced with a marker naming its kind, as Mainwave's own SDKs mark it: `[REDACTED:<kind>]`.
 //
 // Length: Claude Code's own limit for telemetry content, and its marker, so a value the plugin cuts reads as one Claude Code cut.
+
+import { scanPacks, type PackName } from './packs.ts'
 
 /** Claude Code's limit on a telemetry content value, in characters, when nothing sets a lower one. */
 export const CONTENT_MAX_LENGTH = 61_440
@@ -74,8 +76,11 @@ const ASSIGNED: readonly Rule[] = [
   },
 ]
 
-/** A value with every secret replaced, and how many were. */
-export function redact(text: string): { text: string; count: number } {
+/**
+ * A value with every secret replaced, then every match of the personal-data packs among `packs` (packs.ts), and how many were. The
+ * secret rules always run, and first, so a pack never reads the digits inside a token they replace.
+ */
+export function redact(text: string, packs: readonly PackName[] = []): { text: string; count: number } {
   let out = text
   let count = 0
   for (const rule of SECRETS) {
@@ -89,5 +94,6 @@ export function redact(text: string): { text: string; count: number } {
       return next
     })
   }
-  return { text: out, count }
+  const p = scanPacks(out, packs)
+  return { text: p.text, count: count + p.count }
 }

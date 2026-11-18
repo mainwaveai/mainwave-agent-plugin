@@ -18,7 +18,7 @@ export const CONTRACT: Record<string, (v: unknown) => boolean> = {
   'mainwave.plugin.version': v => typeof v === 'string' && /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(v),
   'mainwave.plugin.entrypoint': v => typeof v === 'string' && /^[a-z0-9_-]+$/.test(v),
   'mainwave.telemetry.route': v => v === 'exporter' || v === 'plugin',
-  // On the plugin's own copy only, where the protections replaced a secret: how many.
+  // On the plugin's own copy only, where the protections replaced a secret or a redaction pack's match: how many.
   'mainwave.redaction.count': v => typeof v === 'number' && Number.isInteger(v) && v >= 1,
   // On the plugin's own copy only, where the person opted in to data points off by default: which, each once.
   'mainwave.telemetry.opt_in': v => typeof v === 'string' && v.split(',').every(id => OPT_IN_IDS.includes(id)) && new Set(v.split(',')).size === v.split(',').length,
@@ -53,6 +53,9 @@ export type Rig = { rows: { event: string; attributes: Record<string, unknown> }
 export const keyOption = (value: unknown, id = 'mainwave@mainwave'): Record<string, unknown> => ({ pluginConfigs: { [id]: { options: { devIngestKey: value } } } })
 /** The person's opt-in to more data points in a settings layer, under the given plugin id. */
 export const optInOption = (value: unknown, id = 'mainwave@synced'): Record<string, unknown> => ({ pluginConfigs: { [id]: { options: { extraDataPoints: value } } } })
+
+/** The redaction packs option in a settings layer, under the given plugin id: an organization's in managed settings, a person's in theirs. */
+export const packsOption = (value: unknown, id = 'mainwave@synced'): Record<string, unknown> => ({ pluginConfigs: { [id]: { options: { redactionPacks: value } } } })
 
 /** A dev ingest key, as a person would set it. */
 export const KEY = 'mw_dev_example_key_0001'

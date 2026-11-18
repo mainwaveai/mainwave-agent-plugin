@@ -460,9 +460,11 @@ describe("the person's opt-in, in their own user settings", () => {
     })
   }
 
-  test("user settings that can't be read opt in to nothing, and the plugin goes on", keyless, async ($, on) => {
-    const posts = await session($, on, { layers: { user: 'reject' } })
-    expect(rowsOf(posts).find(r => r['event.name'] === 'user_prompt')!['prompt']).toBe('<REDACTED>')
+  test("user settings that can't be read opt in to nothing, and hold content back, as the packs they may add are unknown; the records go", keyless, async ($, on) => {
+    const posts = await session($, on, { overrides: CAPTURES_ON, layers: { user: 'reject' } })
+    const prompt = rowsOf(posts).find(r => r['event.name'] === 'user_prompt')!
+    expect(prompt['prompt']).toBeUndefined()
+    expect(prompt['prompt_length']).toBe('7')
     expect(spansOf(posts).find(s => s.name === 'claude_code.tool')!.attrs['bash_argv0']).toBe('git')
     expect(thinkingOf(posts)).toBeUndefined()
   })

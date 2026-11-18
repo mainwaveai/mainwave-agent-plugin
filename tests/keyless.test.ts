@@ -207,8 +207,8 @@ describe('a session without the env block, sending keyless', () => {
   test('a session with no outbox to take over reads no settings for it', keyless, async ($, on) => {
     const { rig } = world(on)
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
-    // The person's own settings, read once per load for the data points they opt in to; no repository's.
-    expect(rig.reads).toEqual(['user'])
+    // The person's own settings and the managed settings, read once per load for the opt-in and the redaction packs; no repository's.
+    expect(rig.reads.sort()).toEqual(['policy', 'user'])
   })
 
   test('with every record refused, a tick makes no request and reads no settings', keyless, async ($, on) => {
