@@ -20,7 +20,7 @@ import type { RowIdentity } from '../types'
 import { capturePrompt, captureTool, newCapture, rowFill, streamChunk, streamedThinking, streamStart, type Capture } from './capture.ts'
 import { MCP_SERVER_ROW, SKILL_PROMPT_ROW, type Switch } from './catalog.ts'
 import { mcpParts } from './derive.ts'
-import { allows, configureGate, currentGate, gateAttributes, gateRow, gateSpan, metricAllowed, OVERRIDES_KEY, overridesOf, resetPacks, setOptIn, setOverrides } from './gate.ts'
+import { allows, configureGate, currentGate, gateAttributes, gateRow, gateSpan, metricAllowed, resetPacks, setOptIn, setOverrides } from './gate.ts'
 import { endSession } from './http.ts'
 import { identityOf, isOrgId, mergeIdentity } from './identity.ts'
 import { add, collect, newMeter, type Meter } from './meter.ts'
@@ -28,8 +28,9 @@ import type { CopiedRow } from './otlp.ts'
 import {
   agentSpawned, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
 } from './rebuild.ts'
+import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsSummary } from './orgsettings.ts'
 import { contentLimit } from './protect.ts'
-import { adopt, configure, enqueue, ensureTimer, finish, isCopying, keyMalformed, readOptions, snapshot } from './sender.ts'
+import { adopt, configure, DEV_COLLECTOR, enqueue, ensureTimer, finish, isCopying, keyMalformed, readOptions, snapshot } from './sender.ts'
 import {
   approvalsOf, approved, permitted, DESKTOP_UNDER_APPDATA, DESKTOP_UNDER_HOME, distinct, enabledPlugins, fileServers, foldersUp, globalServers, join, managedDirs, manifestServerFiles, MAX_PLUGINS, parse,
   pluginServers, projectEntry, serverAttributes, toolSpelling, type Approvals, type McpServer,
@@ -125,6 +126,12 @@ async function readEntrypoint($: EngineInterface): Promise<string> {
  */
 async function noteIdentity($: EngineInterface, attributes: Readonly<Record<string, unknown>>): Promise<void> {
   const seen = identityOf(attributes)
+  // The organization's settings follow who the session is: those kept for it apply, and the plugin asks Mainwave for them.
+  try {
+    await noteSessionIdentity($, DEV_COLLECTOR, mergeIdentity(held, seen), isCopying)
+  } catch {
+    // The settings in force stand.
+  }
   if (mergeIdentity(held, seen) === held) return
   let merged = held
   await update($, identityAtom, stored => (merged = mergeIdentity(stored, seen)))
@@ -201,10 +208,13 @@ async function readGate($: EngineInterface): Promise<void> {
   await readOptions($)
 }
 
-/** The explicit settings per data point the store keeps, if any. A store that cannot be read leaves those held. */
+/**
+ * The organization's settings in force (orgsettings.ts): this load's answer from Mainwave, else what the store keeps for the session's
+ * organization. A store that cannot be read leaves the explicit settings held.
+ */
 async function readOverrides($: EngineInterface): Promise<void> {
   try {
-    setOverrides(overridesOf(await $.store.get(OVERRIDES_KEY)))
+    await applyStoredSettings($)
   } catch {
     // Those held stand.
   }
@@ -601,6 +611,8 @@ export async function sessionStart($: SessionStartParams[0], e: SessionStartPara
       await update($, sessionCountedAtom, counted => ((first = counted !== true), true))
       if (first && r !== null) await emit($, sessionStarted(r, await $.clock.now()))
       await adopt($)
+      // The organization's settings: asked for again as a session starts, where its rows have named who it is.
+      ensureFetching($, DEV_COLLECTOR)
       // A new session: its servers and skill texts are sent again (after a /clear, `session.end` starts them over). Claude's settings
       // are read beside the session's start, never holding it.
       textIds = new Map()
@@ -875,7 +887,7 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
       const s = snapshot()
       const withheld = s.keyless ? `, ${s.withheld} held back (no organization and email)` : ''
       const refusals = s.refusedIdentities > 0 ? `, ${s.refusedIdentities} organization and email refused` : ''
-      $.ui.log(`mainwave: copy to dev${s.keyless ? ' (keyless)' : ''}: ${s.sent} sent, ${s.dropped} dropped, ${s.queued} kept for a later session${withheld}${refusals}`, { to: 'debug' })
+      $.ui.log(`mainwave: copy to dev${s.keyless ? ' (keyless)' : ''}: ${s.sent} sent, ${s.dropped} dropped, ${s.queued} kept for a later session${withheld}${refusals}; data collection settings: ${settingsSummary()}`, { to: 'debug' })
     }
   } catch {
     // What could not be kept is lost to the copy alone: the exporter's rows went on.
@@ -899,6 +911,9 @@ export const register: Register = (on, options) => {
   // The opt-in and the packs of an earlier load stand for nothing until this one reads them.
   setOptIn([])
   resetPacks()
+  // Nor do its organization's settings: those kept in the store apply again once a row names the organization.
+  setOverrides({})
+  resetOrgSettings()
   capture = newCapture()
   own = []
   serversSent = new Set()

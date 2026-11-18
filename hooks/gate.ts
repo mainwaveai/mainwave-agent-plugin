@@ -9,13 +9,13 @@
 // Code switch the session's environment sets to `0` (`false`, `no`, `off`) turns the data points it governs that are on by default to
 // `claude`, so an admin who turned a capture off in Mainwave's org-wide setup keeps that choice. The person can opt in to data points
 // still at a default of `off` (`setOptIn`, from their own user settings): each turns `on`. An explicit setting for a data point
-// (`setOverrides`, for organization settings) wins over all three, and the opt-in never raises a data point a switch at `0` governs
+// (`setOverrides`: the organization's settings from Mainwave, orgsettings.ts) wins over all three, and the opt-in never raises a data point a switch at `0` governs
 // (thinking counts as governed by the responses' switch, for this). It only adds: it never turns anything off. Required data points
 // are always sent.
 //
 // Whatever the gate says, every identifier and content value goes through the always-on protections (protect.ts) before it is queued,
-// with the redaction packs in force (packs.ts): those the organization chose (`setOrgPacks`: its managed settings today, its data
-// collection settings once the plugin keeps them), else the default, `DEFAULT_PACKS`; and those the person adds from their own user
+// with the redaction packs in force (packs.ts): those the organization chose (`setOrgPacks`: its managed settings and its data
+// collection settings from Mainwave, orgsettings.ts), else the default, `DEFAULT_PACKS`; and those the person adds from their own user
 // settings (`setPersonPacks`). The person's add to the organization's, never take from them. A choice that can't be read, or that names
 // a pack the plugin does not have, holds every identifier and content value back (the record still goes): redaction that was asked for
 // never silently turns off.
@@ -201,15 +201,17 @@ export function resetPacks(): void {
 }
 
 /**
- * Where explicit settings per data point are kept, in the plugin's store: `{ "<data point>": "on" | "off" | "claude" }`. Nothing
- * writes it yet: the organization's settings will be kept here. A file the person can edit, so a convenience, not a control.
+ * Where explicit settings per data point are kept, in the plugin's store: `{ "<data point>": "on" | "off" | "claude" }`, written by
+ * hand: it applies while the store keeps no answer from Mainwave (orgsettings.ts, `SETTINGS_KEY`). A file the person can edit, so a
+ * convenience, not a control.
  */
 export const OVERRIDES_KEY = 'dataPoints'
 
 /**
  * Where the organization's choice of packs is kept, in the plugin's store, beside `OVERRIDES_KEY`: a value of the packs option's shape
- * (`packsOf`). Nothing writes it yet: the packs in the organization's data collection settings will be kept here. It is read once per
- * load and again before each send (sender.ts, `readOptions`), so a value written mid-session applies to records already queued.
+ * (`packsOf`), written by hand: it applies while the store keeps no answer from Mainwave, whose packs apply instead (orgsettings.ts). It
+ * is read once per load and again before each send (sender.ts, `readOptions`), so a value written mid-session applies to records
+ * already queued.
  */
 export const PACKS_KEY = 'redactionPacks'
 

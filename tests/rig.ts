@@ -129,24 +129,43 @@ export type Post = { url: string; method?: string; headers: Record<string, strin
 /** How the network answers the nth request (1-based): a status, `reject` (no network), or `hang` (no answer). */
 export type Reply = { status: number; text?: string } | 'reject' | 'hang'
 
+/** Where the plugin reads its organization's data collection settings, on the API beside the dev collector. */
+export const SETTINGS_URL = 'https://api.dev.mainwave.com/api/plugin/data-collection-settings'
+/** The settings API's answer where its route is off, as production answers today. */
+const SETTINGS_OFF: Reply = { status: 404, text: '{"detail":"Not Found"}' }
+
 /**
  * The network beneath the plugin: records every request and answers each as `reply` says (200 when not given). With `only`, a
- * request to any other URL is answered 200 and kept in `others` instead, so `posts` and `reply`'s count see the named URLs alone.
+ * request to any other URL is answered 200 and kept in `others` instead, so `posts` and `reply`'s count see the named URLs alone. A
+ * request for the organization's settings is kept in `settings` and answered by `settings`, at once or when its promise settles (404,
+ * the route off, when not given), so
+ * neither `posts` nor `reply`'s count sees it.
  */
-export function network(on: On, reply: (n: number, post: Post) => Reply = () => ({ status: 200 }), only?: (url: string) => boolean): Post[] & { others: Post[] } {
-  const posts = Object.assign([] as Post[], { others: [] as Post[] })
+export function network(
+  on: On,
+  reply: (n: number, post: Post) => Reply = () => ({ status: 200 }),
+  only?: (url: string) => boolean,
+  settings: (n: number, post: Post) => Reply | Promise<Reply> = () => SETTINGS_OFF,
+): Post[] & { others: Post[]; settings: Post[] } {
+  const posts = Object.assign([] as Post[], { others: [] as Post[], settings: [] as Post[] })
+  const answer = (r: Reply) => {
+    if (r === 'reject') throw new Error('network refused in test')
+    if (r === 'hang') return new Promise<never>(() => undefined)
+    return { value: { status: r.status, ok: r.status >= 200 && r.status < 300, headers: {}, text: r.text ?? '' } } as never
+  }
   on('http.fetch', async (_$, e) => {
     const req = e as unknown as { url: string; init?: { method?: string; headers?: Record<string, string>; body?: unknown } }
     const post: Post = { url: req.url, method: req.init?.method, headers: { ...(req.init?.headers ?? {}) }, body: String(req.init?.body ?? '') }
+    if (req.url === SETTINGS_URL) {
+      posts.settings.push(post)
+      return answer(await settings(posts.settings.length, post))
+    }
     if (only && !only(req.url)) {
       posts.others.push(post)
       return { value: { status: 200, ok: true, headers: {}, text: '{"partialSuccess":{}}' } } as never
     }
     posts.push(post)
-    const r = reply(posts.length, post)
-    if (r === 'reject') throw new Error('network refused in test')
-    if (r === 'hang') return new Promise<never>(() => undefined)
-    return { value: { status: r.status, ok: r.status >= 200 && r.status < 300, headers: {}, text: r.text ?? '' } } as never
+    return answer(reply(posts.length, post))
   })
   return posts
 }
@@ -193,12 +212,16 @@ export function records(post: Post): SentRecord[] {
   return out
 }
 
-/** `$.store` beneath the plugin: a map in memory that records each write. */
-export function memoryStore(on: On, entries: Record<string, unknown> = {}) {
+/** `$.store` beneath the plugin: a map in memory that records each write. A read of `unreadable` fails. */
+export function memoryStore(on: On, entries: Record<string, unknown> = {}, unreadable?: string) {
   const data = new Map<string, unknown>(Object.entries(entries))
   const sets: { key: string; value: unknown }[] = []
   const deletes: string[] = []
-  on('store.get', async (_$, e) => ({ value: data.get((e as unknown as { key: string }).key) }) as never)
+  on('store.get', async (_$, e) => {
+    const key = (e as unknown as { key: string }).key
+    if (key === unreadable) throw new Error(`store.get ${key} refused in test`)
+    return { value: data.get(key) } as never
+  })
   on('store.set', async (_$, e) => {
     const w = e as unknown as { key: string; value: unknown }
     const value = JSON.parse(JSON.stringify(w.value)) as unknown
