@@ -284,8 +284,54 @@ const OPEN_ARGS_IN_LINE = String.raw`(?:${HSP}+${WORD}+)*?`
 const BRANCH_OPENER_IN_LINE = String.raw`${GIT_IN_LINE}(?:checkout${OPEN_ARGS_IN_LINE}${HSP}+-[bB]|switch${OPEN_ARGS_IN_LINE}${HSP}+(?:-[cC]|--create|--force-create)|worktree${HSP}+add${OPEN_ARGS_IN_LINE}${HSP}+-[bB])${HSP}+`
 const BRANCH_NAME = new RegExp(String.raw`${CMD_POS_NC}${BRANCH_OPENER_IN_LINE}["']?([^-\t\n\v\f\r &|;"'${'`'}][^\t\n\v\f\r &|;"'${'`'}]*)`)
 const PUSH_REF = new RegExp(String.raw`${CMD_POS_NC}${GIT_IN_LINE}push(?:${HSP}+-${WORD}+)*${HSP}+[^-\t\n\v\f\r &|;]${WORD}*${HSP}+${REF}`)
-/** Read from the counted merge invocation itself, which ends at its simple command's end. */
-const MERGE_REF = new RegExp(String.raw`${GIT_NC}merge(?:${SP}+-${NSP}+)*${SP}+${REF}`)
+/** A merge's flags that take the next word as their value: a message, a message file, a strategy and its option. */
+const MERGE_VALUE_FLAGS: ReadonlySet<string> = new Set(['-m', '-F', '-s', '-X', '--message', '--file', '--strategy', '--strategy-option', '--into-name'])
+/** What a ref may be: one word that starts with no `-` and holds no separator. */
+const REF_WORD = /^[^-\t\n\v\f\r ][^\t\n\v\f\r &|;]*$/
+
+/**
+ * The ref the counted merge invocation names: its first word that is not a flag or a flag's value, as written. Mainwave's pattern
+ * reads the word after any flag, so `git merge -m "fix the login" feat` gives `"fix`, a word of the message. The plugin sends a ref
+ * where the message may stay on the machine, so it skips a value-taking flag's value, quoted words included, and sends no ref for
+ * a word that is not one.
+ */
+function mergeRef(invocation: string): string {
+  const head = MERGE_HEAD.exec(invocation)
+  if (!head) return ''
+  const words = shellWords(invocation.slice(head.index + head[0].length))
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i]!
+    if (w.startsWith('-')) {
+      if (MERGE_VALUE_FLAGS.has(w)) i++
+      continue
+    }
+    return REF_WORD.test(w) ? w : ''
+  }
+  return ''
+}
+
+/** The words of a simple command's arguments, split at unquoted spaces, each kept as written (its quotes too). Linear. */
+function shellWords(text: string): string[] {
+  const out: string[] = []
+  let word = ''
+  let quote: string | null = null
+  for (const c of text) {
+    if (quote) {
+      word += c
+      if (c === quote) quote = null
+    } else if (c === '"' || c === "'") {
+      word += c
+      quote = c
+    } else if (c === ' ' || c === '\t' || c === '\n' || c === '\v' || c === '\f' || c === '\r') {
+      if (word) out.push(word)
+      word = ''
+    } else {
+      word += c
+    }
+  }
+  if (word) out.push(word)
+  return out
+}
 const TAG_NAME = new RegExp(String.raw`${CMD_POS_NC}${GIT_IN_LINE}tag${HSP}+(?:-[as]${HSP}+)?${REF}`)
 /** Each `git merge` from its command position to the next separator; `merge-base` and `merge-tree` are not one. */
 const MERGE_INVOCATION = new RegExp(String.raw`${CMD_POS_NC}${GIT_NC}merge(?:${SP}[^&|;\n]*|$)`)
@@ -517,7 +563,7 @@ export function commandOutcomes(command: string): { counts: Partial<Record<Comma
   const named: Record<CommandRef, () => string> = {
     branch_opened: () => extract(BRANCH_NAME, x),
     push_ref: () => extract(PUSH_REF, x),
-    merge_ref: () => extract(MERGE_REF, merges[merges.length - 1] ?? ''),
+    merge_ref: () => mergeRef(merges[merges.length - 1] ?? ''),
     tag_name: () => extract(TAG_NAME, x),
   }
   const counts: Partial<Record<CommandCount, number>> = {}
