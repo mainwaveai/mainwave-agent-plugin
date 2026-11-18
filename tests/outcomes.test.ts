@@ -9,6 +9,21 @@ import fixture from './fixtures/command-outcomes.ts'
 type Case = { name: string; command: string; outcomes: Record<string, number>; refs: Record<string, string> }
 const { _meta: meta, cases } = fixture as unknown as { _meta: { columns: Record<string, string>; ref_names: Record<string, string> }; cases: Case[] }
 
+/**
+ * How many times longer reading the inputs `build` makes at `size` takes than at a quarter of it: about 4 where reading is linear, 16
+ * where it is quadratic. A ratio, not a time, so a slower machine changes nothing; the quarter runs first, so warming up only lowers it.
+ */
+function growth(build: (size: number) => readonly string[], size: number): number {
+  const time = (n: number) => {
+    const inputs = build(n)
+    const started = Date.now()
+    for (const input of inputs) commandOutcomes(input)
+    return Date.now() - started
+  }
+  const quarter = time(size / 4)
+  return time(size) / Math.max(quarter, 1)
+}
+
 describe("Mainwave's cases", () => {
   test('name the same counts and refs the plugin computes, and each case once', () => {
     expect(Object.keys(meta.columns)).toEqual([...COMMAND_COUNTS])
@@ -233,23 +248,20 @@ describe('commandOutcomes, beyond the cases', () => {
     expect(commandOutcomes('git switch a\ngit checkout b && x -b y').counts).toEqual({})
   })
 
-  test('reads in time linear in the command, however it is built', () => {
-    const inputs = [
-      `"${'a;'.repeat(200_000)}`,
-      `x<<SHIFT ${"'a' ".repeat(20_000)}`,
-      `cat <<EOF\n${'git push\n'.repeat(20_000)}`,
-      `"${'\\"'.repeat(100_000)}`,
-      `git merge --ff-only ${'> '.repeat(60)}foo bar`,
-      `git checkout ${'a '.repeat(50_000)}`,
+  test('reads in time linear in the command, however it is built', { timeoutMs: 60_000 }, () => {
+    const build = (k: number) => [
+      `"${'a;'.repeat(200_000 * k)}`,
+      `x<<SHIFT ${"'a' ".repeat(20_000 * k)}`,
+      `cat <<EOF\n${'git push\n'.repeat(20_000 * k)}`,
+      `"${'\\"'.repeat(100_000 * k)}`,
+      `git merge --ff-only ${'> '.repeat(60 * k)}foo bar`,
+      `git checkout ${'a '.repeat(50_000 * k)}`,
     ]
-    const started = Date.now()
-    for (const input of inputs) commandOutcomes(input)
-    expect(Date.now() - started).toBeLessThan(3_000)
+    expect(growth(build, 4)).toBeLessThan(8)
   })
 
-  test('reads a megabyte of spaces, newlines, body keywords, backslashes or branch commands in time linear in it', () => {
-    const mb = 1 << 20
-    const inputs = [
+  test('reads a megabyte of spaces, newlines, body keywords, backslashes or branch commands in time linear in it', { timeoutMs: 60_000 }, () => {
+    const build = (mb: number) => [
       '\n'.repeat(mb),
       ' \n\t\r\n'.repeat(mb / 5),
       '\ndo'.repeat(mb / 3),
@@ -260,14 +272,11 @@ describe('commandOutcomes, beyond the cases', () => {
       'git checkout a\n'.repeat(mb / 15),
       'git switch a\n'.repeat(mb / 13),
     ]
-    const started = Date.now()
-    for (const input of inputs) commandOutcomes(input)
-    expect(Date.now() - started).toBeLessThan(10_000)
+    expect(growth(build, 1 << 20)).toBeLessThan(8)
   })
 
-  test("reads a megabyte of a ref's words, however they nest, quote, escape or repeat, in time linear in it", () => {
-    const mb = 1 << 20
-    const inputs = [
+  test("reads a megabyte of a ref's words, however they nest, quote, escape or repeat, in time linear in it", { timeoutMs: 60_000 }, () => {
+    const build = (mb: number) => [
       `git push ${'$(;git push '.repeat(mb / 11)}`,
       `git tag ${'`;git tag '.repeat(mb / 9)}`,
       `git push -o ${'"\\;git push -o '.repeat(mb / 15)}`,
@@ -295,8 +304,6 @@ describe('commandOutcomes, beyond the cases', () => {
       `${"cat <<EOF # it's\n  EOF\n".repeat(mb / 22)}`,
       `cat <<${'A'.repeat(mb / 2)}\n${'A'.repeat(mb / 2 - 1)}B\n`,
     ]
-    const started = Date.now()
-    for (const input of inputs) commandOutcomes(input)
-    expect(Date.now() - started).toBeLessThan(10_000)
+    expect(growth(build, 1 << 20)).toBeLessThan(8)
   })
 })
