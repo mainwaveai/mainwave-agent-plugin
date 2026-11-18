@@ -838,16 +838,16 @@ function checkKeyless(pass, { captured, run }, reference) {
     ['a user_prompt row', rowsOf('user_prompt').length > 0],
     ['an assistant_response row', rowsOf('assistant_response').length > 0],
     ['a tool_result row', rowsOf('tool_result').length > 0],
+    ['a file path on a Write or Edit call', spans.some(s => s.attrs.file_path !== undefined)],
   ]
   for (const [what, ok] of expectations) if (!ok) problems.push(`defaults: no ${what} was sent`)
   const withheld = [
     ['a command', spans.some(s => s.attrs.full_command !== undefined || s.attrs.bash_command !== undefined)],
-    ['a file path', spans.some(s => s.attrs.file_path !== undefined)],
     ['a tool output', spans.some(s => (s.events ?? []).some(e => e.name === 'tool.output'))],
     ["a failed call's error text", spans.some(s => /e2e-missing-file/.test(String(s.attrs.error?.v ?? '')))],
     ['a prompt', spans.some(s => !redacted(s.attrs.user_prompt?.v)) || rowsOf('user_prompt').some(r => !redacted(r.attributes.prompt?.v) || !redacted(r.attributes.prompt_text?.v))],
     ['a response', rowsOf('assistant_response').some(r => !redacted(r.attributes.response?.v))],
-    ['tool input', rows.some(r => r.attributes.tool_input !== undefined) || rows.some(r => /full_command|file_path|"description"/.test(String(r.attributes.tool_parameters?.v ?? '')))],
+    ['tool input', rows.some(r => r.attributes.tool_input !== undefined) || rows.some(r => /full_command|"description"/.test(String(r.attributes.tool_parameters?.v ?? '')))],
     ['a repository', [...rows.map(r => r.attributes), ...spans.map(s => s.attrs)].some(a => Object.keys(a).some(k => k.startsWith('vcs.')) || /git_commit_id|git_branch/.test(String(a.tool_parameters?.v ?? '')))],
     // What Claude Code never sends: no row of the plugin's own for MCP server addresses or skill text.
     ...['mcp_server_configured', 'skill_prompt'].map(ev => [`${ev} rows`, rowsOf(ev).length > 0]),

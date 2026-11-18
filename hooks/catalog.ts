@@ -96,7 +96,7 @@ export const DEFAULTS: Readonly<Record<Exclude<DataPointId, 'session.identity' |
   'web.domain': 'on',
   // Identifiers.
   repo: 'off',
-  'file.path': 'off',
+  'file.path': 'on',
   'web.url': 'off',
   'mcp.url': 'off',
   // Content.

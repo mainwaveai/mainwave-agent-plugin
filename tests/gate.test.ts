@@ -45,11 +45,12 @@ describe('the catalog', () => {
 })
 
 describe('resolveGate', () => {
-  test('with nothing set, required and metadata data points are on; identifiers and content are off', () => {
+  test('with nothing set, required and metadata data points and file paths are on; the other identifiers and content are off', () => {
     const g = resolveGate({})
-    for (const d of CATALOG) expect([d.id, g.settings.get(d.id)]).toEqual([d.id, d.required ? 'required' : d.class === 'metadata' ? 'on' : 'off'])
+    for (const d of CATALOG) expect([d.id, g.settings.get(d.id)]).toEqual([d.id, d.required ? 'required' : d.class === 'metadata' || d.id === 'file.path' ? 'on' : 'off'])
     // So none of them goes anywhere, not even where Claude Code would send it.
-    for (const id of ['repo', 'file.path', 'bash.command', 'tool.input', 'tool.result', 'prompt.text', 'response.text'] as const) expect([id, allows(g, id, true)]).toEqual([id, false])
+    for (const id of ['repo', 'bash.command', 'tool.input', 'tool.result', 'prompt.text', 'response.text'] as const) expect([id, allows(g, id, true)]).toEqual([id, false])
+    expect(allows(g, 'file.path', false)).toBe(true)
   })
 
   test("Claude Code's switches turned on turn nothing on", () => {
@@ -57,10 +58,10 @@ describe('resolveGate', () => {
     for (const d of CATALOG) expect([d.id, g.settings.get(d.id)]).toEqual([d.id, resolveGate({}).settings.get(d.id)])
   })
 
-  test('a switch set to 0 turns the metadata it governs to follow Claude Code; what is off stays off', () => {
+  test('a switch set to 0 turns the metadata and file paths it governs to follow Claude Code; what is off stays off', () => {
     const g = resolveGate(SWITCHED_OFF)
-    for (const id of ['tool.mcp', 'skill.name', 'agent.type', 'web.domain'] as const) expect([id, g.settings.get(id)]).toEqual([id, 'claude'])
-    for (const id of ['repo', 'file.path', 'bash.command', 'tool.input', 'tool.result', 'prompt.text', 'response.text'] as const) expect([id, g.settings.get(id)]).toEqual([id, 'off'])
+    for (const id of ['tool.mcp', 'skill.name', 'agent.type', 'web.domain', 'file.path'] as const) expect([id, g.settings.get(id)]).toEqual([id, 'claude'])
+    for (const id of ['repo', 'bash.command', 'tool.input', 'tool.result', 'prompt.text', 'response.text'] as const) expect([id, g.settings.get(id)]).toEqual([id, 'off'])
     // Metadata no switch governs stays on.
     expect(g.settings.get('bash.class')).toBe('on')
     expect(g.settings.get('tool.call')).toBe('on')
@@ -105,7 +106,7 @@ describe("the person's opt-in", () => {
     expect(g.optedIn).toEqual([])
     const all = resolveGate({}, {}, undefined, everything)
     for (const d of CATALOG) expect([d.id, all.settings.get(d.id)]).toEqual([d.id, d.required ? 'required' : 'on'])
-    expect(all.optedIn).toEqual(['repo', 'file.path', 'web.url', 'mcp.url', 'bash.command', 'tool.input', 'tool.result', 'skill.text', 'prompt.text', 'response.text', 'response.thinking'])
+    expect(all.optedIn).toEqual(['repo', 'web.url', 'mcp.url', 'bash.command', 'tool.input', 'tool.result', 'skill.text', 'prompt.text', 'response.text', 'response.thinking'])
   })
 
   test('an explicit setting wins: off stays off, claude stays claude, and an explicit on is not an opt-in', () => {
