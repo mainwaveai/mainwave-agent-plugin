@@ -160,6 +160,30 @@ describe('commandOutcomes, beyond the cases', () => {
     expect(commandOutcomes("git commit -m $'a\\nb' && git push origin main")).toEqual({ counts: { commits: 1, pushes: 1 }, refs: { push_ref: 'main' } })
   })
 
+  test("no ref is read from a heredoc the rules end where the shell does not; counts stay as the rules read them", () => {
+    // A bare upper-case line ends a non-EOF tag's body by the rules, but not the shell's.
+    expect(commandOutcomes("git commit -F - <<'MSG'\nfix\nWHERE\ngit merge conflicts were painful\nMSG")).toEqual({ counts: { commits: 1, merges: 1 }, refs: {} })
+    expect(commandOutcomes("git commit -F - <<'MSG'\nAdd query\n\nSELECT\n  count()\nFROM t\n\ngit push origin release-candidate\nMSG")).toEqual({ counts: { commits: 1, pushes: 1 }, refs: {} })
+    expect(commandOutcomes("git commit -F - <<'MSG'\nfix\nTODO\ngit checkout -b hunter2\nMSG")).toEqual({ counts: { commits: 1, branches_opened: 1 }, refs: {} })
+    expect(commandOutcomes("gh pr create --body \"$(cat <<'BODY'\n## Test\n```sql\nSELECT\n  count()\nFROM t\n```\ngit push origin secret-word\nBODY\n)\"")).toEqual({ counts: { prs_opened: 1 }, refs: {} })
+    // A tag line with blanks around it ends the body by the rules; the shell takes only the tag, after tabs where `<<-` opens it.
+    expect(commandOutcomes('cat <<EOF > f\n  EOF\ngit push origin secret\nEOF')).toEqual({ counts: { pushes: 1 }, refs: {} })
+    expect(commandOutcomes('cat <<EOF > f\nEOF \ngit tag s3cret\nEOF')).toEqual({ counts: { tags: 1 }, refs: {} })
+    expect(commandOutcomes('cat <<EOF > f\n\tEOF\ngit push origin secret\nEOF')).toEqual({ counts: { pushes: 1 }, refs: {} })
+    expect(commandOutcomes('cat <<-EOF > f\n\tbody\n\tEOF\ngit push origin main')).toEqual({ counts: { pushes: 1 }, refs: { push_ref: 'main' } })
+    expect(commandOutcomes('cat <<-EOF > f\n  EOF\ngit push origin secret\nEOF')).toEqual({ counts: { pushes: 1 }, refs: {} })
+    // A quote opened on the opener's line runs the rules' line into the body.
+    expect(commandOutcomes("cat <<EOF > notes.txt # it's\nline1\ngit push origin secret\nit's done\nEOF")).toEqual({ counts: { pushes: 1 }, refs: {} })
+    expect(commandOutcomes("git commit -F - <<EOF # Tyler's msg\nsubject\ngit merge secretword\ndon't\nEOF\n")).toEqual({ counts: { commits: 1, merges: 1 }, refs: {} })
+    // A tag the shell reads as a longer word, or with unpaired quotes, has another terminator.
+    expect(commandOutcomes('cat <<EOF-x\nEOF\ngit push origin secret\nEOF-x')).toEqual({ counts: { pushes: 1 }, refs: {} })
+    expect(commandOutcomes('cat <<\'EOF"\nEOF\ngit push origin secret\nEOF')).toEqual({ counts: { pushes: 1 }, refs: {} })
+    // Where the shell ends the body at the same line, refs after it are read.
+    expect(commandOutcomes("git commit -m \"$(cat <<'EOF'\nfix: a\n\nWHY\nEOF\n)\" && git push -u origin feat/x")).toEqual({ counts: { commits: 1, pushes: 1 }, refs: { push_ref: 'feat/x' } })
+    expect(commandOutcomes("git commit -F - <<'MSG'\nfix\nMSG\ngit push origin main")).toEqual({ counts: { commits: 1, pushes: 1 }, refs: { push_ref: 'main' } })
+    expect(commandOutcomes('cat <<EOF >f; git tag v1\nbody\nEOF')).toEqual({ counts: { tags: 1 }, refs: { tag_name: 'v1' } })
+  })
+
   test('a ref never starts at a separator, so no word of the next command is one', () => {
     expect(commandOutcomes('git push origin |grep password')).toEqual({ counts: { pushes: 1 }, refs: {} })
     expect(commandOutcomes('git push origin ;curl secret-host')).toEqual({ counts: { pushes: 1 }, refs: {} })
@@ -266,6 +290,10 @@ describe('commandOutcomes, beyond the cases', () => {
       `echo ${"$'\\".repeat(mb / 3)}`,
       `${'<<a '.repeat(mb / 4)}`,
       `git push origin ${'"a;b"'.repeat(mb / 5)}`,
+      `${'x <<A '.repeat(mb / 6)}\nB\n`,
+      `git push origin a ${"<<'MSG'\nWHERE\n".repeat(mb / 14)}`,
+      `${"cat <<EOF # it's\n  EOF\n".repeat(mb / 22)}`,
+      `cat <<${'A'.repeat(mb / 2)}\n${'A'.repeat(mb / 2 - 1)}B\n`,
     ]
     const started = Date.now()
     for (const input of inputs) commandOutcomes(input)

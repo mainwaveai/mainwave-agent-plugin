@@ -612,8 +612,12 @@ const isQuote = (c: string | undefined) => c === '"' || c === "'"
  * end, in the order a backtracking engine tries them, after which a terminator line comes; the body is then up to the first one. The
  * scanner computes, from the right, the end that order finds from each position (`tail`), so each heredoc costs constant time once
  * the tables are built, where the pattern itself could backtrack without bound.
+ *
+ * `strict` leaves in place each heredoc whose body the shell reads otherwise: one whose tag the shell reads as a longer word or with
+ * unpaired quotes, one whose opener's line runs past a newline (a quote opened on it), and one whose terminator line is not exactly
+ * its own tag (with leading tabs only after `<<-`). Each check reads the tag once, so the pass stays linear.
  */
-function cutHeredocs(text: string, anyTag: boolean): string {
+function cutHeredocs(text: string, anyTag: boolean, strict = false): string {
   if (!text.includes('<<')) return text
   const n = text.length
   /** The end of a tag at `i`, or -1. */
@@ -635,8 +639,9 @@ function cutHeredocs(text: string, anyTag: boolean): string {
   }
   // From the right: the first terminator line at or after each position; the close of a double-quoted string opened just before each
   // position (`\\.` takes no newline here); the next single quote; and where the rest of an opener's line, read from each position,
-  // ends in the first end a terminator follows.
+  // ends in the first end a terminator follows; and the next newline.
   const term = new Int32Array(n + 1).fill(-1)
+  const nl = new Int32Array(n + 1).fill(n)
   const dq = new Int32Array(n + 2).fill(-1)
   const sq = new Int32Array(n + 2).fill(-1)
   const tail = new Int32Array(n + 1).fill(-1)
@@ -645,6 +650,7 @@ function cutHeredocs(text: string, anyTag: boolean): string {
     term[i] = c === '\n' && terminatorEnd(i) >= 0 ? i : term[i + 1]!
     dq[i] = c === '"' ? i : c === '\\' ? (i + 1 < n && text[i + 1] !== '\n' ? dq[i + 2]! : -1) : dq[i + 1]!
     sq[i] = c === "'" ? i : sq[i + 1]!
+    nl[i] = c === '\n' ? i : nl[i + 1]!
   }
   const bodyFrom = (e: number): boolean => text[e] === '\n' && term[e]! >= 0
   for (let i = n - 1; i >= 0; i--) {
@@ -663,21 +669,26 @@ function cutHeredocs(text: string, anyTag: boolean): string {
     const at = a === 0 && from === 0 ? 0 : a - 1
     if (at < from || (at !== a && text[at] === '<')) continue
     let p = a + 2
-    if (text[p] === '-') p++
+    const tabs = text[p] === '-'
+    if (tabs) p++
     while (text[p] === ' ' || text[p] === '\t') p++
-    if (isQuote(text[p])) p++
+    const open = isQuote(text[p]) ? text[p] : ''
+    if (open) p++
+    const tagFrom = p
     p = tagEnd(p)
     if (p < 0) continue
-    if (isQuote(text[p])) p++
-    let rest = ''
+    const tag = text.slice(tagFrom, p)
+    const close = isQuote(text[p]) ? text[p] : ''
+    if (close) p++
+    if (strict && (open !== close || !SHELL_WORD_END.test(text[p] ?? ''))) continue
     let e = -1
     const c = text[p]
-    if (c !== undefined && !/[A-Za-z0-9_\n"']/.test(c) && tail[p + 1]! >= 0) {
-      e = tail[p + 1]!
-      rest = text.slice(p, e)
-    } else if (bodyFrom(p)) e = p
+    if (c !== undefined && !/[A-Za-z0-9_\n"']/.test(c) && tail[p + 1]! >= 0) e = tail[p + 1]!
+    else if (bodyFrom(p)) e = p
     if (e < 0) continue
     const end = terminatorEnd(term[e]!)
+    if (strict && (nl[p]! < e || !isOwnTerminator(text, term[e]! + 1, end, tag, tabs))) continue
+    const rest = text.slice(p, e)
     out += text.slice(copied, at) + (at === a ? '' : text[at]) + '_' + rest + (text[end - 1] === '\n' ? '\n' : '')
     copied = from = end
     if (end >= n) break
@@ -686,7 +697,19 @@ function cutHeredocs(text: string, anyTag: boolean): string {
   return out + text.slice(copied)
 }
 
-const withoutHeredocs = (command: string) => (command.includes('<<') ? cutHeredocs(cutHeredocs(command, false), true) : command)
+/** A character that ends the shell's word, or the end of the text: a heredoc tag followed by anything else is a longer word. */
+const SHELL_WORD_END = /^(?:[\s;&|<>()]|)$/
+
+/** Whether the line from `from` to `end` (past its newline, or the text's end) is exactly `tag`, after leading tabs where `tabs`. */
+function isOwnTerminator(text: string, from: number, end: number, tag: string, tabs: boolean): boolean {
+  let i = from
+  if (tabs) while (text[i] === '\t') i++
+  const stop = text[end - 1] === '\n' ? end - 1 : end
+  return stop - i === tag.length && text.startsWith(tag, i)
+}
+
+const withoutHeredocs = (command: string, strict = false) =>
+  command.includes('<<') ? cutHeredocs(cutHeredocs(command, false, strict), true, strict) : command
 const groups = (g: unknown[], order: readonly number[]) => order.map(i => (typeof g[i] === 'string' ? g[i] : '')).join('')
 
 /** A command's executable text, as Mainwave reads it: heredoc bodies, quoted strings holding a separator or a newline, and comments cut. */
@@ -696,18 +719,21 @@ export function executableText(command: string): string {
 
 /** An ANSI-C string (`$'…'`) holding an escaped quote, which the quoted-string pass reads as ending at that quote. */
 const ANSI_C_ESCAPED_QUOTE = /\$'(?:[^'\\]|\\[^'])*\\'/
-/** A heredoc operator the heredoc pass left in place: a tag with a lower-case letter, or one with no terminator line. */
+/**
+ * A heredoc operator the heredoc pass left in place: a tag with a lower-case letter, or one with no terminator line, or, in the strict
+ * pass, one whose body the shell may read otherwise.
+ */
 const HEREDOC_LEFT = /(^|[^<])<<-?[\t ]*[^\s<>&|;()]/
 
 /**
  * The text refs are read from: the executable text, but for each quoted string cut leaving a closed pair (`""`, `''`) where the
  * executable text leaves its opening quote alone, which the shell's word rules would pair with the next string's opening quote. The
- * separators outside quotes are the same, so it holds the same invocations, in the same order. It ends at a heredoc operator the
- * heredoc pass left in place, as what follows may be its body, and is empty for a command holding an ANSI-C string with an escaped
- * quote, where the quoted-string pass pairs quotes as the shell does not.
+ * separators outside quotes are the same, so it holds the same invocations, in the same order. Its heredoc pass is strict, and it
+ * ends at a heredoc operator that pass left in place, as what follows may be its body. It is empty for a command holding an ANSI-C
+ * string with an escaped quote, where the quoted-string pass pairs quotes as the shell does not.
  */
 function refText(command: string): string {
-  const text = withoutHeredocs(command)
+  const text = withoutHeredocs(command, true)
   if (ANSI_C_ESCAPED_QUOTE.test(text)) return ''
   const r = text.replace(QUOTED_TEXT, (_m, ...g: unknown[]) => groups(g, [0, 0, 1, 2, 2, 3, 4, 5]))
   const heredoc = HEREDOC_LEFT.exec(r)
