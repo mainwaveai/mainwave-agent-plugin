@@ -16,7 +16,7 @@ export const DEFAULT_TIMEOUT_MS = 5_000
 export type FetchOutcome =
   | { ok: true; status: number; headers: Record<string, string>; text: string }
   /** The host answered with a status outside 2xx. */
-  | { ok: false; reason: 'status'; status: number; text: string }
+  | { ok: false; reason: 'status'; status: number; headers: Record<string, string>; text: string }
   /** No answer within the limit. */
   | { ok: false; reason: 'timeout' }
   /** The session the request was made for ended first, or had already ended. */
@@ -65,7 +65,7 @@ export async function fetchWithin($: EngineInterface, url: string, init: HttpIni
   try {
     sent = $.http.fetch(url, request).then(
       (res): FetchOutcome =>
-        res.ok ? { ok: true, status: res.status, headers: res.headers, text: res.text } : { ok: false, reason: 'status', status: res.status, text: res.text },
+        res.ok ? { ok: true, status: res.status, headers: res.headers, text: res.text } : { ok: false, reason: 'status', status: res.status, headers: res.headers, text: res.text },
       (): FetchOutcome => ({ ok: false, reason: 'failed' }),
     )
   } catch {

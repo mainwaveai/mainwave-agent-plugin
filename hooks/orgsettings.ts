@@ -7,18 +7,19 @@
 // no record. It goes in a POST body, so no request log keeps the address. Mainwave answers only for an organization and email its
 // keyless ingest would route, and refuses the rest as keyless ingest does (403 `unclaimed` or `email_domain`).
 //
-// The answer goes into the store as it came: `data_points` under `dataPoints` (gate.ts, `OVERRIDES_KEY`), the explicit settings that
-// win over everything else; `redaction_packs` under `redactionPacks` (`PACKS_KEY`), the organization's packs, with those of its
-// managed settings and the person's added. Beside them, `dataCollectionSettings` says whose they are, so they apply to that
-// organization's sessions alone.
+// The answer goes to the gate: `data_points` as the explicit settings that win over everything else (`setOverrides`), and
+// `redaction_packs` as the organization's packs, with those of its managed settings and the person's added (`setOrgPacks`). It is kept
+// in the store under one key, `dataCollectionSettings`, as it came and with the organization it is for, written whole in one write, so
+// a store is never left holding one organization's data points beside another's packs or name.
 //
 // What applies, in order:
 //   - this load's answer, for the session's organization;
 //   - else what the store keeps for that organization (the last answer an earlier session had);
 //   - else nothing: the gate's defaults, required and metadata data points only, and the packs of managed settings or the default.
-// Until a row names the organization, no answer kept for one applies. Settings in the store that name no organization (written by
-// hand, as the tests and the end-to-end comparison do) apply to any session until an answer replaces them: the store is a file the
-// person can edit, so a convenience, not a control.
+// Until a row names the organization, no answer kept for one applies. Settings written by hand under `dataPoints` and `redactionPacks`
+// (as the tests and the end-to-end comparison do) apply to any session while the store keeps no answer: the store is a file the person
+// can edit, so a convenience, not a control. A store that can't be read applies nothing of the organization's, and holds identifier
+// and content values back, as the packs chosen are not known.
 //
 // Fail open: a request that fails, times out or is refused leaves the settings in force as they were, and the plugin asks again
 // later. Nothing here holds a row, a turn or a tool call: the request goes from a timer, never from a hook.
@@ -44,8 +45,10 @@ export function settingsUrlOf(collector: string): string {
   return `${API_OF[base] ?? base}${SETTINGS_PATH}`
 }
 
-/** Where the store says whose the settings under `dataPoints` and `redactionPacks` are: `{ organizationId, revision }`. */
-export const META_KEY = 'dataCollectionSettings'
+/** Where the store keeps the last answer: `{ organizationId, revision, dataPoints, redactionPacks }`, the last two as they came. */
+export const SETTINGS_KEY = 'dataCollectionSettings'
+/** The longest wait a `Retry-After` may ask for. */
+const MAX_RETRY_AFTER_MS = 60 * 60_000
 
 /** How often the settings are asked for again while a session runs: within the five minutes the settings page promises. */
 export const REFRESH_MS = 4 * 60_000
@@ -85,6 +88,14 @@ export function settingsOf(text: string): OrgSettings | null {
 /** What one request came to, for the next try and the debug line: never the email. */
 export type Outcome = 'ok' | 'invalid' | 'timeout' | 'failed' | 'stopped' | `${number}` | `403 ${string}`
 
+/** How long a 429 asks the caller to wait (`Retry-After`, in seconds), at most an hour; 0 when it names no number of seconds. */
+export function retryAfterOf(r: FetchOutcome): number {
+  if (r.ok || r.reason !== 'status' || r.status !== 429) return 0
+  const raw = Object.entries(r.headers ?? {}).find(([k]) => k.toLowerCase() === 'retry-after')?.[1]
+  const seconds = raw !== undefined && /^\s*\d+\s*$/.test(raw) ? Number(raw) : 0
+  return Math.min(seconds * 1000, MAX_RETRY_AFTER_MS)
+}
+
 function outcomeOf(r: FetchOutcome): Outcome {
   if (r.ok) return 'ok'
   if (r.reason !== 'status') return r.reason
@@ -101,10 +112,12 @@ function outcomeOf(r: FetchOutcome): Outcome {
 
 /**
  * How long to wait before asking again after an outcome: the refresh interval after an answer, and after a refusal that says no more
- * time will change this load (403, 404, 422, any other 4xx; a 429 too, as the organization's budget is shared by all its sessions);
- * after one that can pass (no network, a timeout, a 5xx, an answer of the wrong shape), `RETRY_MS`, doubling up to the interval.
+ * time will change this load (403, 404, 422, any other 4xx; a 429 too, as the organization's budget is shared by all its sessions, or
+ * longer where its `Retry-After` says so); after one that can pass (no network, a timeout, a 5xx, an answer of the wrong shape),
+ * `RETRY_MS`, doubling up to the interval.
  */
-export function nextWait(outcome: Outcome, lastWait: number): number {
+export function nextWait(outcome: Outcome, lastWait: number, retryAfterMs = 0): number {
+  if (outcome === '429') return Math.max(REFRESH_MS, retryAfterMs)
   if (outcome === 'ok' || outcome.startsWith('4')) return REFRESH_MS
   if (outcome === 'stopped') return RETRY_MS
   return Math.min(Math.max(lastWait * 2, RETRY_MS), REFRESH_MS)
@@ -117,6 +130,7 @@ let email: string | undefined
 /** This load's last answer, and whose it is. */
 let fetched: (OrgSettings & { org: string }) | undefined
 let last: Outcome | undefined
+let retryAfterMs = 0
 let wait = 0
 let timer: Timer | null = null
 let inflight = false
@@ -131,6 +145,7 @@ export function resetOrgSettings(): void {
   email = undefined
   fetched = undefined
   last = undefined
+  retryAfterMs = 0
   wait = 0
   inflight = false
   copying = () => true
@@ -139,44 +154,44 @@ export function resetOrgSettings(): void {
 /**
  * The organization's settings in force for the session, from this load's answer or the store, applied to the gate: the explicit
  * settings per data point, and the organization's packs. Read once per load, again before each send and at session end, so an answer
- * another session wrote reaches this one too. A store that can't be read leaves the explicit settings held, and holds identifier and
- * content values back, as the packs chosen are not known.
+ * another session wrote reaches this one too. Each call sets both, so nothing an earlier organization's settings put in force outlives
+ * a call. A store that can't be read applies none of the organization's data points, and holds identifier and content values back, as
+ * the packs chosen are not known.
  */
 export async function applyStoredSettings($: EngineInterface): Promise<void> {
   const read = (key: string) => $.store.get(key).then(v => ({ ok: true as const, v }), () => ({ ok: false as const }))
-  const [points, packs, meta] = await Promise.all([read(OVERRIDES_KEY), read(PACKS_KEY), read(META_KEY)])
+  const [kept, points, packs] = await Promise.all([read(SETTINGS_KEY), read(OVERRIDES_KEY), read(PACKS_KEY)])
   // Decided after the reads, against the organization as it is then: a row that named it while they ran counts.
   const answer = fetched !== undefined && fetched.org === org ? fetched : undefined
+  let overrides: Overrides = {}
+  let choice: PackChoice = undefined
   if (answer !== undefined) {
-    setOverrides(overridesOf(answer.dataPoints))
-    setOrgPacks('settings', packsOf(answer.redactionPacks))
-    return
+    overrides = overridesOf(answer.dataPoints)
+    choice = packsOf(answer.redactionPacks)
+  } else if (!kept.ok) {
+    choice = 'unreadable'
+  } else if (kept.v !== undefined && kept.v !== null) {
+    // An answer kept for an organization: for its sessions alone. One of the wrong shape: for none.
+    const k = isObject(kept.v) ? kept.v : {}
+    if (isOrgId(k['organizationId']) && k['organizationId'] === org) {
+      overrides = overridesOf(k['dataPoints'])
+      choice = packsOf(k['redactionPacks'])
+    }
+  } else {
+    // No answer kept: settings written by hand, for any session.
+    overrides = points.ok ? overridesOf(points.v) : {}
+    choice = packs.ok ? packsOf(packs.v) : 'unreadable'
   }
-  if (!meta.ok) {
-    setOrgPacks('settings', 'unreadable')
-    return
-  }
-  const owner = isObject(meta.v) ? meta.v['organizationId'] : undefined
-  // Kept for an organization: for its sessions alone. Kept for none (by hand): for any.
-  const applies = meta.v === undefined || meta.v === null || (isOrgId(owner) && owner === org)
-  const overrides: Overrides = applies && points.ok ? overridesOf(points.v) : {}
-  if (points.ok || !applies) setOverrides(overrides)
-  const choice: PackChoice = !applies ? undefined : packs.ok ? packsOf(packs.v) : 'unreadable'
+  setOverrides(overrides)
   setOrgPacks('settings', choice)
 }
 
-/**
- * Keeps an answer: the store's three keys rewritten, whose first, removed while the others change, so a store left half written
- * names no organization's settings it does not hold. A write that fails removes what it can; the answer still applies this load.
- */
+/** Keeps an answer, whole, in one write. A write that fails leaves the store as it was; the answer still applies this load. */
 async function keep($: EngineInterface, forOrg: string, s: OrgSettings): Promise<void> {
   try {
-    await $.store.delete(META_KEY)
-    await $.store.set(OVERRIDES_KEY, s.dataPoints)
-    await $.store.set(PACKS_KEY, s.redactionPacks)
-    await $.store.set(META_KEY, { organizationId: forOrg, revision: s.revision })
+    await $.store.set(SETTINGS_KEY, { organizationId: forOrg, revision: s.revision, dataPoints: s.dataPoints, redactionPacks: s.redactionPacks })
   } catch {
-    await Promise.all([OVERRIDES_KEY, PACKS_KEY, META_KEY].map(k => $.store.delete(k).catch(() => undefined)))
+    // The next answer is kept instead.
   }
 }
 
@@ -188,14 +203,16 @@ export async function fetchNow($: EngineInterface, collector: string): Promise<O
   if (inflight || org === undefined || email === undefined) return undefined
   inflight = true
   const forOrg = org
+  const forEmail = email
   try {
     const r = await fetchWithin($, settingsUrlOf(collector), {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ claude_org_id: forOrg, email }),
+      body: JSON.stringify({ claude_org_id: forOrg, email: forEmail }),
       timeoutMs: FETCH_TIMEOUT_MS,
     })
     let outcome = outcomeOf(r)
+    retryAfterMs = retryAfterOf(r)
     const settings = r.ok ? settingsOf(r.text) : null
     if (r.ok && settings === null) outcome = 'invalid'
     // An answer for an organization the session no longer names is let go: the next try asks for the one it names.
@@ -224,13 +241,13 @@ function schedule($: EngineInterface, collector: string, ms: number): void {
       timer = null
       // The copy turned off (a repository named the key option): nothing is sent, so nothing is asked, until the plugin loads again.
       if (!copying()) return
-      const asked = org
+      const asked = `${org} ${email}`
       void fetchNow($, collector).then(outcome => {
         // Not asked (a request already out, or nothing to ask with): the request out schedules the next.
         if (outcome === undefined) return
-        wait = nextWait(outcome, wait)
-        // The session named another organization while it asked: ask again for that one at once.
-        if (timer === null) schedule($, collector, asked === org ? wait : 0)
+        wait = nextWait(outcome, wait, retryAfterMs)
+        // The session named another organization or email while it asked: ask again for those at once.
+        if (timer === null) schedule($, collector, asked === `${org} ${email}` ? wait : 0)
       }, () => undefined)
     })
   } catch {

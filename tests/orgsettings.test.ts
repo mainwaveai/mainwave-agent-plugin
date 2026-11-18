@@ -26,9 +26,9 @@ const answer = (dataPoints: Record<string, string>, packs: string[] = ['secrets'
   }),
 })
 
-function world(on: On, opts: { settings?: (n: number, post: Post) => Reply; store?: Record<string, unknown>; layers?: Layers; env?: Record<string, string>; down?: () => boolean } = {}) {
+function world(on: On, opts: { settings?: (n: number, post: Post) => Reply | Promise<Reply>; store?: Record<string, unknown>; layers?: Layers; env?: Record<string, string>; down?: () => boolean; unreadable?: string } = {}) {
   const clock = mock.clock(on, { now: START })
-  const store = memoryStore(on, opts.store)
+  const store = memoryStore(on, opts.store, opts.unreadable)
   const posts = network(on, (_n, post) => {
     if (opts.down?.()) return { status: 503 }
     const a = keylessAnswer(post)
@@ -156,6 +156,8 @@ describe('asking Mainwave', () => {
     expect(nextWait('ok', 0)).toBe(REFRESH_MS)
     expect(nextWait('403 unclaimed', 0)).toBe(REFRESH_MS)
     expect(nextWait('429', 0)).toBe(REFRESH_MS)
+    expect(nextWait('429', 0, 10 * 60_000)).toBe(10 * 60_000)
+    expect(nextWait('429', 0, 5_000)).toBe(REFRESH_MS)
     expect(nextWait('503', 0)).toBe(RETRY_MS)
     expect(nextWait('timeout', RETRY_MS)).toBe(2 * RETRY_MS)
     expect(nextWait('failed', REFRESH_MS)).toBe(REFRESH_MS)
@@ -173,9 +175,10 @@ describe('the answer', () => {
     await clock.advance(TICK)
     expect(sent(posts, 'tool_decision')[0]).not.toHaveProperty('decision')
     expect(sent(posts, 'user_prompt')[0]!['prompt']).toBe('mail [REDACTED:pii.contact.email]')
-    expect(store.data.get('dataPoints')).toEqual({ 'tool.call': 'off', 'prompt.text': 'on' })
-    expect(store.data.get('redactionPacks')).toEqual(['secrets', 'pii.contact'])
-    expect(store.data.get('dataCollectionSettings')).toEqual({ organizationId: ORG, revision: 3 })
+    // Kept whole, in one write, with the organization it is for.
+    expect(store.sets.filter(s => !s.key.startsWith('outbox:'))).toEqual([
+      { key: 'dataCollectionSettings', value: { organizationId: ORG, revision: 3, dataPoints: { 'tool.call': 'off', 'prompt.text': 'on' }, redactionPacks: ['secrets', 'pii.contact'] } },
+    ])
   })
 
   test('content captured before the first answer stays out: until then, the defaults', keyless, async ($, on) => {
@@ -197,10 +200,9 @@ describe('the answer', () => {
     await row($, 'api_request', { cost_usd: 0.1 })
     await clock.advance(1)
     await prompt($, 'captured under revision 1')
-    expect(store.data.get('dataCollectionSettings')).toEqual({ organizationId: ORG, revision: 1 })
+    expect(store.data.get('dataCollectionSettings')).toMatchObject({ organizationId: ORG, revision: 1 })
     await clock.advance(REFRESH_MS)
-    expect(store.data.get('dataCollectionSettings')).toEqual({ organizationId: ORG, revision: 2 })
-    expect(store.data.get('dataPoints')).toEqual({ 'prompt.text': 'off' })
+    expect(store.data.get('dataCollectionSettings')).toEqual({ organizationId: ORG, revision: 2, dataPoints: { 'prompt.text': 'off' }, redactionPacks: ['secrets'] })
     down = false
     const before = posts.length
     await clock.advance(2 * 60_000)
@@ -271,7 +273,7 @@ describe('the answer', () => {
 })
 
 describe('what the store keeps', () => {
-  const kept = (org: string) => ({ dataPoints: { 'prompt.text': 'on' }, redactionPacks: ['secrets', 'pii.contact'], dataCollectionSettings: { organizationId: org, revision: 2 } })
+  const kept = (org: string) => ({ dataCollectionSettings: { organizationId: org, revision: 2, dataPoints: { 'prompt.text': 'on' }, redactionPacks: ['secrets', 'pii.contact'] } })
 
   test("the organization's last answer applies while Mainwave cannot be reached", keyless, async ($, on) => {
     const { clock, posts } = world(on, { settings: () => ({ status: 503 }), store: kept(ORG) })
@@ -304,7 +306,37 @@ describe('what the store keeps', () => {
     await prompt($, 'hidden')
     await clock.advance(TICK)
     expect(sent(posts, 'user_prompt').map(r => r['prompt'])).toEqual(['shown', '<REDACTED>'])
-    expect(store.data.get('dataPoints')).toEqual({ 'prompt.text': 'off' })
+    expect(store.data.get('dataCollectionSettings')).toMatchObject({ organizationId: ORG, dataPoints: { 'prompt.text': 'off' } })
+  })
+
+  test('an answer that arrives after the session moved to another organization is let go, and the new one is asked for at once', keyless, async ($, on) => {
+    let release: (r: Reply) => void = () => undefined
+    const late = new Promise<Reply>(r => (release = r))
+    const { clock, posts, store } = world(on, { settings: (_n, post) => (JSON.parse(post.body).claude_org_id === ORG ? late : { status: 503 }) })
+    await prompt($, 'a')
+    await clock.advance(1)
+    expect(posts.settings.length).toBe(1)
+    const other = { ...COMMON, 'organization.id': ORG_B, 'user.email': EMAIL_B }
+    await prompt($, 'b', other)
+    await clock.advance(1)
+    release(answer({ 'prompt.text': 'on' }))
+    await clock.settle()
+    await clock.advance(1)
+    // Asked for the second organization at once, not a refresh later.
+    expect(posts.settings.map(p => JSON.parse(p.body).claude_org_id)).toEqual([ORG, ORG_B])
+    await prompt($, 'c', other)
+    await clock.advance(TICK)
+    expect(sent(posts, 'user_prompt').map(r => r['prompt'])).toEqual(['<REDACTED>', '<REDACTED>', '<REDACTED>'])
+    expect(store.data.get('dataCollectionSettings')).toBeUndefined()
+  })
+
+  test('a store that cannot be read applies nothing of the organization\'s, and holds content back', keyless, async ($, on) => {
+    const { clock, posts } = world(on, { settings: () => ({ status: 503 }), unreadable: 'dataCollectionSettings' })
+    await prompt($, 'held')
+    await decision($)
+    await clock.advance(TICK)
+    expect(sent(posts, 'user_prompt')[0]).not.toHaveProperty('prompt')
+    expect(sent(posts, 'tool_decision')[0]!['decision']).toBe('accept')
   })
 
   test('a session that moves to another organization drops the first one\'s settings and asks for its own', keyless, async ($, on) => {
@@ -313,13 +345,16 @@ describe('what the store keeps', () => {
     })
     await prompt($, 'a')
     await clock.advance(1)
+    // The first organization's answer is in force, and its record sent under it.
+    await prompt($, 'a, after its answer')
+    await clock.advance(TICK)
     const other = { ...COMMON, 'organization.id': ORG_B, 'user.email': EMAIL_B }
     await prompt($, 'b', other)
     await clock.advance(1)
     await prompt($, 'c', other)
     await clock.advance(TICK)
     expect(posts.settings.map(p => JSON.parse(p.body))).toEqual([{ claude_org_id: ORG, email: EMAIL }, { claude_org_id: ORG_B, email: EMAIL_B }])
-    expect(sent(posts, 'user_prompt').map(r => r['prompt'])).toEqual(['<REDACTED>', '<REDACTED>', '<REDACTED>'])
+    expect(sent(posts, 'user_prompt').map(r => r['prompt'])).toEqual(['<REDACTED>', 'a, after its answer', '<REDACTED>', '<REDACTED>'])
   })
 })
 

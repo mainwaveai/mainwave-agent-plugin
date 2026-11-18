@@ -201,15 +201,15 @@ export function resetPacks(): void {
 }
 
 /**
- * Where explicit settings per data point are kept, in the plugin's store: `{ "<data point>": "on" | "off" | "claude" }`. The
- * organization's settings from Mainwave are kept here (orgsettings.ts), as they came. A file the person can edit, so a convenience,
- * not a control.
+ * Where explicit settings per data point are kept, in the plugin's store: `{ "<data point>": "on" | "off" | "claude" }`, written by
+ * hand: it applies while the store keeps no answer from Mainwave (orgsettings.ts, `SETTINGS_KEY`). A file the person can edit, so a
+ * convenience, not a control.
  */
 export const OVERRIDES_KEY = 'dataPoints'
 
 /**
  * Where the organization's choice of packs is kept, in the plugin's store, beside `OVERRIDES_KEY`: a value of the packs option's shape
- * (`packsOf`). The packs in the organization's data collection settings from Mainwave are kept here (orgsettings.ts), as they came. It
+ * (`packsOf`), written by hand: it applies while the store keeps no answer from Mainwave, whose packs apply instead (orgsettings.ts). It
  * is read once per load and again before each send (sender.ts, `readOptions`), so a value written mid-session applies to records
  * already queued.
  */

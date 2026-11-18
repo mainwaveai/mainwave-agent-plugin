@@ -137,14 +137,15 @@ const SETTINGS_OFF: Reply = { status: 404, text: '{"detail":"Not Found"}' }
 /**
  * The network beneath the plugin: records every request and answers each as `reply` says (200 when not given). With `only`, a
  * request to any other URL is answered 200 and kept in `others` instead, so `posts` and `reply`'s count see the named URLs alone. A
- * request for the organization's settings is kept in `settings` and answered by `settings` (404, the route off, when not given), so
+ * request for the organization's settings is kept in `settings` and answered by `settings`, at once or when its promise settles (404,
+ * the route off, when not given), so
  * neither `posts` nor `reply`'s count sees it.
  */
 export function network(
   on: On,
   reply: (n: number, post: Post) => Reply = () => ({ status: 200 }),
   only?: (url: string) => boolean,
-  settings: (n: number, post: Post) => Reply = () => SETTINGS_OFF,
+  settings: (n: number, post: Post) => Reply | Promise<Reply> = () => SETTINGS_OFF,
 ): Post[] & { others: Post[]; settings: Post[] } {
   const posts = Object.assign([] as Post[], { others: [] as Post[], settings: [] as Post[] })
   const answer = (r: Reply) => {
@@ -157,7 +158,7 @@ export function network(
     const post: Post = { url: req.url, method: req.init?.method, headers: { ...(req.init?.headers ?? {}) }, body: String(req.init?.body ?? '') }
     if (req.url === SETTINGS_URL) {
       posts.settings.push(post)
-      return answer(settings(posts.settings.length, post))
+      return answer(await settings(posts.settings.length, post))
     }
     if (only && !only(req.url)) {
       posts.others.push(post)
@@ -211,12 +212,16 @@ export function records(post: Post): SentRecord[] {
   return out
 }
 
-/** `$.store` beneath the plugin: a map in memory that records each write. */
-export function memoryStore(on: On, entries: Record<string, unknown> = {}) {
+/** `$.store` beneath the plugin: a map in memory that records each write. A read of `unreadable` fails. */
+export function memoryStore(on: On, entries: Record<string, unknown> = {}, unreadable?: string) {
   const data = new Map<string, unknown>(Object.entries(entries))
   const sets: { key: string; value: unknown }[] = []
   const deletes: string[] = []
-  on('store.get', async (_$, e) => ({ value: data.get((e as unknown as { key: string }).key) }) as never)
+  on('store.get', async (_$, e) => {
+    const key = (e as unknown as { key: string }).key
+    if (key === unreadable) throw new Error(`store.get ${key} refused in test`)
+    return { value: data.get(key) } as never
+  })
   on('store.set', async (_$, e) => {
     const w = e as unknown as { key: string; value: unknown }
     const value = JSON.parse(JSON.stringify(w.value)) as unknown

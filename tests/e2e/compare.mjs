@@ -26,8 +26,9 @@
 // The plugin asks Mainwave for its organization's data collection settings once the rows name the organization and email; the
 // test-only hooks send that request to the receiver too, which answers as Mainwave's settings API would. Only the keyless pass's rows
 // name an email, so only it asks: the receiver answers with settings that turn a metadata data point off (`file.kind`) and add a
-// redaction pack, and the pass checks the request carried the organization and email alone, that the answer was kept in the store,
-// and that the copy went without the data point turned off, records captured before the answer included.
+// redaction pack, and the pass checks the request carried the organization and email alone, that the answer was kept in the store with
+// its organization, and that the copy went without the data point turned off. (The pass sends no content, so the pack is checked as
+// kept, not as run: the unit tests run it.)
 //
 // The mock model answers each request after a different delay (300 to 900 ms), so a request paired with the wrong step, or timed
 // from the wrong start, lands outside the tolerance; and it refuses one request once as overloaded, so Claude Code retries it. The
@@ -862,7 +863,7 @@ function checkKeyless(pass, { captured, run, config }, reference) {
   ]
   for (const [what, ok] of expectations) if (!ok) problems.push(`defaults: no ${what} was sent`)
 
-  // The organization's settings: asked for with the organization and email alone, kept in the store as they came, and applied to the
+  // The organization's settings: asked for with the organization and email alone, kept in the store with the organization, and applied to the
   // copy, the records captured before the answer included.
   if (captured.settings.length === 0) problems.push('settings: the plugin never asked for its organization\'s settings')
   for (const { headers, body } of captured.settings) {
@@ -881,7 +882,7 @@ function checkKeyless(pass, { captured, run, config }, reference) {
   } catch {
     problems.push('settings: the plugin kept no store')
   }
-  const keptWant = { dataPoints: SETTINGS.data_points, redactionPacks: SETTINGS.redaction_packs, dataCollectionSettings: { organizationId: ORG, revision: SETTINGS.revision } }
+  const keptWant = { dataCollectionSettings: { organizationId: ORG, revision: SETTINGS.revision, dataPoints: SETTINGS.data_points, redactionPacks: SETTINGS.redaction_packs } }
   for (const [k, v] of Object.entries(keptWant)) if (JSON.stringify(kept[k]) !== JSON.stringify(v)) problems.push(`settings: the store keeps ${k} as ${JSON.stringify(kept[k])}, not ${JSON.stringify(v)}`)
   const decisions = points.filter(p => p.name === 'claude_code.code_edit_tool.decision')
   if (decisions.length === 0) problems.push('settings: no code_edit_tool.decision point was sent')
