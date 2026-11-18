@@ -6,7 +6,7 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
 import { whoHash } from '../hooks/sender.ts'
-import { boot, EMAIL, IDEMPOTENCY_KEY, itemAttributes, KEY, keylessAnswer, LOGGED_AT, memoryStore, network, optInOption, ORG, type KeylessAnswer, type Layers, type Post, type Reply } from './rig.ts'
+import { boot, CAPTURES_ON, EMAIL, IDEMPOTENCY_KEY, itemAttributes, KEY, keylessAnswer, LOGGED_AT, memoryStore, network, optInOption, ORG, type KeylessAnswer, type Layers, type Post, type Reply } from './rig.ts'
 
 /** No options: the plugin's defaults, so no key, so keyless. */
 const keyless = { options: {} }
@@ -172,7 +172,7 @@ describe('a session without the env block, sending keyless', () => {
   })
 
   test("the session's own refusal (403 email_domain) stops its sending, keeps what was queued, and queues no more", keyless, async ($, on) => {
-    const { clock, posts, store, logs } = world(on, { refused: { [ORG]: 'email_domain' } })
+    const { clock, posts, store, logs } = world(on, { refused: { [ORG]: 'email_domain' }, store: { dataPoints: CAPTURES_ON } })
     await row($, 'user_prompt', { prompt: 'one', prompt_length: '3' })
     await clock.advance(TICK)
     for (let i = 0; i < 20; i++) await row($, 'user_prompt', { prompt: 'two', prompt_length: '3' })

@@ -23,8 +23,15 @@ export const CONTRACT: Record<string, (v: unknown) => boolean> = {
   // On the plugin's own copy only, where the person opted in to data points off by default: which, each once.
   'mainwave.telemetry.opt_in': v => typeof v === 'string' && v.split(',').every(id => OPT_IN_IDS.includes(id)) && new Set(v.split(',')).size === v.split(',').length,
 }
-/** The data points a person may opt in to: those the plugin sends no record of by default. */
-export const OPT_IN_IDS = ['mcp.url', 'skill.text', 'response.thinking']
+/** The data points a person may opt in to: those off by default, every identifier and every piece of content. */
+export const OPT_IN_IDS = ['repo', 'file.path', 'web.url', 'mcp.url', 'bash.command', 'tool.input', 'tool.result', 'skill.text', 'prompt.text', 'response.text', 'response.thinking']
+/**
+ * Explicit settings that turn on the identifiers and content Claude Code sends with Mainwave's org-wide setup captures on: as an
+ * organization's settings would. For tests of what goes where once a data point is on, not of the defaults.
+ */
+export const CAPTURES_ON = {
+  repo: 'on', 'file.path': 'on', 'web.url': 'on', 'bash.command': 'on', 'tool.input': 'on', 'tool.result': 'on', 'prompt.text': 'on', 'response.text': 'on',
+} as const
 /** The keys every stamped row carries. */
 export const STAMPED = ['mainwave.plugin.entrypoint', 'mainwave.plugin.name', 'mainwave.plugin.version', 'mainwave.telemetry.route']
 // mainwave.mod. is the old prefix: the plugin writes nothing there, so a key under it on a row is a violation.
