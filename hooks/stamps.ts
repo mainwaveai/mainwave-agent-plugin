@@ -6,6 +6,7 @@
 // that fails its rule, is dropped, never sent.
 
 import { DEFAULTS } from './catalog.ts'
+import { featurePrefixes } from './features.ts'
 
 /** The plugin's name on every row it stamps. */
 export const PLUGIN_NAME = 'mainwave'
@@ -66,7 +67,8 @@ export function entrypointOf(raw: unknown): string {
   return typeof raw === 'string' && ENTRYPOINTS.includes(raw) ? raw : 'other'
 }
 
-const owned = (key: string) => OWNED_PREFIXES.some(prefix => key.startsWith(prefix))
+// A feature's prefix is the plugin's too (features.ts): its keys are stripped from every row, the feature on or off, and only the feature adds them.
+const owned = (key: string) => OWNED_PREFIXES.some(prefix => key.startsWith(prefix)) || featurePrefixes().some(prefix => key.startsWith(prefix))
 
 /** The attributes without any key under an owned prefix, in their order. A key named `__proto__` stays a plain key. */
 export function stripOwned<V>(attributes: Readonly<Record<string, V>>): Record<string, V> {

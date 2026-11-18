@@ -302,6 +302,19 @@ A release bumps the version in both `.claude-plugin/plugin.json` and `hooks/vers
 | `hooks/sender.ts` | the copy: one queue for all three signals, the person's opt-in read again before each send, timer, batches (keyless, one organization and email each) and their idempotency keys, retries and the outbox kept in the store |
 | `hooks/otlp.ts` | the copy as OTLP/JSON (log records, spans, metric points), with the resource rebuilt as the exporter builds it |
 | `hooks/http.ts` | `fetchWithin`: a request with a time limit that ends with its session |
+| `hooks/features.ts` | the extension point: the list of features, their flags, and the calls the hooks make into them (see Adding a feature) |
+
+### Adding a feature
+
+A feature is a small addition that rides the plugin's own hooks. The engine loads one hooks module per plugin and hooks each event once per plugin, so a feature is never a module or a plugin of its own: it is compiled in, and ships with the plugin.
+
+1. Put it in `hooks/features/<name>/`. It registers nothing and exports a `Feature` (`hooks/features.ts`): its `name`, the attribute prefix it owns (`mainwave.<name>.`), `enabled(options)`, one shape rule per key it may stamp, and any of `observe(attributes, event)` (every collector row, as it came), `stamps(attributes, event)` (rows that name an organization), `steps` (the event of `session.start`, `turn.start`, `turn.step`, `turn.complete`, `tool.call`, `command.run`, `prompt.submit`, `agent.spawn`, `skill.prompt`, `session.end`) and `reset()`.
+2. Add it to `FEATURES` in `hooks/features.ts`, and its flag to `userConfig` in `.claude-plugin/plugin.json` (a boolean read once per load by `enabled`).
+3. A step that needs `$` is an exported top-level function of the feature whose first parameter is `$`. The engine lets a hook pass `$` only to a top-level function named at the call site, so `hooks/register.ts` calls it by name in the hook, in this one shape: `if (featureOn('<name>')) try { await <name>TurnStart($, e) } catch {}`.
+4. A key the feature keeps in `$.state` is declared in `types/index.d.ts` under `mainwave`; its stamp keys go in the test contract in `tests/rig.ts`.
+5. Its tests call its parts and the plugin's handlers directly: the engine loads the hooks module in an environment of its own, so a list a test configures never reaches the copy the engine registered.
+
+What holds for every feature: each call into it is in its own `try`, so one that throws is skipped and the plugin runs as without it; every key under its prefix is stripped from every row, on or off; its stamps go only on rows that name an organization, inside its prefix, past its rules; and it sends nothing the gate (What it sends) would not.
 
 ## License
 
