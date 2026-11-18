@@ -31,6 +31,8 @@ export const SWITCHES: readonly Switch[] = ['OTEL_LOG_TOOL_DETAILS', 'OTEL_LOG_T
 
 export type DataPoint = {
   id: DataPointId
+  /** What the settings page calls it. */
+  name: string
   class: DataClass
   /** No switch: Mainwave cannot route, join or count spend without it. */
   required?: true
@@ -45,38 +47,38 @@ export type DataPoint = {
 }
 
 export const CATALOG: readonly DataPoint[] = [
-  { id: 'session.identity', class: 'identifiers', required: true, description: 'Who sent the record: Claude organization, account, email, and the ID Claude Code keeps per installation', example: 'ana@example.com' },
-  { id: 'session.links', class: 'metadata', required: true, description: 'IDs that tie records together: session, prompt, request, tool call, trace and span', example: 'prompt.id 4f1c…' },
-  { id: 'session.client', class: 'metadata', required: true, description: "What ran the session (Claude Code version, entry point, Cowork surface, terminal, plan, provider, the plugin's version), and Claude Code's own event rows", example: 'remote_cowork, 2.1.322' },
-  { id: 'usage', class: 'metadata', required: true, description: 'Model, tokens, cost, request time, time to first token, effort, stop reason, query source; prompt, response, tool input and result sizes', example: 'claude-opus-5-5, 2,914 output tokens, $0.04' },
-  { id: 'tool.call', class: 'metadata', description: 'Each tool call: its name, duration, success and error class, and the permission decision and what made it', example: 'Edit, 412 ms, accepted by rule' },
-  { id: 'tool.mcp', class: 'metadata', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The MCP server and tool of each MCP call, and where the server was set up: user, project, managed, a plugin, or a claude.ai connector', example: 'remote-devices / device_bash' },
-  { id: 'skill.name', class: 'metadata', switch: 'OTEL_LOG_TOOL_DETAILS', description: "The skill used, third-party plugins' skills included", example: 'pdf' },
-  { id: 'agent.type', class: 'metadata', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The type of each subagent started, custom ones included', example: 'Explore' },
-  { id: 'command.name', class: 'metadata', description: 'The slash command run, not its arguments', example: 'compact' },
-  { id: 'bash.class', class: 'metadata', description: 'The kind and program of each shell command, in Bash or an MCP shell tool such as Cowork\'s device_bash', example: 'vcs / git' },
-  { id: 'bash.outcome', class: 'metadata', description: 'Commits, reverts, pushes, branches opened, merges, tags, workflow runs and pull requests opened, merged or updated by shell commands that succeeded, as counts', example: '1 commit, 1 push' },
-  { id: 'file.kind', class: 'metadata', description: 'The language of each file edited or written, from its extension', example: 'TypeScript' },
-  { id: 'web.domain', class: 'metadata', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The site of each page fetched', example: 'docs.python.org' },
-  { id: 'repo', class: 'identifiers', switch: 'OTEL_METRICS_INCLUDE_REPOSITORY', description: "The Git remote's address, owner and name, the branch and the commit, and the branch, ref or tag a shell command opened, pushed, merged or tagged", example: 'github.com/acme/api' },
-  { id: 'file.path', class: 'identifiers', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The path of each file read, edited or written', example: '/Users/ana/acme/api/src/login.ts' },
-  { id: 'web.url', class: 'identifiers', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The full address of each page fetched', example: 'https://docs.python.org/3/library/re.html' },
+  { id: 'session.identity', name: 'Who sent it', class: 'identifiers', required: true, description: 'Who sent the record: Claude organization, account, email, and the ID Claude Code keeps per installation', example: 'ana@example.com' },
+  { id: 'session.links', name: 'Record links', class: 'metadata', required: true, description: 'IDs that tie records together: session, prompt, request, tool call, trace and span', example: 'prompt.id 4f1c…' },
+  { id: 'session.client', name: 'Client and version', class: 'metadata', required: true, description: "What ran the session (Claude Code version, entry point, Cowork surface, terminal, plan, provider, the plugin's version), and Claude Code's own event rows", example: 'remote_cowork, 2.1.322' },
+  { id: 'usage', name: 'Usage and cost', class: 'metadata', required: true, description: 'Model, tokens, cost, request time, time to first token, effort, stop reason, query source; prompt, response, tool input and result sizes', example: 'claude-opus-5-5, 2,914 output tokens, $0.04' },
+  { id: 'tool.call', name: 'Tool calls', class: 'metadata', description: 'Each tool call: its name, duration, success and error class, and the permission decision and what made it', example: 'Edit, 412 ms, accepted by rule' },
+  { id: 'tool.mcp', name: 'MCP server and tool', class: 'metadata', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The MCP server and tool of each MCP call, and where the server was set up: user, project, managed, a plugin, or a claude.ai connector', example: 'remote-devices / device_bash' },
+  { id: 'skill.name', name: 'Skill', class: 'metadata', switch: 'OTEL_LOG_TOOL_DETAILS', description: "The skill used, third-party plugins' skills included", example: 'pdf' },
+  { id: 'agent.type', name: 'Subagent type', class: 'metadata', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The type of each subagent started, custom ones included', example: 'Explore' },
+  { id: 'command.name', name: 'Slash command', class: 'metadata', description: 'The slash command run, not its arguments', example: 'compact' },
+  { id: 'bash.class', name: 'Kind of shell command', class: 'metadata', description: 'The kind and program of each shell command, in Bash or an MCP shell tool such as Cowork\'s device_bash', example: 'vcs / git' },
+  { id: 'bash.outcome', name: 'What a command did', class: 'metadata', description: 'Commits, reverts, pushes, branches opened, merges, tags, workflow runs and pull requests opened, merged or updated by shell commands that succeeded, as counts', example: '1 commit, 1 push' },
+  { id: 'file.kind', name: 'File language', class: 'metadata', description: 'The language of each file edited or written, from its extension', example: 'TypeScript' },
+  { id: 'web.domain', name: 'Website', class: 'metadata', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The site of each page fetched', example: 'docs.python.org' },
+  { id: 'repo', name: 'Repository and branch', class: 'identifiers', switch: 'OTEL_METRICS_INCLUDE_REPOSITORY', description: "The Git remote's address, owner and name, the branch and the commit, and the branch, ref or tag a shell command opened, pushed, merged or tagged", example: 'github.com/acme/api' },
+  { id: 'file.path', name: 'File paths', class: 'identifiers', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The path of each file read, edited or written', example: '/Users/ana/acme/api/src/login.ts' },
+  { id: 'web.url', name: 'Web addresses', class: 'identifiers', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The full address of each page fetched', example: 'https://docs.python.org/3/library/re.html' },
   {
-    id: 'mcp.url', class: 'identifiers', needs: 'tool.mcp',
+    id: 'mcp.url', name: 'MCP server addresses', class: 'identifiers', needs: 'tool.mcp',
     description: "The MCP servers set up for the session, called or not: each one's name, where it was set up and its address, read from Claude's MCP settings. A remote server's address keeps scheme, host, port and path; a local server's is its command. Headers and environment variables are never read",
     example: 'https://mcp.example.com/mcp',
   },
-  { id: 'bash.command', class: 'content', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The full text of each shell command, in Bash or an MCP shell tool', example: 'git commit -m "fix login redirect"' },
-  { id: 'tool.input', class: 'content', switch: 'OTEL_LOG_TOOL_DETAILS', holds: ['bash.command', 'file.path', 'web.url'], description: "Each tool call's input: what an edit writes, search patterns, MCP arguments, subagent task prompts", example: '{"pattern":"login"}' },
-  { id: 'tool.result', class: 'content', switch: 'OTEL_LOG_TOOL_CONTENT', description: 'What each tool returned: command output, file contents read, MCP results, a failed call\'s error', example: '3 files changed, 41 insertions(+)' },
+  { id: 'bash.command', name: 'Shell commands', class: 'content', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The full text of each shell command, in Bash or an MCP shell tool', example: 'git commit -m "fix login redirect"' },
+  { id: 'tool.input', name: 'Tool input', class: 'content', switch: 'OTEL_LOG_TOOL_DETAILS', holds: ['bash.command', 'file.path', 'web.url'], description: "Each tool call's input: what an edit writes, search patterns, MCP arguments, subagent task prompts", example: '{"pattern":"login"}' },
+  { id: 'tool.result', name: 'Tool results', class: 'content', switch: 'OTEL_LOG_TOOL_CONTENT', description: 'What each tool returned: command output, file contents read, MCP results, a failed call\'s error', example: '3 files changed, 41 insertions(+)' },
   {
-    id: 'skill.text', class: 'content', needs: 'skill.name',
+    id: 'skill.text', name: 'Skill instructions', class: 'content', needs: 'skill.name',
     description: 'The instructions of each skill run, as Claude Code expanded them for the model with arguments filled in; sent once per session for each distinct text, later runs refer to it',
     example: 'Review the diff for correctness bugs…',
   },
-  { id: 'prompt.text', class: 'content', switch: 'OTEL_LOG_USER_PROMPTS', description: 'What the person typed, pastes expanded, slash command arguments included', example: 'Fix the login redirect on Safari' },
-  { id: 'response.text', class: 'content', switch: 'OTEL_LOG_ASSISTANT_RESPONSES', description: "The model's visible answers", example: 'Fixed: the redirect now keeps the query string.' },
-  { id: 'response.thinking', class: 'content', description: "The model's thinking text, where the API returns it", example: 'The redirect drops the query because…' },
+  { id: 'prompt.text', name: 'Prompts', class: 'content', switch: 'OTEL_LOG_USER_PROMPTS', description: 'What the person typed, pastes expanded, slash command arguments included', example: 'Fix the login redirect on Safari' },
+  { id: 'response.text', name: 'Responses', class: 'content', switch: 'OTEL_LOG_ASSISTANT_RESPONSES', description: "The model's visible answers", example: 'Fixed: the redirect now keeps the query string.' },
+  { id: 'response.thinking', name: 'Thinking', class: 'content', description: "The model's thinking text, where the API returns it", example: 'The redirect drops the query because…' },
 ]
 
 export const DATA_POINTS: ReadonlyMap<DataPointId, DataPoint> = new Map(CATALOG.map(d => [d.id, d]))

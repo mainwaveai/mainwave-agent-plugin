@@ -5,6 +5,7 @@ export default {
   "data_points": [
     {
       "id": "session.identity",
+      "name": "Who sent it",
       "class": "identifiers",
       "required": true,
       "description": "Who sent the record: Claude organization, account, email, and the ID Claude Code keeps per installation",
@@ -12,6 +13,7 @@ export default {
     },
     {
       "id": "session.links",
+      "name": "Record links",
       "class": "metadata",
       "required": true,
       "description": "IDs that tie records together: session, prompt, request, tool call, trace and span",
@@ -19,6 +21,7 @@ export default {
     },
     {
       "id": "session.client",
+      "name": "Client and version",
       "class": "metadata",
       "required": true,
       "description": "What ran the session (Claude Code version, entry point, Cowork surface, terminal, plan, provider, the plugin's version), and Claude Code's own event rows",
@@ -26,6 +29,7 @@ export default {
     },
     {
       "id": "usage",
+      "name": "Usage and cost",
       "class": "metadata",
       "required": true,
       "description": "Model, tokens, cost, request time, time to first token, effort, stop reason, query source; prompt, response, tool input and result sizes",
@@ -33,6 +37,7 @@ export default {
     },
     {
       "id": "tool.call",
+      "name": "Tool calls",
       "class": "metadata",
       "default": "on",
       "description": "Each tool call: its name, duration, success and error class, and the permission decision and what made it",
@@ -67,6 +72,7 @@ export default {
     },
     {
       "id": "tool.mcp",
+      "name": "MCP server and tool",
       "class": "metadata",
       "default": "on",
       "switch": "OTEL_LOG_TOOL_DETAILS",
@@ -98,6 +104,7 @@ export default {
     },
     {
       "id": "skill.name",
+      "name": "Skill",
       "class": "metadata",
       "default": "on",
       "switch": "OTEL_LOG_TOOL_DETAILS",
@@ -117,6 +124,7 @@ export default {
     },
     {
       "id": "agent.type",
+      "name": "Subagent type",
       "class": "metadata",
       "default": "on",
       "switch": "OTEL_LOG_TOOL_DETAILS",
@@ -144,6 +152,7 @@ export default {
     },
     {
       "id": "command.name",
+      "name": "Slash command",
       "class": "metadata",
       "default": "on",
       "description": "The slash command run, not its arguments",
@@ -158,6 +167,7 @@ export default {
     },
     {
       "id": "bash.class",
+      "name": "Kind of shell command",
       "class": "metadata",
       "default": "on",
       "description": "The kind and program of each shell command, in Bash or an MCP shell tool such as Cowork's device_bash",
@@ -175,6 +185,7 @@ export default {
     },
     {
       "id": "bash.outcome",
+      "name": "What a command did",
       "class": "metadata",
       "default": "on",
       "description": "Commits, reverts, pushes, branches opened, merges, tags, workflow runs and pull requests opened, merged or updated by shell commands that succeeded, as counts",
@@ -206,6 +217,7 @@ export default {
     },
     {
       "id": "file.kind",
+      "name": "File language",
       "class": "metadata",
       "default": "on",
       "description": "The language of each file edited or written, from its extension",
@@ -223,6 +235,7 @@ export default {
     },
     {
       "id": "web.domain",
+      "name": "Website",
       "class": "metadata",
       "default": "on",
       "switch": "OTEL_LOG_TOOL_DETAILS",
@@ -238,6 +251,7 @@ export default {
     },
     {
       "id": "repo",
+      "name": "Repository and branch",
       "class": "identifiers",
       "default": "on",
       "switch": "OTEL_METRICS_INCLUDE_REPOSITORY",
@@ -266,6 +280,7 @@ export default {
     },
     {
       "id": "file.path",
+      "name": "File paths",
       "class": "identifiers",
       "default": "on",
       "switch": "OTEL_LOG_TOOL_DETAILS",
@@ -285,6 +300,7 @@ export default {
     },
     {
       "id": "web.url",
+      "name": "Web addresses",
       "class": "identifiers",
       "default": "on",
       "switch": "OTEL_LOG_TOOL_DETAILS",
@@ -300,6 +316,7 @@ export default {
     },
     {
       "id": "mcp.url",
+      "name": "MCP server addresses",
       "class": "identifiers",
       "default": "on",
       "needs": "tool.mcp",
@@ -324,8 +341,9 @@ export default {
     },
     {
       "id": "bash.command",
+      "name": "Shell commands",
       "class": "content",
-      "default": "off",
+      "default": "on",
       "switch": "OTEL_LOG_TOOL_DETAILS",
       "description": "The full text of each shell command, in Bash or an MCP shell tool",
       "example": "git commit -m \"fix login redirect\"",
@@ -347,8 +365,9 @@ export default {
     },
     {
       "id": "tool.input",
+      "name": "Tool input",
       "class": "content",
-      "default": "off",
+      "default": "on",
       "switch": "OTEL_LOG_TOOL_DETAILS",
       "holds": [
         "bash.command",
@@ -375,8 +394,9 @@ export default {
     },
     {
       "id": "tool.result",
+      "name": "Tool results",
       "class": "content",
-      "default": "off",
+      "default": "on",
       "switch": "OTEL_LOG_TOOL_CONTENT",
       "description": "What each tool returned: command output, file contents read, MCP results, a failed call's error",
       "example": "3 files changed, 41 insertions(+)",
@@ -393,8 +413,9 @@ export default {
     },
     {
       "id": "skill.text",
+      "name": "Skill instructions",
       "class": "content",
-      "default": "off",
+      "default": "on",
       "needs": "skill.name",
       "description": "The instructions of each skill run, as Claude Code expanded them for the model with arguments filled in; sent once per session for each distinct text, later runs refer to it",
       "example": "Review the diff for correctness bugs…",
@@ -415,8 +436,9 @@ export default {
     },
     {
       "id": "prompt.text",
+      "name": "Prompts",
       "class": "content",
-      "default": "off",
+      "default": "on",
       "switch": "OTEL_LOG_USER_PROMPTS",
       "description": "What the person typed, pastes expanded, slash command arguments included",
       "example": "Fix the login redirect on Safari",
@@ -444,8 +466,9 @@ export default {
     },
     {
       "id": "response.text",
+      "name": "Responses",
       "class": "content",
-      "default": "off",
+      "default": "on",
       "switch": "OTEL_LOG_ASSISTANT_RESPONSES",
       "description": "The model's visible answers",
       "example": "Fixed: the redirect now keeps the query string.",
@@ -463,8 +486,9 @@ export default {
     },
     {
       "id": "response.thinking",
+      "name": "Thinking",
       "class": "content",
-      "default": "off",
+      "default": "on",
       "description": "The model's thinking text, where the API returns it",
       "example": "The redirect drops the query because…",
       "attributes": [

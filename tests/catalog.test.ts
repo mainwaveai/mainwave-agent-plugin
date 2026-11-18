@@ -10,13 +10,13 @@ import vendored from './fixtures/data-points.ts'
 
 type Attributes = { keys: string[]; records?: string[]; redact?: boolean }
 type Entry = {
-  id: string; class: string; required?: boolean; default?: string; switch?: string; holds?: string[]; needs?: string; description: string; example: string
+  id: string; name: string; class: string; required?: boolean; default?: string; switch?: string; holds?: string[]; needs?: string; description: string; example: string
   attributes?: Attributes[]; parameters?: string[]; output_keys?: string[]; own_rows?: string[]; key_prefixes?: string[]; metrics?: string[]
 }
 const json = vendored as unknown as { catalog_version: number; tool_output_event: string; data_points: Entry[] }
 
 /** The fields this test reads; a field Mainwave's catalog adds fails the last test until it is compared too. */
-const FIELDS = ['id', 'class', 'required', 'default', 'switch', 'holds', 'needs', 'description', 'example', 'attributes', 'parameters', 'output_keys', 'own_rows', 'key_prefixes', 'metrics']
+const FIELDS = ['id', 'name', 'class', 'required', 'default', 'switch', 'holds', 'needs', 'description', 'example', 'attributes', 'parameters', 'output_keys', 'own_rows', 'key_prefixes', 'metrics']
 
 /** Each owned key as one line: its key, the records it is limited to, and whether it is redacted. */
 const ownership = (entries: readonly { key: string; records?: readonly string[]; redact?: boolean }[]) =>
@@ -29,11 +29,11 @@ describe('the catalog, against Mainwave\'s', () => {
     expect(CATALOG.map(d => d.id)).toEqual(json.data_points.map(d => d.id) as DataPointId[])
   })
 
-  test('each data point: its class, whether it is required, its switch, what it holds and needs, its description and example', () => {
+  test('each data point: its name, its class, whether it is required, its switch, what it holds and needs, its description and example', () => {
     for (const d of CATALOG) {
       const j = byId.get(d.id)!
-      expect({ id: d.id, class: d.class, required: d.required ?? false, switch: d.switch, holds: d.holds, needs: d.needs, description: d.description, example: d.example })
-        .toEqual({ id: j.id, class: j.class, required: j.required ?? false, switch: j.switch, holds: j.holds, needs: j.needs, description: j.description, example: j.example })
+      expect({ id: d.id, name: d.name, class: d.class, required: d.required ?? false, switch: d.switch, holds: d.holds, needs: d.needs, description: d.description, example: d.example })
+        .toEqual({ id: j.id, name: j.name, class: j.class, required: j.required ?? false, switch: j.switch, holds: j.holds, needs: j.needs, description: j.description, example: j.example })
     }
   })
 

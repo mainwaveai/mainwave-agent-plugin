@@ -295,7 +295,7 @@ A release bumps the version in both `.claude-plugin/plugin.json` and `hooks/vers
 | `hooks/settings.ts` | where the dev ingest key and the person's opt-in to more data points may come from, and the key's shape |
 | `hooks/identity.ts` | the organization, account, email and device read from a row, and the pair a record is routed by without a key |
 | `hooks/rebuild.ts` | Claude Code's spans, and the measures behind its metrics, rebuilt from rows and events; without the env block, the trace built by the plugin |
-| `hooks/catalog.ts` | the data points: their IDs, classes, switches and attributes, and the table of defaults; held field by field to `hooks/data-points.json`, a copy of Mainwave's catalog, all but the defaults |
+| `hooks/catalog.ts` | the data points: their IDs, names, classes, switches and attributes, and the table of defaults; held field by field to `hooks/data-points.json`, a copy of Mainwave's catalog, all but the defaults |
 | `hooks/gate.ts` | the gate: which data points go (an explicit setting, a switch at `0`, the person's opt-in, the default), applied to every record as it is captured and again as it is sent, and the opt-in stamp |
 | `hooks/protect.ts` | the always-on protections: secrets replaced, long values cut |
 | `hooks/capture.ts` | what the hooks read for the rows Claude Code writes without it: a call's parameters and input, a prompt, a response |
