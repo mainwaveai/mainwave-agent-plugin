@@ -3,7 +3,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { CATALOG, DEFAULTS, ownerOf } from '../hooks/catalog.ts'
-import { allows, gateAttributes, gateEvent, gatePoint, gateRow, gateSpan, optInOf, resolveGate } from '../hooks/gate.ts'
+import { allows, combinePacks, gateAttributes, gateEvent, gatePoint, gateRow, gateSpan, optInOf, packsOf, resolveGate, resolveRedaction } from '../hooks/gate.ts'
 import type { BuiltSpan } from '../hooks/otlp.ts'
 import { contentLimit, CONTENT_MAX_LENGTH, cut, redact } from '../hooks/protect.ts'
 import { CAPTURES_ON } from './rig.ts'
@@ -450,5 +450,111 @@ describe('protections', () => {
     expect(cut('abc', 10)).toEqual({ text: 'abc', truncated: false })
     expect(cut('a'.repeat(70_000), CONTENT_MAX_LENGTH).text.endsWith('[TRUNCATED - Content exceeds 60KB limit]')).toBe(true)
     expect(cut('abcdef', 4)).toEqual({ text: 'abcd', truncated: true })
+  })
+})
+
+describe('redaction packs', () => {
+  const ALL = resolveRedaction(['pii.contact', 'pii.us_gov_id', 'pii.payment_card'], undefined)
+  // With identifiers and content on, as an organization's settings turn them on: with no settings they don't go at all.
+  const withPacks = (redaction = ALL) => resolveGate({}, CAPTURES_ON, CONTENT_MAX_LENGTH, [], redaction)
+  const HELD = resolveRedaction('unreadable', undefined)
+
+  test('packsOf: a list or one string of names, as written; unset says nothing; any other value is unreadable', () => {
+    expect(packsOf(['pii.contact', ' pii.us_gov_id '])).toEqual(['pii.contact', 'pii.us_gov_id'])
+    expect(packsOf('pii.contact, pii.payment_card  secrets')).toEqual(['pii.contact', 'pii.payment_card', 'secrets'])
+    expect(packsOf('')).toEqual([])
+    expect(packsOf([])).toEqual([])
+    expect(packsOf(undefined)).toBeUndefined()
+    expect(packsOf(null)).toBeUndefined()
+    for (const v of [7, true, { 'pii.contact': true }, ['pii.contact', 7]]) expect([v, packsOf(v)]).toEqual([v, 'unreadable'])
+  })
+
+  test('combinePacks: every name any source lists; one unreadable source makes it unreadable; none, nothing said', () => {
+    expect(combinePacks([undefined, ['pii.contact'], ['pii.us_gov_id']])).toEqual(['pii.contact', 'pii.us_gov_id'])
+    expect(combinePacks([undefined, undefined])).toBeUndefined()
+    expect(combinePacks([['pii.contact'], 'unreadable'])).toBe('unreadable')
+  })
+
+  test('with no choice, secrets alone; the default is one constant', () => {
+    expect(resolveRedaction(undefined, undefined)).toEqual({ packs: ['secrets'] })
+    expect(resolveGate({}).redaction).toEqual({ packs: ['secrets'] })
+  })
+
+  test("the organization's packs in the order they run, secrets always; the person's add to them and never take one away", () => {
+    expect(resolveRedaction(['pii.payment_card', 'pii.contact'], undefined)).toEqual({ packs: ['secrets', 'pii.contact', 'pii.payment_card'] })
+    expect(resolveRedaction([], undefined)).toEqual({ packs: ['secrets'] })
+    expect(resolveRedaction(['pii.contact'], [])).toEqual({ packs: ['secrets', 'pii.contact'] })
+    expect(resolveRedaction(['pii.contact'], ['pii.us_gov_id'])).toEqual({ packs: ['secrets', 'pii.contact', 'pii.us_gov_id'] })
+    expect(resolveRedaction(undefined, ['pii.payment_card'])).toEqual({ packs: ['secrets', 'pii.payment_card'] })
+  })
+
+  test("held when either can't be read or names a pack the plugin does not have", () => {
+    expect(resolveRedaction('unreadable', undefined)).toEqual({ held: 'unreadable' })
+    expect(resolveRedaction(['pii.contact'], 'unreadable')).toEqual({ held: 'unreadable' })
+    expect(resolveRedaction(['pii.passport'], undefined)).toEqual({ held: 'unknown pack' })
+    expect(resolveRedaction(undefined, ['pii.contacts'])).toEqual({ held: 'unknown pack' })
+  })
+
+  test('the packs in force run on every identifier and content value, after the secrets, and the record counts every match', () => {
+    const out = gateAttributes(withPacks(), 'tool_result', {
+      'organization.id': 'o', 'user.email': 'ana@example.com', tool_name: 'Bash',
+      tool_parameters: '{"full_command":"mail -s hi bob@example.com --token=abc"}',
+      tool_input: '{"command":"echo 078-05-1120"}', error: 'card 4111 1111 1111 1111 declined',
+    })
+    expect(out).toEqual({
+      'organization.id': 'o', 'user.email': 'ana@example.com', tool_name: 'Bash',
+      tool_parameters: '{"full_command":"mail -s hi [REDACTED:pii.contact.email] --token=[REDACTED:assigned_secret]"}',
+      tool_input: '{"command":"echo [REDACTED:pii.us_gov_id.ssn]"}', error: 'card [REDACTED:pii.payment_card.card_number] declined',
+      'mainwave.redaction.count': 4,
+    })
+    // Once more through the gate, as it is sent: nothing more to replace, and the count stands.
+    expect(gateAttributes(withPacks(), 'tool_result', out)).toEqual(out)
+  })
+
+  test('by default an email in content goes as it is: secrets alone', () => {
+    expect(gateAttributes(resolveGate({}, CAPTURES_ON), 'user_prompt', { prompt: 'mail bob@example.com' })).toEqual({ prompt: 'mail bob@example.com' })
+  })
+
+  test('the routing and identity keys are never scanned, a repository and a commit included; metadata is not content', () => {
+    const attrs = {
+      'organization.id': 'o', 'user.email': 'ana@example.com', 'user.account_uuid': 'u', 'session.id': 's', 'prompt.id': 'p',
+      'vcs.repository.url.full': 'git@github.com:acme/api.git', 'vcs.commit.sha': '4111111111111111', model: 'claude-opus-5-5',
+    }
+    expect(gateAttributes(withPacks(), 'api_request', attrs)).toEqual(attrs)
+    expect(gateAttributes(withPacks(HELD), 'api_request', attrs)).toEqual(attrs)
+    // A key of the same data point that no other path exempts is scanned.
+    expect(gateAttributes(withPacks(), 'api_request', { 'vcs.repository.name': 'bob@example.com' })['vcs.repository.name']).toBe('[REDACTED:pii.contact.email]')
+  })
+
+  test('each string of a list is scanned; a list holding anything else is left out', () => {
+    const g = withPacks()
+    expect(gateAttributes(g, 'cowork', { 'workspace.host_paths': ['/Users/ana/bob@example.com', '/tmp'] })).toEqual({ 'workspace.host_paths': ['/Users/ana/[REDACTED:pii.contact.email]', '/tmp'], 'mainwave.redaction.count': 1 })
+    expect(gateAttributes(resolveGate({}, CAPTURES_ON), 'cowork', { 'workspace.host_paths': [`/x/ghp_${'a'.repeat(36)}`] })['workspace.host_paths']).toEqual(['/x/[REDACTED:github_token]'])
+    expect(gateAttributes(g, 'cowork', { 'workspace.host_paths': ['/a', 7 as never] })).toEqual({})
+  })
+
+  test('held: every identifier and content value is left out, and the record goes with the rest', () => {
+    const g = withPacks(HELD)
+    const out = gateAttributes(g, 'user_prompt', { 'organization.id': 'o', 'user.email': 'ana@example.com', prompt: 'hello', prompt_length: '5', 'workspace.host_paths': ['/a'] })
+    expect(out).toEqual({ 'organization.id': 'o', 'user.email': 'ana@example.com', prompt_length: '5' })
+    expect(gateRow(g, { event: 'user_prompt', loggedAt: '2026-11-12T00:00:00.000Z', attributes: { prompt: 'hello', prompt_length: '5' } })).toEqual({ event: 'user_prompt', loggedAt: '2026-11-12T00:00:00.000Z', attributes: { prompt_length: '5' } })
+  })
+
+  test("a span's status message and its tool output go through the packs, and the span counts them; held, both are left out", () => {
+    const span: BuiltSpan = {
+      traceId: 't', spanId: 's', name: 'claude_code.tool.execution', startMs: 0, endMs: 1,
+      attributes: { success: false, error: 'no user bob@example.com', error_class: 'ShellError' },
+      status: { code: 2, message: 'no user bob@example.com' },
+      events: [{ name: 'tool.output', timeMs: 1, attributes: { output: 'call (415) 555-2671', output_truncated: false } }],
+    }
+    const out = gateSpan(withPacks(), span)
+    expect(out.attributes['error']).toBe('no user [REDACTED:pii.contact.email]')
+    expect(out.status).toEqual({ code: 2, message: 'no user [REDACTED:pii.contact.email]' })
+    expect(out.events).toEqual([{ name: 'tool.output', timeMs: 1, attributes: { output: 'call [REDACTED:pii.contact.phone_nanp]', output_truncated: false } }])
+    expect(out.attributes['mainwave.redaction.count']).toBe(3)
+    const held = gateSpan(withPacks(HELD), span)
+    expect(held.attributes).toEqual({ success: false, error_class: 'ShellError' })
+    expect(held.status).toEqual({ code: 2 })
+    expect(held.events).toEqual([{ name: 'tool.output', timeMs: 1, attributes: { output_truncated: false } }])
   })
 })

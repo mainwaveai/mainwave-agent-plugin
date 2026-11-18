@@ -162,12 +162,23 @@ Never sent, whatever the settings: images and other attachments, the system prom
 - Secrets are replaced with a marker naming their kind (`[REDACTED:github_token]`): AWS access key IDs, GitHub tokens, Anthropic and OpenAI-style API keys, Slack tokens, private key blocks, JSON Web Tokens, `Authorization` header values, passwords in web addresses (`https://user:pass@host`), and values assigned to names containing `password`, `secret`, `token`, `api_key`, `access_key` or `private_key`. A record that had any carries their count, `mainwave.redaction.count`.
 - Long values are cut at 61,440 characters, Claude Code's own limit for telemetry content, or at what `CLAUDE_CODE_OTEL_CONTENT_MAX_LENGTH` sets; lower where `OTEL_ATTRIBUTE_VALUE_LENGTH_LIMIT`, `OTEL_SPAN_ATTRIBUTE_VALUE_LENGTH_LIMIT` or `OTEL_LOGRECORD_ATTRIBUTE_VALUE_LENGTH_LIMIT` says. A cut value ends with Claude Code's `[TRUNCATED` marker and carries `<attribute>_truncated` and `<attribute>_original_length`.
 
+**Redaction packs.** Beside the secrets, the plugin runs the personal-data packs the organization chooses, the same packs, rule names and matches as Mainwave's SDKs and CLI hooks (one difference: the secret rules always run first here, so a card number inside an API key is replaced as the key):
+
+| Pack | What it replaces |
+| --- | --- |
+| `secrets` | The secrets above. Always on |
+| `pii.contact` | Email addresses (`[REDACTED:pii.contact.email]`), North American phone numbers (`pii.contact.phone_nanp`) and international numbers written with a `+` (`pii.contact.phone_e164`) |
+| `pii.us_gov_id` | US Social Security numbers written with dashes, such as 123-45-6789 (`pii.us_gov_id.ssn`) |
+| `pii.payment_card` | Card numbers that pass the Luhn check, with or without separators (`pii.payment_card.card_number`, `pii.payment_card.card_number_grouped_19`) |
+
+With no choice from the organization, `secrets` runs alone, as Mainwave's org-wide setup applies to its hooks by default. A pack that is on runs on every identifier and content value the plugin sends, the same ones as the secrets: prompts, responses, thinking, tool input and output, shell commands (an MCP shell tool's such as `device_bash` included), file paths, web addresses, MCP server addresses, skill text, and error and status messages, in Claude Code and Cowork alike. Each match is replaced with `[REDACTED:<pack>.<rule>]`, after the secrets, and counts in `mainwave.redaction.count`. A value that is JSON (a call's `tool_parameters`, for one) is scanned value by value and keeps its shape: keys aren't scanned, and a number that matches becomes the marker as a string. JSON that no longer parses, as when it was cut at the limit, is scanned as text and again between its escapes, so a number after a `\n` is still found. The resource's values are scanned too, as `OTEL_RESOURCE_ATTRIBUTES` can hold anything. The keys that say who sent a record and that Mainwave routes and joins on (`organization.id`, `user.email`, `user.account_uuid`, `session.id`, `prompt.id`, a repository's address, a commit and the rest of the list Mainwave's SDKs share) are never scanned by a pack. If the packs chosen can't be read or name a pack this version doesn't have, the plugin sends no identifier or content value at all (except those keys), rather than send what it couldn't check; the records still go, and the session's debug log says why. See Settings for how a pack is chosen. Like the rest of this section, the packs apply to the plugin's copy: Claude Code's exporter sends its rows to the organization's collector as Claude Code writes them.
+
 ## What is coming
 
 In rough order, each in a later version:
 
 1. **Its own telemetry, to production.** The plugin already sends a session's rows, spans and metrics without the env block or a key, to the dev collector. Next it sends them to Mainwave's production collector, so an organization needs nothing but the plugin.
-2. **Settings from Mainwave.** At session start the plugin asks Mainwave for the organization's settings and the session's state, by the organization, account, email and device it read.
+2. **Settings from Mainwave.** At session start the plugin asks Mainwave for the organization's settings (its data points and redaction packs) and the session's state, by the organization, account, email and device it read.
 3. **Attributes.** The organization's attribute list in the session: Claude or the person sets a value (such as the project) with `/mainwave:attribute`, or proposes a new one for an admin to accept.
 4. **Anthropic's plugin directory.** A public listing, so updates reach every organization that sets the plugin to Required, and personal Pro and Max accounts can install it.
 
@@ -217,7 +228,7 @@ Answer `y` to add the marketplace, then pick a scope. From a shell: `claude plug
 
 ## Settings
 
-The plugin reads two settings of the person's: the dev ingest key, and the data points they opt in to. Neither can come from a repository's settings.
+The plugin reads three settings: the dev ingest key and the data points the person opts in to, both the person's own, and the redaction packs, which the organization chooses and the person may add to. None can come from a repository's settings.
 
 ### Dev ingest key
 
@@ -267,6 +278,28 @@ The value is a list of IDs, or one string of IDs separated by commas or spaces. 
 
 `extraDataPoints` is not declared as a plugin option, so `/config` doesn't show it and `claude plugin configure` doesn't set it (setting `devIngestKey` with it leaves the list in place): Claude Code refuses to load a plugin whose declared option holds a value of the wrong type, and a mistake here must never stop the plugin.
 
+### Redaction packs
+
+`redactionPacks` lists the redaction packs to run (see What it sends): `pii.contact`, `pii.us_gov_id`, `pii.payment_card`, and `secrets`, which always runs. An admin sets it for the whole organization in its managed settings, the ones Claude Code reads for every member wherever they come from, under the plugin's ID:
+
+```json
+{
+  "pluginConfigs": {
+    "mainwave@synced": { "options": { "redactionPacks": ["pii.contact", "pii.us_gov_id", "pii.payment_card"] } }
+  }
+}
+```
+
+The value is a list of pack names, or one string of names separated by commas or spaces. The rules:
+
+- **The organization's list replaces the default.** With none, `secrets` runs alone. Later, the packs in the organization's data collection settings in Mainwave apply too, through the same path, once the plugin fetches them.
+- **A person can add packs, never remove one.** The same option in a person's user settings (`settings.json` in `~/.claude`, or in `CLAUDE_CONFIG_DIR`) adds its packs to the organization's for their own sessions. Nothing in it turns off a pack the organization's list or the default turns on.
+- **Only managed settings and the person's user settings count.** A repository's settings (`.claude/settings.json`, `.claude/settings.local.json`) and `--settings` are ignored.
+- **A mistake holds content back.** Unlike the opt-in, where a mistake is ignored, a pack name this version doesn't have, a value of another type, or managed or user settings that can't be read make the plugin send no identifier or content value (see What it sends). Redaction that was asked for never silently turns off.
+- **Read again before each send,** as the opt-in is, from the organization's data collection settings in the store too: a pack added mid-session applies to records already queued.
+
+`redactionPacks` is not declared as a plugin option either, for the same reason as `extraDataPoints`.
+
 ## Developing
 
 The plugin sits at the repository's root: `.claude-plugin/plugin.json` (the manifest), `.claude-plugin/marketplace.json` (this repository as a marketplace), `hooks/` (the hooks module, `register.ts`, and the modules it imports), `types/index.d.ts` (what it keeps in `$.state`) and `tests/`.
@@ -288,21 +321,24 @@ The end-to-end comparison runs `claude -p` in a fresh config folder and a scratc
 
 A release bumps the version in both `.claude-plugin/plugin.json` and `hooks/version.ts`.
 
+The redaction packs are Mainwave's, shared with its SDKs and CLI hooks: a change to them there is a change here, in `hooks/packs.ts`, with the sample strings in `tests/pack-vectors.ts` regenerated from the CLI hooks' output.
+
 | Module | What it holds |
 | --- | --- |
 | `hooks/register.ts` | the hooks: the collector row hook and its fail-open handler, the turn, model request, tool call, command and spawn hooks, `session.start` and `session.end` |
 | `hooks/stamps.ts` | the keys the plugin owns (the opt-in stamp and a shell command's outcome stamps among them), their shape rules, and the strip of forged keys |
-| `hooks/settings.ts` | where the dev ingest key and the person's opt-in to more data points may come from, and the key's shape |
+| `hooks/settings.ts` | where the dev ingest key, the person's opt-in to more data points and the redaction packs may come from, and the key's shape |
 | `hooks/identity.ts` | the organization, account, email and device read from a row, and the pair a record is routed by without a key |
 | `hooks/rebuild.ts` | Claude Code's spans, and the measures behind its metrics, rebuilt from rows and events; without the env block, the trace built by the plugin |
 | `hooks/catalog.ts` | the data points: their IDs, names, classes, switches and attributes, and the table of defaults; held field by field to `hooks/data-points.json`, a copy of Mainwave's catalog, all but the defaults |
-| `hooks/gate.ts` | the gate: which data points go (an explicit setting, a switch at `0`, the person's opt-in, the default), applied to every record as it is captured and again as it is sent, and the opt-in stamp |
-| `hooks/protect.ts` | the always-on protections: secrets replaced, long values cut |
+| `hooks/gate.ts` | the gate: which data points go (an explicit setting, a switch at `0`, the person's opt-in, the default) and which redaction packs run (the organization's, else the default, with the person's added), applied to every record as it is captured and again as it is sent, and the opt-in stamp |
+| `hooks/protect.ts` | the always-on protections: secrets replaced, then the packs in force, long values cut |
+| `hooks/packs.ts` | the personal-data redaction packs, the same as Mainwave's SDKs and CLI hooks, their Luhn check, the JSON scan in place and the keys no pack scans |
 | `hooks/capture.ts` | what the hooks read for the rows Claude Code writes without it: a call's parameters and input, a prompt, a response |
 | `hooks/servers.ts` | the MCP servers set up for a session, read from Claude's settings files for `mcp.url`: name, scope, transport and address |
 | `hooks/derive.ts` | the rules Claude Code fills attributes by: tool names, query sources, Bash commands, line counts, languages; and Mainwave's rules for what a shell command did |
 | `hooks/meter.ts` | the counters behind the metrics, collected as delta points |
-| `hooks/sender.ts` | the copy: one queue for all three signals, the person's opt-in read again before each send, timer, batches (keyless, one organization and email each) and their idempotency keys, retries and the outbox kept in the store |
+| `hooks/sender.ts` | the copy: one queue for all three signals, the person's opt-in and the redaction packs read again before each send, timer, batches (keyless, one organization and email each) and their idempotency keys, retries and the outbox kept in the store |
 | `hooks/otlp.ts` | the copy as OTLP/JSON (log records, spans, metric points), with the resource rebuilt as the exporter builds it |
 | `hooks/http.ts` | `fetchWithin`: a request with a time limit that ends with its session |
 

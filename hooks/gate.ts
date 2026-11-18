@@ -13,18 +13,30 @@
 // (thinking counts as governed by the responses' switch, for this). It only adds: it never turns anything off. Required data points
 // are always sent.
 //
-// Whatever the gate says, every identifier and content value goes through the always-on protections (protect.ts) before it is queued.
+// Whatever the gate says, every identifier and content value goes through the always-on protections (protect.ts) before it is queued,
+// with the redaction packs in force (packs.ts): those the organization chose (`setOrgPacks`: its managed settings today, its data
+// collection settings once the plugin keeps them), else the default, `DEFAULT_PACKS`; and those the person adds from their own user
+// settings (`setPersonPacks`). The person's add to the organization's, never take from them. A choice that can't be read, or that names
+// a pack the plugin does not have, holds every identifier and content value back (the record still goes): redaction that was asked for
+// never silently turns off.
 
 import type { TelemetryAttribute } from 'claude-code'
 
 import { CATALOG, DATA_POINTS, DEFAULTS, METRIC_OWNERS, OUTPUT_OWNERS, OWN_ROWS, ownerOf, PARAMETER_OWNERS, sensitive, SKILL_PROMPT_ROW, TOOL_OUTPUT_EVENT, type DataPointId, type Switch } from './catalog.ts'
 import type { BuiltSpan, CopiedRow, MetricPoint } from './otlp.ts'
+import { DEFAULT_PACKS, EXEMPT_KEYS, PACK_NAMES, type PackName } from './packs.ts'
 import { CONTENT_MAX_LENGTH, cut, redact } from './protect.ts'
 import { COMMAND_PREFIX, COMMAND_REF_KEYS, COUNT_RULES, filterStamps, OPT_IN_STAMP, REDACTION_COUNT } from './stamps.ts'
 
 export type Setting = 'on' | 'off' | 'claude'
+/**
+ * The redaction in force: the packs that run, `secrets` always among them, in the order they run; or `held`, when a choice of packs
+ * can't be read or names a pack the plugin does not have, and no identifier or content value is sent. `held` says which, never the
+ * value.
+ */
+export type Redaction = { packs: readonly PackName[] } | { held: 'unreadable' | 'unknown pack' }
 /** `optedIn`: the data points that are `on` because the person opted in, in catalog order. */
-export type Gate = { settings: ReadonlyMap<DataPointId, Setting | 'required'>; limit: number; optedIn: readonly DataPointId[] }
+export type Gate = { settings: ReadonlyMap<DataPointId, Setting | 'required'>; limit: number; optedIn: readonly DataPointId[]; redaction: Redaction }
 export type Overrides = Partial<Record<DataPointId, Setting>>
 
 
@@ -44,7 +56,13 @@ export const switchedOff = (raw: string | undefined): boolean => ['0', 'false', 
  * else the default. `optedIn` lists those the opt-in turned on that can go somewhere: not one the data point it adds detail to keeps
  * from going.
  */
-export function resolveGate(env: Readonly<Partial<Record<Switch, string | undefined>>>, overrides: Overrides = {}, limit = CONTENT_MAX_LENGTH, optIn: Iterable<DataPointId> = []): Gate {
+export function resolveGate(
+  env: Readonly<Partial<Record<Switch, string | undefined>>>,
+  overrides: Overrides = {},
+  limit = CONTENT_MAX_LENGTH,
+  optIn: Iterable<DataPointId> = [],
+  redaction: Redaction = resolveRedaction(undefined, undefined),
+): Gate {
   const settings = new Map<DataPointId, Setting | 'required'>()
   const wanted = new Set(optIn)
   const raised: DataPointId[] = []
@@ -65,8 +83,50 @@ export function resolveGate(env: Readonly<Partial<Record<Switch, string | undefi
       raised.push(d.id)
     } else settings.set(d.id, byDefault)
   }
-  const gate: Gate = { settings, limit, optedIn: [] }
+  const gate: Gate = { settings, limit, optedIn: [], redaction }
   return { ...gate, optedIn: raised.filter(id => allows(gate, id, false)) }
+}
+
+// ── Redaction packs ───────────────────────────────────────────────────────────
+
+/**
+ * What one source says of the packs: the names it lists, as written; `unreadable` for a value of the wrong type or a source that
+ * can't be read; undefined when it says nothing.
+ */
+export type PackChoice = readonly string[] | 'unreadable' | undefined
+
+/**
+ * The packs a value of the packs option lists: a list of names, or one string of names separated by commas or spaces. Unset (or
+ * `null`) says nothing; any other value, or a list holding anything but strings, is `unreadable`. Names are checked in
+ * `resolveRedaction`, not here.
+ */
+export function packsOf(raw: unknown): PackChoice {
+  if (raw === undefined || raw === null) return undefined
+  const items = typeof raw === 'string' ? raw.split(/[\s,]+/) : Array.isArray(raw) && raw.every(v => typeof v === 'string') ? (raw as string[]) : undefined
+  if (items === undefined) return 'unreadable'
+  return items.map(v => v.trim()).filter(v => v !== '')
+}
+
+/** Several sources of one party as one choice: `unreadable` if any is, else every name any lists; undefined when none says anything. */
+export function combinePacks(choices: Iterable<PackChoice>): PackChoice {
+  let out: string[] | undefined
+  for (const c of choices) {
+    if (c === 'unreadable') return 'unreadable'
+    if (c !== undefined) out = [...(out ?? []), ...c]
+  }
+  return out
+}
+
+/**
+ * The redaction in force from the organization's choice and the person's: the organization's packs, or `DEFAULT_PACKS` where it chose
+ * none, with the person's added, and `secrets` always; in the order the packs run. `held` when either can't be read or names a pack
+ * the plugin does not have.
+ */
+export function resolveRedaction(org: PackChoice, person: PackChoice): Redaction {
+  if (org === 'unreadable' || person === 'unreadable') return { held: 'unreadable' }
+  const named = new Set<string>([...(org ?? DEFAULT_PACKS), ...(person ?? []), 'secrets'])
+  if ([...named].some(n => !(PACK_NAMES as readonly string[]).includes(n))) return { held: 'unknown pack' }
+  return { packs: PACK_NAMES.filter(p => named.has(p)) }
 }
 
 /**
@@ -87,7 +147,14 @@ let env: Partial<Record<Switch, string | undefined>> = {}
 let overrides: Overrides = {}
 let limit = CONTENT_MAX_LENGTH
 let optIn: readonly DataPointId[] = []
+/** The organization's choice of packs by where it came from: its data collection settings (`settings`), its managed settings. */
+let orgPacks: Partial<Record<'settings' | 'managed', PackChoice>> = {}
+let personPacks: PackChoice = undefined
 let current: Gate = resolveGate(env, overrides, limit, optIn)
+
+const refresh = () => {
+  current = resolveGate(env, overrides, limit, optIn, resolveRedaction(combinePacks(Object.values(orgPacks)), personPacks))
+}
 
 /** The gate in force for this load. */
 export const currentGate = (): Gate => current
@@ -96,19 +163,41 @@ export const currentGate = (): Gate => current
 export function configureGate(switches: Partial<Record<Switch, string | undefined>>, contentLimit: number = CONTENT_MAX_LENGTH): void {
   env = { ...switches }
   limit = contentLimit
-  current = resolveGate(env, overrides, limit, optIn)
+  refresh()
 }
 
 /** Explicit settings per data point, over the defaults: for organization settings, and for tests. */
 export function setOverrides(next: Overrides): void {
   overrides = { ...next }
-  current = resolveGate(env, overrides, limit, optIn)
+  refresh()
 }
 
 /** The data points the person opts in to (`optInOf`), from their own user settings: read once per load, and again before each send. */
 export function setOptIn(next: readonly DataPointId[]): void {
   optIn = [...next]
-  current = resolveGate(env, overrides, limit, optIn)
+  refresh()
+}
+
+/**
+ * The organization's choice of packs from one source: `settings`, its data collection settings, as the plugin keeps them (`PACKS_KEY`);
+ * `managed`, the packs option in its managed settings. Every source's packs apply.
+ */
+export function setOrgPacks(from: 'settings' | 'managed', choice: PackChoice): void {
+  orgPacks = { ...orgPacks, [from]: choice }
+  refresh()
+}
+
+/** The packs the person adds, from their own user settings: read once per load, and again before each send. */
+export function setPersonPacks(choice: PackChoice): void {
+  personPacks = choice
+  refresh()
+}
+
+/** The choices of packs of an earlier load stand for nothing: the default until this one reads its own. */
+export function resetPacks(): void {
+  orgPacks = {}
+  personPacks = undefined
+  refresh()
 }
 
 /**
@@ -116,6 +205,13 @@ export function setOptIn(next: readonly DataPointId[]): void {
  * writes it yet: the organization's settings will be kept here. A file the person can edit, so a convenience, not a control.
  */
 export const OVERRIDES_KEY = 'dataPoints'
+
+/**
+ * Where the organization's choice of packs is kept, in the plugin's store, beside `OVERRIDES_KEY`: a value of the packs option's shape
+ * (`packsOf`). Nothing writes it yet: the packs in the organization's data collection settings will be kept here. It is read once per
+ * load and again before each send (sender.ts, `readOptions`), so a value written mid-session applies to records already queued.
+ */
+export const PACKS_KEY = 'redactionPacks'
 
 const SETTINGS: readonly string[] = ['on', 'off', 'claude']
 
@@ -189,22 +285,51 @@ function protectedKey(record: string, key: string): boolean {
 }
 
 /**
- * The always-on protections on one record's attributes: secrets replaced in every identifier and content value, and a value past the
- * limit cut, with `<key>_truncated` and `<key>_original_length` beside it. Answers how many secrets were replaced.
+ * One identifier or content value through the protections: secrets replaced, then the packs in force, unless `key` is one no pack
+ * scans (packs.ts, `EXEMPT_KEYS`). Null when it must not be sent: the redaction is `held`, or the value could not be scanned.
+ */
+export function protectText(gate: Gate, text: string, key?: string): { text: string; count: number } | null {
+  const exempt = key !== undefined && EXEMPT_KEYS.has(key)
+  if ('held' in gate.redaction && !exempt) return null
+  try {
+    return redact(text, exempt || 'held' in gate.redaction ? [] : gate.redaction.packs)
+  } catch {
+    return null
+  }
+}
+
+/**
+ * The always-on protections on one record's attributes: in every identifier and content value (each string of a list too), secrets
+ * replaced and the packs in force run, and a value past the limit cut first, with `<key>_truncated` and `<key>_original_length` beside
+ * it. A value the protections can't clear is left out (`protectText`); the record goes without it. Answers how many matches were
+ * replaced.
  */
 export function protect(gate: Gate, record: string, attributes: Attrs, all = false): { attributes: Attrs; count: number } {
   const out: Attrs = {}
   let count = 0
   for (const [key, value] of Object.entries(attributes)) {
-    if (typeof value !== 'string' || !(all || protectedKey(record, key))) {
+    if (typeof value === 'number' || typeof value === 'boolean' || !(all || protectedKey(record, key))) {
       put(out, key, value)
       continue
     }
-    // Cut first, so the secret rules read a value of bounded length. A command stamp (a ref) goes whole or not at all: a ref cut short
+    if (Array.isArray(value)) {
+      const items: string[] = []
+      for (const item of value) {
+        const r = typeof item === 'string' ? protectText(gate, cut(item, gate.limit).text, key) : null
+        if (r === null) break
+        items.push(r.text)
+        count += r.count
+      }
+      if (items.length === value.length) put(out, key, items)
+      continue
+    }
+    if (typeof value !== 'string') continue
+    // Cut first, so the rules read a value of bounded length. A command stamp (a ref) goes whole or not at all: a ref cut short
     // names another ref.
     const c = cut(value, gate.limit)
     if (c.truncated && key.startsWith(COMMAND_PREFIX)) continue
-    const r = redact(c.text)
+    const r = protectText(gate, c.text, key)
+    if (r === null) continue
     count += r.count
     put(out, key, r.text)
     if (c.truncated) {
@@ -215,7 +340,7 @@ export function protect(gate: Gate, record: string, attributes: Attrs, all = fal
   return { attributes: out, count }
 }
 
-/** Adds the count of secrets replaced to a record's own, if any were. */
+/** Adds the count of matches replaced to a record's own, if any were. */
 function withCount(attributes: Attrs, count: number): Attrs {
   if (count === 0) return attributes
   const before = typeof attributes[REDACTION_COUNT] === 'number' ? (attributes[REDACTION_COUNT] as number) : 0
@@ -295,6 +420,34 @@ export function gateEvent(gate: Gate, event: { name: string; timeMs: number; att
   return { event: { ...event, attributes }, count }
 }
 
+/**
+ * A record's resource (JSON, as the sender keeps it) through the protections: each string value but those of the keys no pack scans,
+ * as the CLI hooks scan a resource, since `OTEL_RESOURCE_ATTRIBUTES` can hold anything. A value the protections can't clear is left
+ * out. The resource carries no count.
+ */
+export function gateResource(gate: Gate, resource: string): string {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(resource)
+  } catch {
+    // Not one the sender wrote: nothing in it is sent.
+    return '{}'
+  }
+  if (!isObject(parsed)) return resource
+  const out: Attrs = {}
+  let changed = false
+  for (const [key, value] of Object.entries(parsed)) {
+    if (typeof value !== 'string' || EXEMPT_KEYS.has(key)) {
+      put(out, key, value as TelemetryAttribute)
+      continue
+    }
+    const r = protectText(gate, cut(value, gate.limit).text, key)
+    if (r !== null) put(out, key, r.text)
+    if (r === null || r.text !== value) changed = true
+  }
+  return changed ? JSON.stringify(out) : resource
+}
+
 /** Whether a metric's points may go at all: none of a metric's a data point counts (catalog.ts, `METRIC_OWNERS`) while it is off. */
 export const metricAllowed = (gate: Gate, name: string, strict = false): boolean => METRIC_OWNERS[name] === undefined || allows(gate, METRIC_OWNERS[name]!, !strict)
 
@@ -321,16 +474,19 @@ export function gateSpan(gate: Gate, span: BuiltSpan, strict = false): BuiltSpan
   let status = span.status
   // A failed run's error text can repeat what the call read and ran: it goes with tool results and tool input alone.
   const errorText = allows(gate, 'tool.result', !strict) && allows(gate, 'tool.input', !strict)
+  let count = 0
   if (span.name === 'claude_code.tool.execution' && !errorText && attributes['error'] !== undefined && attributes['error'] !== attributes['error_class']) {
     const { error: _text, ...rest } = attributes
     const cls = attributes['error_class']
     attributes = cls === undefined ? rest : gateAttributes(gate, span.name, { ...attributes, error: cls })
     if (status?.message !== undefined) status = typeof cls === 'string' ? { ...status, message: cls } : { code: status.code }
   } else if (status?.message !== undefined) {
-    // The message repeats the error: the protections apply to it as to the attribute.
-    status = { ...status, message: cut(redact(status.message).text, gate.limit).text }
+    // The message repeats the error: the protections apply to it as to the attribute, cut first, and it is left out where the attribute
+    // would be.
+    const r = protectText(gate, cut(status.message, gate.limit).text)
+    status = r === null ? { code: status.code } : { ...status, message: r.text }
+    count += r?.count ?? 0
   }
-  let count = 0
   const events: NonNullable<BuiltSpan['events']> = []
   for (const e of span.events ?? []) {
     const g = gateEvent(gate, e, strict)

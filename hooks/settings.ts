@@ -32,6 +32,13 @@ export const SENDING_OPTIONS: readonly string[] = [KEY_OPTION]
  */
 export const OPT_IN_OPTION = 'extraDataPoints'
 
+/**
+ * The option that lists the redaction packs to run (gate.ts, `packsOf`), undeclared for the same reason. The organization sets it in
+ * its managed settings (the `policy` layer), and those packs apply to everyone; a person may add packs in their own user settings
+ * (the `user` layer), never take one away. A repository's settings (`project`, `local`) and `--settings` are not read for it.
+ */
+export const PACKS_OPTION = 'redactionPacks'
+
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v)
 const has = (o: Record<string, unknown>, k: string) => Object.prototype.hasOwnProperty.call(o, k)
 

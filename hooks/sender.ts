@@ -40,11 +40,11 @@
 
 import type { EngineInterface, PluginOptions, Timer } from 'claude-code'
 
-import { currentGate, gatePoint, gateRow, gateSpan, optInOf, setOptIn } from './gate.ts'
+import { combinePacks, currentGate, gatePoint, gateResource, gateRow, gateSpan, optInOf, PACKS_KEY, packsOf, setOptIn, setOrgPacks, setPersonPacks } from './gate.ts'
 import { fetchWithin, type FetchOutcome } from './http.ts'
 import { logsBody, metricsBody, resourceOf, tracesBody, type BuiltSpan, type CopiedRow, type MetricPoint } from './otlp.ts'
 import { routingIdentityOf } from './identity.ts'
-import { ingestKeyOf, KEY_OPTION, namesOption, OPT_IN_OPTION, optionValues, type Layer } from './settings.ts'
+import { ingestKeyOf, KEY_OPTION, namesOption, OPT_IN_OPTION, optionValues, PACKS_OPTION, type Layer } from './settings.ts'
 
 /** The one place the copy goes, a path per signal. Nothing reads another URL from settings or the environment. */
 export const DEV_COLLECTOR = 'https://collector.dev.mainwave.com'
@@ -428,12 +428,14 @@ function bodyOf(batch: readonly Queued[], nowMs: number): string {
     const d = gateRow(gate, item.d, strict)
     return d === null ? null : { ...item, d }
   }).filter((item): item is Queued => item !== null)
-  if (signal === 'traces') return tracesBody(groups<BuiltSpan>(gated))
-  if (signal === 'metrics') return metricsBody(groups<MetricPoint>(gated), scopeVersion)
-  return logsBody(groups<CopiedRow>(gated).map(g => ({ resource: g.resource, rows: g.items })), scopeVersion, nowMs)
+  // The resource is the same for every record of a load: through the protections once per group.
+  const grouped = <T>() => groups<T>(gated).map(g => ({ ...g, resource: gateResource(gate, g.resource) }))
+  if (signal === 'traces') return tracesBody(grouped<BuiltSpan>())
+  if (signal === 'metrics') return metricsBody(grouped<MetricPoint>(), scopeVersion)
+  return logsBody(grouped<CopiedRow>().map(g => ({ resource: g.resource, rows: g.items })), scopeVersion, nowMs)
 }
 
-async function readLayer($: EngineInterface, source: 'user' | 'project' | 'local'): Promise<Layer> {
+async function readLayer($: EngineInterface, source: 'user' | 'project' | 'local' | 'policy'): Promise<Layer> {
   try {
     return await $.settings.read({ source })
   } catch {
@@ -442,17 +444,36 @@ async function readLayer($: EngineInterface, source: 'user' | 'project' | 'local
 }
 
 /**
- * The data points the person opts in to, read from their own user settings into the gate (gate.ts, `setOptIn`): once per load, and
- * again before each send, so a data point taken off the list stops going out from records already queued. A layer that cannot be read
- * opts in to nothing. A batch sent again under its idempotency key goes through the gate as it is then, as with any setting: the
- * collector keeps the copy it took first.
+ * The plugin's options the gate reads, once per load and again before each send, so a change reaches records already queued: the data
+ * points the person opts in to and the packs they add, from their own user settings (gate.ts, `setOptIn`, `setPersonPacks`), and the
+ * packs the organization chooses, in its managed settings and in its data collection settings as the store keeps them (`setOrgPacks`).
+ * A user layer that cannot be read opts in to nothing; a layer or a store that cannot be read holds identifier and content values back,
+ * as its packs are not known. A batch sent again under its idempotency key goes through the gate as it is then, as with any setting:
+ * the collector keeps the copy it took first.
  */
-export async function readOptIn($: EngineInterface): Promise<void> {
+export async function readOptions($: EngineInterface): Promise<void> {
+  const [user, policy, stored] = await Promise.all([
+    readLayer($, 'user'),
+    readLayer($, 'policy'),
+    $.store.get(PACKS_KEY).then(v => packsOf(v), () => 'unreadable' as const),
+  ])
   try {
-    setOptIn(optionValues(await readLayer($, 'user'), OPT_IN_OPTION).flatMap(optInOf))
+    setOptIn(optionValues(user, OPT_IN_OPTION).flatMap(optInOf))
   } catch {
     setOptIn([])
   }
+  const packs = (layer: Layer) => (layer === 'unreadable' ? 'unreadable' : combinePacks(optionValues(layer, PACKS_OPTION).map(packsOf)))
+  try {
+    setPersonPacks(packs(user))
+  } catch {
+    setPersonPacks('unreadable')
+  }
+  try {
+    setOrgPacks('managed', packs(policy))
+  } catch {
+    setOrgPacks('managed', 'unreadable')
+  }
+  setOrgPacks('settings', stored)
 }
 
 /** A repository that names the key option stops the copy for this load, and what was queued for it is let go. */
@@ -541,8 +562,8 @@ export async function flush($: EngineInterface, opts: { timeoutMs: number | (() 
     // Nothing that may go now (every signal waiting, or every record's organization and email refused): no request, and no settings read.
     const at = await $.clock.now()
     if (!SIGNALS.some(sig => ready(sig, at) && queue.some(item => item.s === sig && sendable(item)))) return
-    // The opt-in is read beside the repository's settings, not after: the end of a session leaves little time.
-    const [refusedNow] = await Promise.all([repositoryNamesKey($), readOptIn($)])
+    // The options are read beside the repository's settings, not after: the end of a session leaves little time.
+    const [refusedNow] = await Promise.all([repositoryNamesKey($), readOptions($)])
     if (refusedNow) return
     const limitNow = () => (typeof opts.timeoutMs === 'function' ? opts.timeoutMs() : opts.timeoutMs)
     if (opts.together) {
