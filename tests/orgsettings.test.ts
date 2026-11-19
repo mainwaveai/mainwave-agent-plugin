@@ -6,6 +6,7 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
 import { nextWait, REFRESH_MS, RETRY_MS, settingsOf, settingsUrlOf } from '../hooks/orgsettings.ts'
+import { SETTINGS_WAIT_MS } from '../hooks/register.ts'
 import vendored from './fixtures/data-points.ts'
 import { boot, collectorOption, EMAIL, keylessAnswer, LOGGED_AT, memoryStore, network, optInOption, ORG, packsOption, SETTINGS_URL, type Layers, type Post, type Reply } from './rig.ts'
 
@@ -232,13 +233,52 @@ describe('the answer', () => {
     ])
   })
 
-  test('content captured before the first answer stays out: until then, the defaults', keyless, async ($, on) => {
+  test("content captured before the first answer goes with it: a row's copy waits for the first answer, the row itself never", keyless, async ($, on) => {
     const { clock, posts } = world(on, { settings: () => answer({ 'prompt.text': 'on' }) })
     await prompt($, 'first')
     await clock.advance(1)
     await prompt($, 'second')
     await clock.advance(TICK)
-    expect(sent(posts, 'user_prompt').map(r => r['prompt'])).toEqual(['<REDACTED>', 'second'])
+    expect(sent(posts, 'user_prompt').map(r => r['prompt'])).toEqual(['first', 'second'])
+  })
+
+  test('a first answer that does not come in time: the copy goes after a few seconds, under the defaults, the row at once', keyless, async ($, on) => {
+    const { clock, posts } = world(on, { settings: () => 'hang' })
+    await prompt($, 'first')
+    await clock.advance(TICK)
+    expect(sent(posts, 'user_prompt')).toEqual([])
+    await clock.advance(SETTINGS_WAIT_MS)
+    expect(sent(posts, 'user_prompt').map(r => r['prompt'])).toEqual(['<REDACTED>'])
+  })
+
+  test('content the first answer turns off never goes, though settings written by hand had it on as the row was built', keyless, async ($, on) => {
+    // The answer arrives after the row is built, as a session's first answer does.
+    const { clock, posts } = world(on, { settings: async () => {
+      await clock.advance(1_000)
+      return answer({ 'prompt.text': 'off' })
+    }, store: { dataPoints: { 'prompt.text': 'on' } } })
+    await prompt($, 'secret first prompt')
+    await clock.advance(TICK + SETTINGS_WAIT_MS)
+    expect(sent(posts, 'user_prompt').map(r => r['prompt'])).toEqual(['<REDACTED>'])
+    expect(JSON.stringify(posts.map(p => p.body))).not.toContain('secret first prompt')
+  })
+
+  test('an answer that arrives after the first prompt row is built still fills it: the copy waits for it', keyless, async ($, on) => {
+    const { clock, posts } = world(on, { settings: async () => {
+      await clock.advance(2_000)
+      return answer({ 'prompt.text': 'on' })
+    } })
+    await prompt($, 'first prompt')
+    await clock.advance(TICK + SETTINGS_WAIT_MS)
+    expect(sent(posts, 'user_prompt').map(r => r['prompt'])).toEqual(['first prompt'])
+  })
+
+  test("with the organization's answer in the store, nothing waits: the copy goes under it at once", keyless, async ($, on) => {
+    const kept = { dataCollectionSettings: { organizationId: ORG, revision: 2, dataPoints: { 'prompt.text': 'on' }, redactionPacks: ['secrets'] } }
+    const { clock, posts } = world(on, { settings: () => 'hang', store: kept })
+    await prompt($, 'first')
+    await clock.advance(TICK)
+    expect(sent(posts, 'user_prompt').map(r => r['prompt'])).toEqual(['first'])
   })
 
   test('a change reaches the session at the next ask; one that turns a data point off, records already queued too', keyless, async ($, on) => {
@@ -405,7 +445,8 @@ describe('what the store keeps', () => {
     await prompt($, 'c', other)
     await clock.advance(TICK)
     expect(posts.settings.map(p => JSON.parse(p.body))).toEqual([{ claude_org_id: ORG, email: EMAIL }, { claude_org_id: ORG_B, email: EMAIL_B }])
-    expect(sent(posts, 'user_prompt').map(r => r['prompt'])).toEqual(['<REDACTED>', 'a, after its answer', '<REDACTED>', '<REDACTED>'])
+    // The first organization's first record waited for its answer; the second's, asked for later in the load, waits for none.
+    expect(sent(posts, 'user_prompt').map(r => r['prompt'])).toEqual(['a', 'a, after its answer', '<REDACTED>', '<REDACTED>'])
   })
 })
 

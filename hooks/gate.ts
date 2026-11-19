@@ -95,6 +95,16 @@ export function resolveGate(
   return { ...gate, optedIn: raised.filter(id => allows(gate, id, false)) }
 }
 
+/**
+ * A gate with every data point on, the length limit of the gate in force: what the rebuild builds records with while the organization's
+ * settings have yet to first answer (register.ts), so nothing is left out that the answer may turn on. Nothing it builds is sent
+ * through it: each record waits for the answer, then goes through the gate in force, strictly.
+ */
+export function openGate(): Gate {
+  const all: Overrides = Object.fromEntries(CATALOG.filter(d => !d.required).map(d => [d.id, 'on']))
+  return { ...resolveGate({}, all, current.limit), optedIn: [] }
+}
+
 // ── Redaction packs ───────────────────────────────────────────────────────────
 
 /**

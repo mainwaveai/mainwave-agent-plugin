@@ -43,6 +43,9 @@ function world(on: On, opts: { layers?: Layers; env?: Record<string, string>; re
   return { clock, posts, rig, sets, data, logs }
 }
 
+/** The organization's last answer, kept in the store: a row's copy waits for no first answer, and is queued as the row comes. */
+const KEPT = { dataCollectionSettings: { organizationId: ORG, revision: 1, dataPoints: {}, redactionPacks: ['secrets'] } }
+
 /** Logs one collector row with its span, as Claude Code raises it. */
 async function logRow($: Engine, rig: ReturnType<typeof boot>, attributes: Record<string, unknown>, event = 'api_request') {
   const before = rig.rows.length
@@ -116,7 +119,7 @@ describe('the copy', () => {
   })
 
   test('rows go in batches of at most 200, every row once, in order', async ($, on) => {
-    const { clock, posts, rig } = world(on)
+    const { clock, posts, rig } = world(on, { store: KEPT })
     for (let i = 1; i <= 450; i++) await logRow($, rig, row(i))
     await clock.advance(TICK)
     expect(posts.map(p => records(p).length)).toEqual([200, 200, 50])
@@ -281,7 +284,7 @@ describe('the idempotency key', () => {
   })
 
   test('a batch after one that was settled has a new key; every key has the shape the collector takes', async ($, on) => {
-    const { clock, posts, rig } = world(on)
+    const { clock, posts, rig } = world(on, { store: KEPT })
     for (let i = 1; i <= 450; i++) await logRow($, rig, row(i))
     await clock.advance(TICK)
     await logRow($, rig, row(451))

@@ -26,6 +26,10 @@
 //
 // Fail open: a request that fails, times out or is refused leaves the settings in force as they were, and the plugin asks again
 // later. Nothing here holds a row, a turn or a tool call: the request goes from a timer, never from a hook.
+//
+// Until the first answer of a load comes, where nothing of the organization's applies yet (no answer kept for it), the copy of a row
+// waits for it a few seconds at most (`settingsPending`, register.ts): a session's first prompt row is built as its first turn begins,
+// before any answer could come, and the content the organization turned on goes only on a copy made once its settings apply.
 
 import type { EngineInterface, Timer } from 'claude-code'
 
@@ -150,6 +154,10 @@ let reading = false
 let stoppedAsking = false
 /** Whether the plugin sends a copy at all: it asks only while it does. */
 let copying: () => boolean = () => true
+/** The organization whose settings apply: this load's answer for it, or the one the store keeps. */
+let appliedFor: string | undefined
+/** The first request of the load, asked for once the organization and email are known: settled however it ends. */
+let firstAsk: { done: Promise<void>; settle: () => void; settled: boolean } | undefined
 
 /** Starts over for a load of the module: nothing known, nothing asked. */
 export function resetOrgSettings(): void {
@@ -165,6 +173,28 @@ export function resetOrgSettings(): void {
   reading = false
   stoppedAsking = false
   copying = () => true
+  appliedFor = undefined
+  firstAsk?.settle()
+  firstAsk = undefined
+}
+
+function newAsk(): NonNullable<typeof firstAsk> {
+  let settle = () => {}
+  const ask = { done: new Promise<void>(resolve => (settle = resolve)), settle: () => {}, settled: false }
+  ask.settle = () => {
+    ask.settled = true
+    settle()
+  }
+  return ask
+}
+
+/**
+ * While the load's first request for the organization's settings is out and nothing of theirs applies yet (no answer this load or in
+ * the store for the organization): settled as that request ends, however it does. Undefined otherwise, and nothing need wait.
+ */
+export function settingsPending(): Promise<void> | undefined {
+  if (firstAsk === undefined || firstAsk.settled || org === undefined || appliedFor === org) return undefined
+  return firstAsk.done
 }
 
 /**
@@ -182,6 +212,7 @@ export async function applyStoredSettings($: EngineInterface): Promise<void> {
   let overrides: Overrides = {}
   let inForce: Overrides = {}
   let choice: PackChoice = undefined
+  appliedFor = answer !== undefined ? org : undefined
   if (answer !== undefined) {
     overrides = overridesOf(answer.dataPoints)
     inForce = overridesOf(answer.inForce)
@@ -192,6 +223,7 @@ export async function applyStoredSettings($: EngineInterface): Promise<void> {
     // An answer kept for an organization: for its sessions alone. One of the wrong shape: for none.
     const k = isObject(kept.v) ? kept.v : {}
     if (isOrgId(k['organizationId']) && k['organizationId'] === org) {
+      appliedFor = org
       overrides = overridesOf(k['dataPoints'])
       // Kept by an earlier version, or from an answer without it: the explicit settings alone.
       inForce = overridesOf(k['inForce'])
@@ -249,6 +281,7 @@ export async function fetchNow($: EngineInterface, collector: string): Promise<O
     if (settings !== null && forOrg === org) {
       const changed = fetched === undefined || fetched.org !== forOrg || !same(fetched, settings)
       fetched = { ...settings, org: forOrg }
+      appliedFor = forOrg
       setOverrides(overridesOf(settings.dataPoints), overridesOf(settings.inForce))
       setOrgPacks('settings', packsOf(settings.redactionPacks))
       if (changed) await keep($, forOrg, settings)
@@ -291,7 +324,7 @@ function schedule($: EngineInterface, ms: number): void {
       timer = null
       // The copy turned off (a repository named the collector option, or the person's is malformed): nothing is sent, so nothing is
       // asked, until the plugin loads again.
-      if (!copying() || stoppedAsking) return
+      if (!copying() || stoppedAsking) return firstAsk?.settle()
       // A read already under way: its request schedules the next.
       if (reading) return
       const asked = `${org} ${email}`
@@ -301,7 +334,11 @@ function schedule($: EngineInterface, ms: number): void {
           where => (where === 'held' || where === 'stop' ? where : fetchNow($, where)),
           () => 'held' as const,
         )
-        .finally(() => (reading = false))
+        .finally(() => {
+          reading = false
+          // However it went, the copies waiting for the first answer go on.
+          firstAsk?.settle()
+        })
         .then(outcome => {
           // Not asked (a request already out, or nothing to ask with): the request out schedules the next.
           if (outcome === undefined) return
@@ -340,6 +377,7 @@ export async function noteSessionIdentity($: EngineInterface, who: { organizatio
   if (emailChanged) email = who.email
   if (orgChanged) await applyStoredSettings($)
   if (copying() && org !== undefined && email !== undefined) {
+    firstAsk ??= newAsk()
     wait = 0
     schedule($, 0)
   }
