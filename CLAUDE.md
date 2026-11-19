@@ -9,7 +9,7 @@ claude plugin validate .        # manifest, marketplace and hooks module, read t
 claude plugin test .            # tests/*.test.ts against the engine
 scripts/check-version.sh        # plugin.json and hooks/version.ts agree; the Claude Code floor is the same in CI's pin, plugin.json and the README
 scripts/check-layout.sh         # one plugin, at the root: org sync refuses a .claude-plugin/ or plugin.json anywhere else
-scripts/check-hooks.sh          # the row, tool call, command, spawn and marker hooks keep their fail-open .catch; the turn hooks and session.end are hooked
+scripts/check-hooks.sh          # the row, tool call, command, spawn and marker hooks keep their fail-open .catch; the turn hooks, tool.check and session.end are hooked
 scripts/check-vendored.sh       # the copies of Mainwave's catalog and command cases (JSON) and the twins the tests import agree; --write rewrites the twins
 node tests/e2e/compare.mjs      # real sessions, model mocked: the plugin's copy against the exporter's; without the env block, keyless and coherent
 ```

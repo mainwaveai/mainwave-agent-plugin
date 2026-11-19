@@ -18,6 +18,8 @@ export const CONTRACT: Record<string, (v: unknown) => boolean> = {
   'mainwave.plugin.version': v => typeof v === 'string' && /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(v),
   'mainwave.plugin.entrypoint': v => typeof v === 'string' && /^[a-z0-9_-]+$/.test(v),
   'mainwave.telemetry.route': v => v === 'exporter' || v === 'plugin',
+  // On the plugin's own copy only, where no row of Claude Code's reached the plugin: the record was built from Claude Code's events.
+  'mainwave.telemetry.built_from': v => v === 'events',
   // On the plugin's own copy only, where the protections replaced a secret or a redaction pack's match: how many.
   'mainwave.redaction.count': v => typeof v === 'number' && Number.isInteger(v) && v >= 1,
   // On the plugin's own copy only, where the person opted in to data points off by default: which, each once.

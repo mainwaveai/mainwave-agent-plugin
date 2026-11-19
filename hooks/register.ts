@@ -17,6 +17,12 @@
 // turn ends, and again when that changes. When no row of Claude Code's reaches the plugin by then (a built-in plugin that runs first can
 // send them on past it), the plugin's own rows and its markers go under the identity in Claude's account file instead, until a row
 // names one.
+//
+// Where no row reaches the plugin as the session's first turn begins, and the session's identity is not the plugin's to read (a
+// built-in plugin runs first), the plugin builds the rows Mainwave reads a session from out of Claude Code's own events instead
+// (rowless.ts): a prompt row as each turn begins, a request row as each model request answers, and a decision and a result row for
+// each tool call. They go through the rebuild and the copy as Claude Code's rows would, under the host's identity or the account
+// file's, so the spans and metrics go too. The first row of Claude Code's that comes ends it for the load.
 
 import { atom, update } from 'claude-code'
 import type { CatchHandler, EngineInterface, Frozen, Hook, Next, Register, StreamHook, TelemetryAttribute, TelemetryLogResult, TelemetryRecordEntry, Timer } from 'claude-code'
@@ -35,10 +41,11 @@ import {
   linearTicket, MARKER_IDENTITY, MARKER_KEYS, markerResource, outputTexts, parseNumstat, parsePrStats, placeAttributes, prAttributes, prCreateOf, prLookup, prNumberOf, prUrlOf, STOP_FAILURE,
   opaqueId, STOP_FAILURE_ERROR, SUBSCRIPTION_SNAPSHOT, ticketSpan, type MarkerKind,
 } from './markers.ts'
-import type { BuiltSpan, CopiedRow } from './otlp.ts'
+import { parseResourceAttributes, type BuiltSpan, type CopiedRow } from './otlp.ts'
 import {
-  agentSpawned, callerCtx, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
+  agentSpawned, callerCtx, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild, type RowIn,
 } from './rebuild.ts'
+import { decisionRow, hostIdentityOf, newRowless, promptRow, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf, type HostIdentityEnv, type Rowless } from './rowless.ts'
 import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsSummary, settingsUnavailable } from './orgsettings.ts'
 import { contentLimit } from './protect.ts'
 import { adopt, collectorMalformed, collectorOf, configure, enqueue, ensureTimer, finish, isCopying, readOptions, snapshot } from './sender.ts'
@@ -48,7 +55,7 @@ import {
 } from './servers.ts'
 import { accountIdentityOf, exporterOf, issuesOf, signedInElsewhere, type ExporterEnv, type SignInEnv } from './setup.ts'
 import { snapshotOfText } from './snapshot.ts'
-import { applyStamps, entrypointOf, filterStamps, issuesStamp, PLUGIN_NAME, stripOwned, type IssueCode } from './stamps.ts'
+import { applyStamps, BUILT_FROM_STAMP, entrypointOf, filterStamps, issuesStamp, PLUGIN_NAME, stripOwned, type IssueCode } from './stamps.ts'
 import { VERSION } from './version.ts'
 
 export { VERSION }
@@ -65,6 +72,7 @@ type TurnCompleteParams = Parameters<Hook<'turn.complete'>>
 type StepParams = Parameters<StreamHook<'turn.step'>>
 type ToolCallParams = Parameters<Hook<'tool.call'>>
 type ToolCatchParams = Parameters<CatchHandler<Hook<'tool.call'>>>
+type ToolCheckParams = Parameters<Hook<'tool.check'>>
 type PromptParams = Parameters<Hook<'prompt.submit'>>
 type PromptCatchParams = Parameters<CatchHandler<Hook<'prompt.submit'>>>
 type CommandParams = Parameters<Hook<'command.run'>>
@@ -90,6 +98,9 @@ export const METRIC_INTERVAL_MS = 60_000
 /** How often records waiting for their pair are looked at. */
 export const SWEEP_MS = 1_000
 const ROUTE = filterStamps({ 'mainwave.telemetry.route': 'plugin' }).kept
+const BUILT = filterStamps({ 'mainwave.telemetry.route': 'plugin', [BUILT_FROM_STAMP]: 'events' }).kept
+/** What every span and measure the plugin sends carries: its route, and while it builds the rows itself, that it does. */
+const routeStamps = () => (rowless ? BUILT : ROUTE)
 
 // Per load of the module: a reload starts these over. `$.state` outlives a reload, so the first row after one writes the identity again.
 let entrypoint: Promise<string> | null = null
@@ -120,6 +131,18 @@ let recentArgs: { text: string; atMs: number }[] = []
 
 /** Whether a row of Claude Code's has reached the plugin this load. */
 let rowSeen = false
+/** No row of Claude Code's reaches the plugin: it builds them from Claude Code's events (rowless.ts), until one does. */
+let rowless = false
+let rowlessState: Rowless = newRowless()
+/** Whether `$.session.identity()` refused the plugin, asked once per load: a built-in plugin runs first. */
+let identityDenied: Promise<boolean> | null = null
+/** `OTEL_RESOURCE_ATTRIBUTES`, read once per load: Claude Code puts them first on each of its rows. */
+let resourceAttrs: Promise<Record<string, string>> | null = null
+/** When each tool call the plugin builds rows for began, by its id, until it ends. */
+let callStarts = new Map<string, number>()
+/** The permission check's verdict on each of those calls (`allow`, `deny` or `ask`), by its id, until it ends. */
+let verdicts = new Map<string, string>()
+const MAX_VERDICTS = 500
 /** The session's identity from Claude's account file, read once; and in use, once a turn ended with no row of Claude Code's seen. */
 let account: Promise<Record<string, string>> | null = null
 let accountCommon: Record<string, string> | undefined
@@ -323,11 +346,11 @@ async function rebuildOf($: EngineInterface): Promise<Rebuild | null> {
 async function emit($: EngineInterface, out: Emit): Promise<void> {
   const gate = await gateOf($)
   for (const m of out.measures) {
-    if (metricAllowed(gate, m.name)) add(meter, { ...m, attributes: { ...gateAttributes(gate, m.name, m.attributes), ...ROUTE } })
+    if (metricAllowed(gate, m.name)) add(meter, { ...m, attributes: { ...gateAttributes(gate, m.name, m.attributes), ...routeStamps() } })
   }
   for (const span of out.spans) {
     const gated = gateSpan(gate, span)
-    await enqueue($, { s: 'traces', d: { ...gated, attributes: { ...gated.attributes, ...ROUTE } } })
+    await enqueue($, { s: 'traces', d: { ...gated, attributes: { ...gated.attributes, ...routeStamps() } } })
   }
 }
 
@@ -421,15 +444,18 @@ async function readAccountFile($: EngineInterface): Promise<unknown> {
 }
 
 /**
- * No row of Claude Code's reached the plugin by a turn's end: its own rows go under the identity in Claude's account file, and the
- * organization's settings are asked for with it. A row that names the session later takes over (`stampRow`).
+ * No row of Claude Code's reached the plugin: its own rows go under the session's identity as Claude Code reads it, the host's
+ * variables (rowless.ts), else Claude's account file, and the organization's settings are asked for with it. A row that names the
+ * session later takes over (`stampRow`).
  */
 async function adoptAccount($: EngineInterface): Promise<void> {
-  // A session signed in another way: the account file's login may be someone else's.
-  const [signIn, settings] = await Promise.all([readSignInEnv($), mergedSettings($)])
-  if (signedInElsewhere(signIn, settings)) return
-  account ??= readAccountFile($).then(accountIdentityOf, () => ({}))
-  const who = await account
+  const [signIn, settings, hostEnv] = await Promise.all([readSignInEnv($), mergedSettings($), readHostIdentityEnv($)])
+  const host = hostIdentityOf(hostEnv)
+  // A session signed in another way: the account file's login may be someone else's. The host's word stands: Claude Code's rows carry it.
+  const elsewhere = signedInElsewhere(signIn, settings)
+  if (elsewhere && host['organization.id'] === undefined) return
+  account ??= elsewhere ? Promise.resolve({}) : readAccountFile($).then(accountIdentityOf, () => ({}))
+  const who = sessionIdentityOf(host, await account)
   if (rowSeen || who['organization.id'] === undefined || who['user.email'] === undefined) return
   accountCommon = who
   try {
@@ -437,6 +463,16 @@ async function adoptAccount($: EngineInterface): Promise<void> {
   } catch {
     // The settings in force stand.
   }
+}
+
+/** The variables a host sets to say who the session is, each spelled out. */
+async function readHostIdentityEnv($: EngineInterface): Promise<HostIdentityEnv> {
+  const [org, email, accountId] = await Promise.all([
+    settle($.env.get('CLAUDE_CODE_ORGANIZATION_UUID')),
+    settle($.env.get('CLAUDE_CODE_USER_EMAIL')),
+    settle($.env.get('CLAUDE_CODE_ACCOUNT_UUID')),
+  ])
+  return { CLAUDE_CODE_ORGANIZATION_UUID: org, CLAUDE_CODE_USER_EMAIL: email, CLAUDE_CODE_ACCOUNT_UUID: accountId }
 }
 
 /** The variables that sign a session in another way than the account file's login, each spelled out. */
@@ -512,6 +548,8 @@ async function checkStatus($: EngineInterface, graceElapsed = false): Promise<vo
   const epoch = statusEpoch
   const issues = await setupIssues($, graceElapsed)
   if (issues.includes('rows_skipped') && accountCommon === undefined) await adoptAccount($)
+  // No row came by the grace though one was due: the rows are built from the next turn on, if they were not already.
+  if (issues.includes('rows_skipped')) await startRowless($).catch(() => undefined)
   // A /clear or a resume while this ran: what it found is the ended session's, and the next one checks for itself.
   if (epoch !== statusEpoch) return
   const key = issues.join(',')
@@ -1037,6 +1075,8 @@ async function nextSession($: EngineInterface): Promise<void> {
   textsSent = new Set()
   textsWaiting = new Set()
   pendingArgs = new Map()
+  // A /clear starts the session's cost over, and its sequence.
+  rowlessState = newRowless()
   await startServers($)
 }
 
@@ -1058,9 +1098,10 @@ async function observe($: EngineInterface, e: Frozen<TelemetryRecordEntry>): Pro
  * exporter, and the copy, where the plugin copies at all, is queued with route `plugin`.
  */
 export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams[2]): Promise<TelemetryLogResult> {
-  // Rows reach the plugin: what they say of the session stands, not the account file's.
+  // Rows reach the plugin: what they say of the session stands, not the account file's, and the rows are theirs, not built.
   rowSeen = true
   accountCommon = undefined
+  endRowless()
   let attributes: Record<string, TelemetryAttribute>
   if (isOrgId(e.attributes['organization.id'])) {
     entrypoint ??= readEntrypoint($)
@@ -1079,34 +1120,108 @@ export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams
   } else {
     attributes = stripOwned(e.attributes)
   }
-  if (isCopying()) {
-    // The rebuild reads the row first, so its copy carries the ids the plugin's spans give it. The copy is the plugin's own: a fault
-    // in either never holds the exporter's row, and a fault in the rebuild never holds the copy.
-    // The row's copy is queued before what the row completes, as the row came first.
-    let out: Awaited<ReturnType<typeof observe>> = null
-    try {
-      out = await observe($, e)
-    } catch {
-      out = null
-    }
-    if (e.event === 'tool_result') {
-      // Its call's name as the hook saw it (the row's may read `mcp_tool`), before the row's fill lets the call go.
-      const id = e.attributes['tool_use_id']
-      const tool = typeof id === 'string' ? capture.tools.get(id)?.name : undefined
-      void noteCalledServer($, e.attributes, tool).catch(() => undefined)
-    }
-    try {
-      // The copy goes through the gate: what it holds back removed, what the plugin read and it allows added, the protections applied.
-      const gated = gateAttributes(await gateOf($), e.event, attributes, rowFill(capture, e.event, e.attributes))
-      await enqueue($, { s: 'logs', d: copyOf(e, gated, out?.rowCtx) })
-    } catch {
-      // Lost to the copy alone.
-    }
-    if (out !== null) await emit($, out).catch(() => undefined)
-    // The session's identity may be known now: the plugin's own rows waiting for it go, beside the row.
-    if (own.length > 0 || markers.length > 0) void flushOwn($).catch(() => undefined)
-  }
+  if (isCopying()) await copyRow($, e, attributes)
   return next({ ...e, attributes })
+}
+
+/**
+ * Reads one row into the rebuild and queues its copy, `attributes` its stamped attributes: a row of Claude Code's, or one the plugin
+ * built from its events (`feedRow`). The rebuild reads the row first, so its copy carries the ids the plugin's spans give it. The copy
+ * is the plugin's own: a fault in either never holds the exporter's row, and a fault in the rebuild never holds the copy. The row's
+ * copy is queued before what the row completes, as the row came first.
+ */
+async function copyRow($: EngineInterface, e: Frozen<TelemetryRecordEntry>, attributes: Record<string, TelemetryAttribute>): Promise<void> {
+  let out: Awaited<ReturnType<typeof observe>> = null
+  try {
+    out = await observe($, e)
+  } catch {
+    out = null
+  }
+  if (e.event === 'tool_result') {
+    // Its call's name as the hook saw it (the row's may read `mcp_tool`), before the row's fill lets the call go.
+    const id = e.attributes['tool_use_id']
+    const tool = typeof id === 'string' ? capture.tools.get(id)?.name : undefined
+    void noteCalledServer($, e.attributes, tool).catch(() => undefined)
+  }
+  try {
+    // The copy goes through the gate: what it holds back removed, what the plugin read and it allows added, the protections applied.
+    const gated = gateAttributes(await gateOf($), e.event, attributes, rowFill(capture, e.event, e.attributes))
+    await enqueue($, { s: 'logs', d: copyOf(e, gated, out?.rowCtx) })
+  } catch {
+    // Lost to the copy alone.
+  }
+  if (out !== null) await emit($, out).catch(() => undefined)
+  // The session's identity may be known now: the plugin's own rows waiting for it go, beside the row.
+  if (own.length > 0 || markers.length > 0) void flushOwn($).catch(() => undefined)
+}
+
+// ── Rowless: the rows built from Claude Code's events (rowless.ts) ──────────────────────────────────────────────────────────────
+
+/** Whether `$.session.identity()` refuses the plugin: a built-in plugin that runs first keeps the session's identity from it. */
+async function readIdentityDenied($: EngineInterface): Promise<boolean> {
+  try {
+    const answer = (await $.session.identity()) as { deny?: unknown } | null | undefined
+    return typeof answer?.deny === 'string'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Builds the rows from Claude Code's events from now on: the rebuild builds the trace itself, and the session's identity is read
+ * where Claude Code reads it. Never once a row of Claude Code's has come.
+ */
+async function startRowless($: EngineInterface): Promise<void> {
+  if (rowless || rowSeen || !isCopying()) return
+  rowless = true
+  if (accountCommon === undefined) await adoptAccount($).catch(() => undefined)
+  const r = await rebuildOf($)
+  if (r !== null && !rowSeen) r.rowless = true
+}
+
+/**
+ * As a main-loop turn begins: no row of Claude Code's has come (its prompt row comes before the turn does), and the session's identity
+ * is not the plugin's to read, so a built-in plugin runs first and sends the rows on past it. The rows are built from here on.
+ */
+async function decideRowless($: EngineInterface): Promise<void> {
+  if (rowless || rowSeen || !isCopying()) return
+  identityDenied ??= readIdentityDenied($)
+  if (await identityDenied) await startRowless($)
+}
+
+/** Ends building the rows: a row of Claude Code's came, and the rows that follow are its. */
+function endRowless(): void {
+  if (!rowless) return
+  rowless = false
+  void rebuild?.then(r => (r.rowless = false)).catch(() => undefined)
+}
+
+/** The attributes the rows built now start with: the organization's resource attributes, the device, the session and who it is. */
+async function rowlessHead($: EngineInterface): Promise<Record<string, TelemetryAttribute>> {
+  resourceAttrs ??= settle($.env.get('OTEL_RESOURCE_ATTRIBUTES')).then(parseResourceAttributes, () => ({}))
+  const [resource, sessionId] = await Promise.all([resourceAttrs, sessionIdOf($)])
+  return rowHead(resource, accountCommon ?? {}, sessionId)
+}
+
+/** A row built from Claude Code's events, as Claude Code's own go: stamped, through the rebuild, and copied. */
+async function feedRow($: EngineInterface, row: RowIn): Promise<void> {
+  entrypoint ??= readEntrypoint($)
+  const ep = await entrypoint
+  const e = { to: 'collector', event: row.event, attributes: row.attributes, loggedAt: new Date(row.atMs).toISOString() } as Frozen<TelemetryRecordEntry>
+  const attributes = applyStamps(row.attributes, {
+    'mainwave.plugin.name': PLUGIN_NAME, 'mainwave.plugin.version': VERSION, 'mainwave.plugin.entrypoint': ep, [BUILT_FROM_STAMP]: 'events',
+  })
+  await copyRow($, e, attributes)
+}
+
+/** The session's cost so far, as `$.session.usage()` reads it; undefined where it can't be read. */
+async function sessionCostOf($: EngineInterface): Promise<number | undefined> {
+  try {
+    const usd = (await $.session.usage()).cost?.usd
+    return typeof usd === 'number' && Number.isFinite(usd) ? usd : undefined
+  } catch {
+    return undefined
+  }
 }
 
 /**
@@ -1157,7 +1272,16 @@ export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1]
   let out: Emit | null = null
   try {
     if (e.agentId === undefined && isCopying()) capturePrompt(capture, e.text)
+    if (e.agentId === undefined) await decideRowless($)
     const r = await rebuildOf($)
+    // The prompt row, built where none comes: before the turn, as Claude Code logs it.
+    if (r !== null && rowless && e.agentId === undefined) {
+      try {
+        await feedRow($, promptRow(rowlessState, await rowlessHead($), e.text, await $.clock.now(), uuidOf(randomHex(32))))
+      } catch {
+        // The turn goes without its prompt row.
+      }
+    }
     if (r !== null) out = turnStart(r, e, await $.clock.now())
   } catch {
     // The turn's interaction is not rebuilt.
@@ -1215,6 +1339,8 @@ function watched<T, R>(inner: AsyncGenerator<T, R, unknown>, see: (chunk: T) => 
 export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepParams[2]) {
   let r: Rebuild | null = null
   let startMs = 0
+  // When the first piece of the response came, for a request row the plugin builds (its time to first token).
+  let firstChunk: Promise<number> | undefined
   try {
     r = await rebuildOf($)
     if (r !== null) {
@@ -1226,7 +1352,10 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
     r = null
   }
   // A stream closed early (interrupted, or no longer read) leaves here and sends nothing: its row, if one comes, goes alone.
-  const stream = r === null ? next(e) : watched(next(e), chunk => streamChunk(capture, e.agentId, chunk))
+  const stream = r === null ? next(e) : watched(next(e), chunk => {
+    firstChunk ??= $.clock.now()
+    streamChunk(capture, e.agentId, chunk)
+  })
   const result = yield* stream
   try {
     firstStepAtMs ??= await $.clock.now()
@@ -1235,7 +1364,17 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
   }
   if (r !== null) {
     try {
-      await emit($, stepEnd(r, e.agentId, startMs, result, await $.clock.now(), streamedThinking(capture, e.agentId)))
+      const endMs = await $.clock.now()
+      await emit($, stepEnd(r, e.agentId, startMs, result, endMs, streamedThinking(capture, e.agentId)))
+      // The request row, built where none comes: after the step, which it pairs with as Claude Code's does. A request that brought no
+      // response logs none here (Claude Code's error row says what failed, which no event does).
+      if (rowless && result?.usage) {
+        const [head, sessionCostUsd, firstChunkMs, ep] = await Promise.all([rowlessHead($), sessionCostOf($), firstChunk?.catch(() => undefined), (entrypoint ??= readEntrypoint($))])
+        await feedRow($, requestRow(rowlessState, head, {
+          model: e.model, usage: result.usage, ...(e.effort !== undefined ? { effort: e.effort } : {}), ...(e.agentId !== undefined ? { agentId: e.agentId } : {}),
+          startMs, endMs, ...(firstChunkMs !== undefined ? { firstChunkMs } : {}), ...(sessionCostUsd !== undefined ? { sessionCostUsd } : {}), sdk: ep.startsWith('sdk'),
+        }))
+      }
     } catch {
       // The request's span goes without its stop reason.
     }
@@ -1252,7 +1391,9 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
       // The call's own arguments: what the engine adds beside them is not the tool's input.
       const { tool, tool_use_id: id, agentId: _agent, consent: _consent, requestMeta: _meta, ...input } = e as unknown as { tool: string; tool_use_id?: string; agentId?: string; consent?: string; requestMeta?: unknown } & Record<string, unknown>
       captureTool(capture, id, tool, input)
-      toolStart(r, e as never, await $.clock.now())
+      const startMs = await $.clock.now()
+      toolStart(r, e as never, startMs)
+      if (rowless && id !== undefined) callStarts.set(id, startMs)
     }
   } catch {
     r = null
@@ -1274,12 +1415,48 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
   }
   if (r !== null) {
     try {
-      await emit($, toolEnd(r, e.tool_use_id, result as never, await $.clock.now()))
+      const endMs = await $.clock.now()
+      await emit($, toolEnd(r, e.tool_use_id, result as never, endMs))
+      // The decision and result rows, built where none comes: a refused call has its decision alone, as in Claude Code.
+      const id = e.tool_use_id
+      const startMs = id !== undefined ? callStarts.get(id) : undefined
+      if (id !== undefined) callStarts.delete(id)
+      if (rowless && id !== undefined && startMs !== undefined) {
+        const settled = result as { isError?: boolean; deny?: unknown } | undefined
+        // A refused call ends in an error, like a call whose tool failed: the permission check says which. One it refused outright, or
+        // left to an ask that ended in an error (the person, the mode or the classifier said no), was refused.
+        const verdict = verdicts.get(id)
+        verdicts.delete(id)
+        const refused = settled?.deny !== undefined || verdict === 'deny' || (verdict === 'ask' && settled?.isError === true)
+        const call = { tool: e.tool, id, ...(e.agentId !== undefined ? { agentId: e.agentId } : {}) }
+        const head = await rowlessHead($)
+        await feedRow($, decisionRow(rowlessState, head, { ...call, refused }, startMs))
+        if (!refused) await feedRow($, resultRow(rowlessState, head, { ...call, startMs, endMs, isError: settled?.isError === true }))
+      }
     } catch {
       // The call's spans go with what the rows say.
     }
   }
   return result
+}
+
+/**
+ * A tool call's permission check, while the plugin builds the rows: its verdict, kept for the call's decision row. The check goes on
+ * and its verdict comes back unchanged.
+ */
+export async function toolCheckHook($: ToolCheckParams[0], e: ToolCheckParams[1], next: ToolCheckParams[2]) {
+  const verdict = await next(e)
+  try {
+    const id = (e as { tool_use_id?: unknown }).tool_use_id
+    const decision = (verdict as { decision?: unknown } | undefined)?.decision
+    if (rowless && typeof id === 'string' && typeof decision === 'string') {
+      verdicts.set(id, decision)
+      if (verdicts.size > MAX_VERDICTS) verdicts.delete(verdicts.keys().next().value!)
+    }
+  } catch {
+    // The call's decision row says accept.
+  }
+  return verdict
 }
 
 /**
@@ -1469,6 +1646,12 @@ export const register: Register = on => {
   cliHooks = null
   making = new Set()
   rowSeen = false
+  rowless = false
+  rowlessState = newRowless()
+  identityDenied = null
+  resourceAttrs = null
+  callStarts = new Map()
+  verdicts = new Map()
   firstStepAtMs = undefined
   account = null
   accountCommon = undefined
@@ -1483,6 +1666,7 @@ export const register: Register = on => {
   on('turn.step', stepHook)
   on('turn.complete', turnCompleteHook)
   on('tool.call', toolCallHook).catch(toolCatch)
+  on('tool.check', toolCheckHook)
   on('command.run', commandHook).catch(commandCatch)
   on('prompt.submit', promptHook).catch(promptCatch)
   on('agent.spawn', spawnHook).catch(spawnCatch)
