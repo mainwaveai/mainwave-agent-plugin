@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from 'claude-code/testing'
 
-import { anyValue, logRecord, logsBody, metricsBody, msToNanos, parseResourceAttributes, resourceOf, spanJson, tracesBody, unixNanos } from '../hooks/otlp.ts'
+import { anyValue, hostArchOf, isCowork, logRecord, logsBody, metricsBody, msToNanos, parseResourceAttributes, resourceOf, spanJson, tracesBody, unixNanos } from '../hooks/otlp.ts'
 
 describe('parseResourceAttributes', () => {
   test('pairs split by commas, trimmed, values percent-decoded', () => {
@@ -28,6 +28,23 @@ describe('resourceOf', () => {
     expect(resourceOf({ version: '2.1.322', resourceAttributes: 'service.name=claude-code-desktop,service.version=5.1.0,deployment.environment=production' }))
       .toEqual({ 'service.name': 'claude-code-desktop', 'service.version': '5.1.0', 'deployment.environment': 'production' })
     expect(resourceOf({ resourceAttributes: 'service.name=a', serviceName: 'b' })).toEqual({ 'service.name': 'b' })
+  })
+
+  test("in Cowork the defaults are Cowork's, and the variables still win; host.arch where the machine says", () => {
+    expect(resourceOf({ version: '2.1.328', cowork: true })).toEqual({ 'service.name': 'cowork', 'cowork.surface': 'remote', 'service.version': '2.1.328' })
+    expect(resourceOf({ version: '2.1.328', cowork: true, resourceAttributes: 'cowork.surface=local', serviceName: 'other' })).toEqual({ 'service.name': 'other', 'cowork.surface': 'local', 'service.version': '2.1.328' })
+    expect(resourceOf({ version: '2.1.328', cowork: true, resourceAttributes: 'service.name=cowork-x' })['service.name']).toBe('cowork-x')
+    expect(resourceOf({ version: '2.1.328', hostArch: 'arm64' })).toEqual({ 'service.name': 'claude-code', 'host.arch': 'arm64', 'service.version': '2.1.328' })
+  })
+
+  test('Cowork as Claude Code decides it, and host.arch in the host detector\'s words', () => {
+    expect(isCowork({ CLAUDE_CODE_ENTRYPOINT: 'remote_cowork' })).toBe(true)
+    expect(isCowork({ CLAUDE_CODE_IS_COWORK: '1' })).toBe(true)
+    expect(isCowork({ CLAUDE_CODE_IS_COWORK: ' TRUE ', CLAUDE_CODE_ENTRYPOINT: 'cli' })).toBe(true)
+    expect(isCowork({ CLAUDE_CODE_IS_COWORK: '0', CLAUDE_CODE_ENTRYPOINT: 'cli' })).toBe(false)
+    expect(isCowork({ CLAUDE_CODE_ENTRYPOINT: 'remote_cowork_trigger' })).toBe(false)
+    expect(isCowork({})).toBe(false)
+    expect(['x86_64', 'amd64', 'arm64', 'aarch64', 'AARCH64', 'i686', 'riscv64', '', undefined, 3].map(hostArchOf)).toEqual(['amd64', 'amd64', 'arm64', 'arm64', 'arm64', undefined, undefined, undefined, undefined, undefined])
   })
 })
 

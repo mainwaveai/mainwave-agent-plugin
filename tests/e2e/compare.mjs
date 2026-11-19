@@ -838,7 +838,7 @@ function compare(pass, details, auto, { captured, run, work }) {
   console.log(`metrics: exporter ${exporterPoints.length} points in ${exSeries.size} series, plugin ${pluginPoints.length} in ${plSeries.size}`)
   console.log(`  series: ${count([...exSeries.keys()].map(k => k.split(' ')[0].replace('claude_code.', '')))}`)
   console.log(`worst time difference: spans ${worstTime.span.toFixed(1)} ms, metric points ${worstTime.metric.toFixed(1)} ms (tolerances ${TIME_TOLERANCE_MS} and ${METRIC_TIME_TOLERANCE_MS} ms)`)
-  const hostOnly = [...HOST_ONLY].filter(k => exporterLogs[0]?.resource[k] !== undefined)
+  const hostOnly = [...HOST_ONLY].filter(k => exporterLogs[0]?.resource[k] !== undefined && pluginLogs[0]?.resource[k] === undefined)
   if (hostOnly.length) noteKnown(`all signals: the copy's resource has no ${hostOnly.join(', ')}`)
   if (known.size) console.log(`known differences:\n${[...known].map(([w, n]) => `  - ${w} (${n})`).join('\n')}`)
   for (let i = before; i < problems.length; i++) problems[i] = `${pass}: ${problems[i]}`

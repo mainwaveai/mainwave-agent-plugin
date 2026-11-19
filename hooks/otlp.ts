@@ -3,8 +3,12 @@
 // A row reaches the plugin's hook with every attribute the exporter sends (the session's identity, `event.name`, `event.sequence`
 // and `event.timestamp` among them), the time it was logged and the span it belongs to. What the hook does not see is the
 // exporter's resource, so it is rebuilt here the way the OpenTelemetry SDK builds it: `service.name` and `service.version` by
-// default, then `OTEL_RESOURCE_ATTRIBUTES`, then `OTEL_SERVICE_NAME`. The SDK's host detectors (`os.type`, `os.version`,
-// `host.arch`) have no counterpart a plugin can read, so the copy's resource goes without them.
+// default, then `OTEL_RESOURCE_ATTRIBUTES`, then `OTEL_SERVICE_NAME`. Of the SDK's host detectors, `host.arch` is read from the
+// machine where Claude Code says what it is (`$.session.machine()`, 2.1.328 on); `os.type` and `os.version` the copy goes without.
+//
+// In Cowork, its host names the service through those variables (`service.name` `cowork`, `cowork.surface`), and its export is filed
+// under Cowork by them. Where they name none (no Cowork export configured), the resource takes Cowork's names, so the copy is filed
+// there all the same.
 
 import type { TelemetryAttribute, TelemetrySpan } from 'claude-code'
 
@@ -21,6 +25,28 @@ export const SCOPE_NAME = 'com.anthropic.claude_code.events'
 
 /** `service.name` when nothing names one. */
 export const DEFAULT_SERVICE_NAME = 'claude-code'
+
+/** `service.name` and `cowork.surface` as Cowork's host sets them, where no variable names them. Every Cowork session runs in the cloud. */
+export const COWORK_SERVICE_NAME = 'cowork'
+export const COWORK_SURFACE = 'remote'
+
+/** Whether a variable is set to on, as Claude Code reads one (`1`, `true`, `yes`, `on`, any case). */
+export const isTruthy = (v: string | undefined) => ['1', 'true', 'yes', 'on'].includes((v ?? '').trim().toLowerCase())
+
+/** Whether the session is Cowork's, as Claude Code decides it: `CLAUDE_CODE_IS_COWORK` on, or the entry point `remote_cowork`. */
+export function isCowork(env: { CLAUDE_CODE_IS_COWORK?: string | undefined; CLAUDE_CODE_ENTRYPOINT?: string | undefined }): boolean {
+  return isTruthy(env.CLAUDE_CODE_IS_COWORK) || env.CLAUDE_CODE_ENTRYPOINT?.trim() === 'remote_cowork'
+}
+
+/**
+ * `host.arch` as the OpenTelemetry SDK's host detector names it (`amd64`, `arm64`), from the hardware's name in `uname -m`'s words;
+ * undefined for any other, which the plugin does not guess at.
+ */
+export function hostArchOf(machine: unknown): string | undefined {
+  if (typeof machine !== 'string') return undefined
+  const m = machine.trim().toLowerCase()
+  return m === 'x86_64' || m === 'amd64' ? 'amd64' : m === 'arm64' || m === 'aarch64' ? 'arm64' : undefined
+}
 
 /**
  * `OTEL_RESOURCE_ATTRIBUTES` as the OpenTelemetry JS SDK reads it: `key=value` pairs split by commas, a pair with no `=` or more than
@@ -43,9 +69,14 @@ export function parseResourceAttributes(raw: string | undefined): Record<string,
   return out
 }
 
-/** The resource the exporter would send: defaults, then `OTEL_RESOURCE_ATTRIBUTES`, then `OTEL_SERVICE_NAME`. */
-export function resourceOf(input: { resourceAttributes?: string; serviceName?: string; version?: string }): Record<string, string> {
-  const out: Record<string, string> = { 'service.name': DEFAULT_SERVICE_NAME }
+/**
+ * The resource the exporter would send: defaults, then `OTEL_RESOURCE_ATTRIBUTES`, then `OTEL_SERVICE_NAME`. In Cowork the defaults
+ * are Cowork's (`cowork`, `cowork.surface` `remote`); the variables still win.
+ */
+export function resourceOf(input: { resourceAttributes?: string; serviceName?: string; version?: string; cowork?: boolean; hostArch?: string }): Record<string, string> {
+  const out: Record<string, string> = { 'service.name': input.cowork ? COWORK_SERVICE_NAME : DEFAULT_SERVICE_NAME }
+  if (input.cowork) out['cowork.surface'] = COWORK_SURFACE
+  if (input.hostArch) out['host.arch'] = input.hostArch
   if (input.version) out['service.version'] = input.version
   Object.assign(out, parseResourceAttributes(input.resourceAttributes))
   if (input.serviceName) out['service.name'] = input.serviceName

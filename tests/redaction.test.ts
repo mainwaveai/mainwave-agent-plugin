@@ -141,7 +141,8 @@ describe("the organization's packs, in its managed settings", () => {
       expect(r['team.owner']).toBe('[REDACTED:pii.contact.email]')
       expect(r['department']).toBe('eng')
       expect(r['user.email']).toBe(EMAIL)
-      expect(r['service.name']).toBe('claude-code')
+      // The session runs in Cowork (remote_cowork), whose host's variables name no service here: Cowork's.
+      expect(r['service.name']).toBe('cowork')
     }
   })
 

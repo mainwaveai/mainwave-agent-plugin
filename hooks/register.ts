@@ -42,11 +42,11 @@ import {
   linearTicket, MARKER_IDENTITY, MARKER_KEYS, markerResource, outputTexts, parseNumstat, parsePrStats, placeAttributes, prAttributes, prCreateOf, prLookup, prNumberOf, prUrlOf, STOP_FAILURE,
   opaqueId, STOP_FAILURE_ERROR, SUBSCRIPTION_SNAPSHOT, ticketSpan, type MarkerKind,
 } from './markers.ts'
-import { parseResourceAttributes, type BuiltSpan, type CopiedRow } from './otlp.ts'
+import { isCowork, parseResourceAttributes, type BuiltSpan, type CopiedRow } from './otlp.ts'
 import {
   agentSpawned, callerCtx, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild, type RowIn,
 } from './rebuild.ts'
-import { accountDeviceOf, costOf, decisionRow, hostIdentityOf, isRefusal, newRowless, promptIdFrom, promptRow, providerOf, requestRow, responseRow, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, uuidOf, type HostFacts, type HostIdentityEnv, type Rowless, type Verdict } from './rowless.ts'
+import { accountDeviceOf, costOf, decisionRow, hostIdentityOf, isRefusal, newRowless, promptIdFrom, promptRow, providerOf, remoteSessionIdOf, requestRow, responseRow, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, uuidOf, type HostFacts, type HostIdentityEnv, type Rowless, type Verdict } from './rowless.ts'
 import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsSummary, settingsUnavailable } from './orgsettings.ts'
 import { contentLimit } from './protect.ts'
 import { adopt, collectorMalformed, collectorOf, configure, enqueue, ensureTimer, finish, isCopying, readOptions, snapshot } from './sender.ts'
@@ -155,6 +155,12 @@ let costChain: Promise<unknown> = Promise.resolve()
 let seedSince: { atMs?: number; previous?: number } = {}
 /** `OTEL_RESOURCE_ATTRIBUTES`, read once per load: Claude Code puts them first on each of its rows. */
 let resourceAttrs: Promise<Record<string, string>> | null = null
+/**
+ * The text of the last prompt submitted while the session was idle (no turn running) that runs no slash command, until the main-loop
+ * turn it starts begins. A host may start that turn with no text of its own (`turn.start`'s `''`), as a continuation's: the turn
+ * takes this text instead, for its prompt row and its interaction.
+ */
+let idleSubmitted: { text: string } | undefined
 /** When each tool call the plugin builds rows for began, by its id, until it ends. */
 let callStarts = new Map<string, number>()
 /** The permission check's verdict on each of those calls (`allow`, `deny` or `ask`), by its id, until it ends. */
@@ -1315,9 +1321,17 @@ function endRowless(): void {
 /** The attributes the rows built now start with: the organization's resource attributes, the device, the session and who it is. */
 async function rowlessHead($: EngineInterface): Promise<Record<string, TelemetryAttribute>> {
   resourceAttrs ??= settle($.env.get('OTEL_RESOURCE_ATTRIBUTES')).then(parseResourceAttributes, () => ({}))
-  hostFacts ??= Promise.all([readSignInEnv($), settle($.env.get('ANTHROPIC_BASE_URL'))]).then(([signIn, baseUrl]) => ({
-    provider: providerOf(signIn), customBaseUrl: (baseUrl ?? '').trim() !== '', nonInteractive: false,
-  }))
+  hostFacts ??= Promise.all([
+    readSignInEnv($), settle($.env.get('ANTHROPIC_BASE_URL')), settle($.env.get('CLAUDE_CODE_IS_COWORK')), settle($.env.get('CLAUDE_CODE_ENTRYPOINT')),
+    settle($.env.get('CLAUDE_CODE_REMOTE_SESSION_ID')),
+  ]).then(([signIn, baseUrl, isCoworkVar, ep, remote]) => {
+    const remoteSessionId = remoteSessionIdOf(remote)
+    return {
+      provider: providerOf(signIn), customBaseUrl: (baseUrl ?? '').trim() !== '', nonInteractive: false,
+      cowork: isCowork({ CLAUDE_CODE_IS_COWORK: isCoworkVar, CLAUDE_CODE_ENTRYPOINT: ep }),
+      ...(remoteSessionId !== undefined ? { remoteSessionId } : {}),
+    }
+  })
   entrypoint ??= readEntrypoint($)
   const [resource, sessionId, host, device, ep] = await Promise.all([resourceAttrs, sessionIdOf($), hostFacts, keyDevice ?? {}, entrypoint])
   // No person types into it: its start said so, or it runs under an SDK (`claude -p` among them), which a reload's load still knows.
@@ -1422,22 +1436,27 @@ export async function sessionStart($: SessionStartParams[0], e: SessionStartPara
 /** A main-loop turn began: an interaction opens. */
 export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1], next: TurnStartParams[2]) {
   let out: Emit | null = null
+  // A main-loop turn takes the prompt submitted while the session was idle, if one was, whatever text it starts with.
+  const submitted = e.agentId === undefined ? idleSubmitted?.text : undefined
+  if (e.agentId === undefined) idleSubmitted = undefined
   try {
-    if (e.agentId === undefined && isCopying()) capturePrompt(capture, e.text)
+    // The turn's prompt: its own text, else (a host that starts the turn with none) the prompt submitted to start it.
+    const text = e.text !== '' ? e.text : (submitted ?? '')
+    if (e.agentId === undefined && isCopying()) capturePrompt(capture, text)
     if (e.agentId === undefined) await decideRowless($)
     const r = await rebuildOf($)
     // The prompt row, built where none comes: before the turn, as Claude Code logs it.
     // A turn no prompt began (a continuation) has no prompt row, as in Claude Code.
-    if (r !== null && rowless && e.agentId === undefined && e.text !== '') {
+    if (r !== null && rowless && e.agentId === undefined && text !== '') {
       try {
         // What the session spent between turns (a compaction, a suggestion) is not this turn's.
         await flushOutsideCost($).catch(() => undefined)
-        await feedRow($, promptRow(rowlessState, await rowlessHead($), e.text, await $.clock.now(), (await promptIdOf($)) ?? uuidOf(randomHex(32))))
+        await feedRow($, promptRow(rowlessState, await rowlessHead($), text, await $.clock.now(), (await promptIdOf($)) ?? uuidOf(randomHex(32))))
       } catch {
         // The turn goes without its prompt row.
       }
     }
-    if (r !== null) out = turnStart(r, e, await $.clock.now())
+    if (r !== null) out = turnStart(r, { ...e, text }, await $.clock.now())
   } catch {
     // The turn's interaction is not rebuilt.
   }
@@ -1719,6 +1738,13 @@ export async function commandHook($: CommandParams[0], e: CommandParams[1], next
 export async function promptHook($: PromptParams[0], e: PromptParams[1], next: PromptParams[2]) {
   let r: Rebuild | null = null
   let out: Emit | null = null
+  // Submitted while idle, it starts a turn: held for that turn's start, which comes before `next` resolves.
+  let held: { text: string } | undefined
+  try {
+    if (e.turnId === undefined && e.command === undefined && typeof e.text === 'string') held = idleSubmitted = { text: e.text }
+  } catch {
+    held = undefined
+  }
   try {
     const slash = slashCommand(e.text)
     if (slash !== undefined) expectArgs(slash.name, slash.args, await $.clock.now())
@@ -1730,7 +1756,13 @@ export async function promptHook($: PromptParams[0], e: PromptParams[1], next: P
   } catch {
     r = null
   }
-  const result = await next(e)
+  let result: Awaited<ReturnType<typeof next>>
+  try {
+    result = await next(e)
+  } finally {
+    // Its turn has started by now, or none will (a dropped prompt): no later turn takes its text.
+    if (held !== undefined && idleSubmitted === held) idleSubmitted = undefined
+  }
   // The plan snapshot, beside the prompt that entered, never holding it.
   try {
     if (result.drop === undefined && isCopying()) beside(() => snapshotMarker($))
@@ -1888,6 +1920,7 @@ export const register: Register = on => {
   costChain = Promise.resolve()
   seedSince = {}
   resourceAttrs = null
+  idleSubmitted = undefined
   callStarts = new Map()
   verdicts = new Map()
   agentTypes = new Map()

@@ -11,7 +11,8 @@
 // begins with no row seen means none comes (register.ts decides, and ends it as soon as one does). From those events, the plugin
 // builds the four rows Mainwave reads a session from, under Claude Code's names, attributes and value types:
 //
-//   user_prompt     a main-loop turn began: its prompt's length (the text itself is the gate's to add, as for Claude Code's row)
+//   user_prompt     a main-loop turn began: its prompt's length (the text itself is the gate's to add, as for Claude Code's row); the
+//                   turn's own text, or the prompt submitted while idle where the host starts the turn with none (register.ts)
 //   api_request     a model request answered: its model, tokens, effort, duration, time to first token and cost
 //   assistant_response  a model request answered with text: its length (the text itself is the gate's to add, as for Claude
 //                   Code's row), after its request row
@@ -27,6 +28,7 @@
 import type { TelemetryAttribute } from 'claude-code'
 
 import { identityOf } from './identity.ts'
+import { COWORK_SURFACE, isTruthy } from './otlp.ts'
 import type { RowIn } from './rebuild.ts'
 
 type Attrs = Record<string, TelemetryAttribute>
@@ -81,21 +83,28 @@ export type HostFacts = {
   customBaseUrl: boolean
   /** The session takes no input from a person (`claude -p`, an SDK host): `terminal.type` `non-interactive`. */
   nonInteractive: boolean
+  /** The session is Cowork's (`isCowork`): its rows carry `cowork.surface`, as its host's variables put it on them. */
+  cowork?: boolean
+  /** The id of the remote session the host runs it in (`CLAUDE_CODE_REMOTE_SESSION_ID`): `ccr.session.id`. */
+  remoteSessionId?: string
 }
 
 /** `anthropic.provider` as Claude Code names it, from the variables that pick a cloud provider. */
 export function providerOf(env: { CLAUDE_CODE_USE_BEDROCK?: string | undefined; CLAUDE_CODE_USE_VERTEX?: string | undefined; CLAUDE_CODE_USE_FOUNDRY?: string | undefined }): string {
-  const on = (v: string | undefined) => ['1', 'true', 'yes', 'on'].includes((v ?? '').trim().toLowerCase())
-  return on(env.CLAUDE_CODE_USE_BEDROCK) ? 'bedrock' : on(env.CLAUDE_CODE_USE_VERTEX) ? 'vertex' : on(env.CLAUDE_CODE_USE_FOUNDRY) ? 'foundry' : 'firstParty'
+  return isTruthy(env.CLAUDE_CODE_USE_BEDROCK) ? 'bedrock' : isTruthy(env.CLAUDE_CODE_USE_VERTEX) ? 'vertex' : isTruthy(env.CLAUDE_CODE_USE_FOUNDRY) ? 'foundry' : 'firstParty'
 }
 
 /**
  * The attributes Claude Code puts first on each of its rows, in its order: the organization's resource attributes
  * (`OTEL_RESOURCE_ATTRIBUTES`), then the device, the session and who it is, then where requests go and the terminal (an interactive
  * session's terminal no event names). The rebuild reads them as the session's common attributes, as it reads a row's.
+ *
+ * In Cowork, its host's resource attributes name the surface (`cowork.surface`), so Claude Code's rows carry it: where they don't
+ * (no Cowork export configured), the head starts with Cowork's, `remote`. The remote session's id (`ccr.session.id`) goes after the
+ * session's, where the host names one.
  */
 export function rowHead(resource: Readonly<Record<string, string>>, identity: Readonly<Record<string, string>>, sessionId: string | undefined, host?: HostFacts): Attrs {
-  const out: Attrs = { ...resource }
+  const out: Attrs = host?.cowork && resource['cowork.surface'] === undefined ? { 'cowork.surface': COWORK_SURFACE, ...resource } : { ...resource }
   const put = (key: string, value: string | undefined) => {
     if (value === undefined) return
     delete out[key]
@@ -103,6 +112,7 @@ export function rowHead(resource: Readonly<Record<string, string>>, identity: Re
   }
   put('user.id', identity['user.id'])
   put('session.id', sessionId)
+  put('ccr.session.id', host?.remoteSessionId)
   put('organization.id', identity['organization.id'])
   put('user.email', identity['user.email'])
   put('user.account_uuid', identity['user.account_uuid'])
@@ -126,6 +136,12 @@ export const newRowless = (): Rowless => ({ sequence: 0 })
 export function promptIdFrom(info: unknown): string | undefined {
   const id = info !== null && typeof info === 'object' ? (info as { promptId?: unknown }).promptId : undefined
   return typeof id === 'string' && /^[0-9A-Za-z._:-]{1,128}$/.test(id) ? id : undefined
+}
+
+/** The remote session's id from `CLAUDE_CODE_REMOTE_SESSION_ID`, where it has the shape of an id; undefined otherwise. */
+export function remoteSessionIdOf(raw: string | undefined): string | undefined {
+  const id = raw?.trim()
+  return id !== undefined && /^[0-9A-Za-z._:-]{1,128}$/.test(id) ? id : undefined
 }
 
 /** A random version 4 UUID, from 32 random hex digits: the shape of Claude Code's `prompt.id`. */
