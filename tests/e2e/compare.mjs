@@ -33,7 +33,8 @@
 // The plugin asks Mainwave for its organization's data collection settings once the rows name the organization and email, on the API
 // beside the collector the copy goes to. In the keyless pass that is production's API, which the test-only hooks send here too, and
 // the receiver answers as Mainwave's settings API would, with settings that turn a metadata data point off (`file.kind`) and add a
-// redaction pack, and whose `in_force` names that data point alone, so the rest keep the plugin's defaults; with the env block it is the receiver the person's settings name, which answers as the route off, so the explicit
+// redaction pack, and whose `in_force` names that data point alone, so the rest keep the plugin's defaults and the pass can check the
+// copy carries no identifier or content (tests/orgsettings.test.ts covers an answer with every data point in force); with the env block it is the receiver the person's settings name, which answers as the route off, so the explicit
 // settings below stand. The keyless pass checks the request carried the organization and email alone, that the answer was kept in the store with
 // its organization, and that the copy went without the data point turned off. (The pass sends no content, so the pack is checked as
 // kept, not as run: the unit tests run it.)

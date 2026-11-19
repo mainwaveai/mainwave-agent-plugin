@@ -279,7 +279,7 @@ async function readClaudeTraces($: EngineInterface): Promise<boolean> {
 
 /**
  * The gate's settings for this load, read once: Claude Code's switches from the environment (one set to `0` keeps what it governs as
- * Claude Code sends it), the length limit, the explicit settings in the store, and the data points the person opts in to in their own
+ * Claude Code sends it), the length limit, the organization's settings in the store (its explicit settings and what it gives in force), and the data points the person opts in to in their own
  * user settings. A read that fails counts as unset.
  */
 async function readGate($: EngineInterface): Promise<void> {

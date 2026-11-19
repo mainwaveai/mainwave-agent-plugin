@@ -470,6 +470,25 @@ describe("what Mainwave's settings page shows", () => {
     expect(sent(posts, 'assistant_response')[0]!['response']).toBe('shown')
   })
 
+  test("what another organization's kept answer gives in force never applies", keyless, async ($, on) => {
+    const { clock, posts } = world(on, { settings: () => ({ status: 503 }), store: { dataCollectionSettings: { ...keptPage, organizationId: ORG_B } } })
+    await prompt($, 'hidden')
+    await clock.advance(TICK)
+    expect(sent(posts, 'user_prompt')[0]!['prompt']).toBe('<REDACTED>')
+  })
+
+  test("a later answer without in_force: the store drops it, and the plugin's defaults stand for the rest", keyless, async ($, on) => {
+    const { clock, posts, store } = world(on, { settings: n => (n === 1 ? pageAnswer(SET) : pageAnswer(SET, { inForce: null })) })
+    await row($, 'api_request', { cost_usd: 0.1 })
+    await clock.advance(1)
+    await prompt($, 'shown')
+    await clock.advance(REFRESH_MS)
+    await prompt($, 'hidden')
+    await clock.advance(TICK)
+    expect(sent(posts, 'user_prompt').map(r => r['prompt'])).toEqual(['shown', '<REDACTED>'])
+    expect(store.data.get('dataCollectionSettings')).toEqual({ organizationId: ORG, revision: 3, dataPoints: SET, redactionPacks: ['secrets'] })
+  })
+
   test('a change to what is in force alone (a catalog default changed in a deploy, no new revision) reaches the session and the store', keyless, async ($, on) => {
     const { clock, posts, store } = world(on, {
       settings: n => pageAnswer({}, { inForce: n === 1 ? CATALOG_DEFAULTS : { ...CATALOG_DEFAULTS, 'prompt.text': 'off' } }),
