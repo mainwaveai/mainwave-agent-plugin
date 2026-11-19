@@ -5,7 +5,7 @@ The Mainwave plugin for Claude Code and Cowork. It reports Claude sessions to [M
 It is a Claude Code mod: TypeScript that runs inside Claude Code and Cowork. Nothing needs installing on the machine: no Node, Python or CLI.
 
 > [!IMPORTANT]
-> Requires Claude Code 2.1.317 or later, in every place a session runs: a remote machine, a script, an IDE extension or the desktop app can run an older copy than the terminal does. `claude --version` shows the version; `claude update` updates a native install, and other installs update through their package manager. Older versions send less or nothing; see [Install](#install).
+> Requires Claude Code 2.1.326 or later, in every place a session runs: a remote machine, a script, an IDE extension or the desktop app can run an older copy than the terminal does. `claude --version` shows the version; `claude update` updates a native install, and other installs update through their package manager. Older versions send less or nothing; see [Install](#install).
 
 ## What it does today
 
@@ -142,7 +142,7 @@ Each marker carries the session's organization, email, account and session ID (t
 
 - **Only where its key goes.** A commit, pull request or ticket marker is sent only while the data point of its key is on, and nothing runs to make one while it is off: without its key Mainwave could neither count it nor join it. With no settings that is none of them (their keys are identifiers); the snapshot and the failure go. Every other attribute follows its own data point (a commit's paths `file.path`, a title `change.title`), and the protections and packs, as any record does. Claude Code sends no marker, so a data point set to as Claude Code sends it sends none of a marker's values.
 - **Beside the CLI's hooks, one copy.** Where the merged settings run the CLI's hook for a marker (`mainwave-hook.sh claude-code <Event> <route>`), the script it runs is on the machine (the managed command does nothing where the CLI was never installed), and the session gives the CLI a key to send with (`OTEL_EXPORTER_OTLP_ENDPOINT`, and an `Authorization` header in `OTEL_EXPORTER_OTLP_HEADERS` or an `otelHeadersHelper`), the CLI sends that marker and the plugin does not, so nothing counts twice. The plugin reads those variables only to see whether a key is there; it never keeps or sends the key. Where the hooks run but there is no key (an organization took its env block out), the CLI's hooks send nothing, and the plugin's markers stand in.
-- **Where it can.** The lookups (`git`, `gh`, `glab`) run on the host, so in Cowork, which runs no host commands, a commit makes no marker and a pull request goes without its size. A lookup gets 5 seconds at most (2.5 for glab), beside the call: it never holds the call up. The kind of a turn's API error is read from the end of the session's transcript (its last 64 KiB, then further back, up to 4 MiB, a few times over half a second while the line is not found), so a session that keeps no transcript sends no failure marker; nor do Claude Code versions without `$.session.info` (2.1.325 and earlier, the floor among them), which also give no prompt ID for the snapshot. The session's end waits half a second at most for markers still being made.
+- **Where it can.** The lookups (`git`, `gh`, `glab`) run on the host, so in Cowork, which runs no host commands, a commit makes no marker and a pull request goes without its size. A lookup gets 5 seconds at most (2.5 for glab), beside the call: it never holds the call up. The kind of a turn's API error is read from the end of the session's transcript (its last 64 KiB, then further back, up to 4 MiB, a few times over half a second while the line is not found), so a session that keeps no transcript sends no failure marker; nor do Claude Code versions without `$.session.info` (2.1.325 and earlier, below the floor), which also give no prompt ID for the snapshot. The session's end waits half a second at most for markers still being made.
 - **Keyless ingest has to keep them.** The collector strips every `mainwave.*` key a keyless request carries but the plugin's own stamps, and the markers' source with them; it keeps them once it lets keyless markers keep their `hook.*` source and keys.
 
 **It says what's wrong with the telemetry setup.** As the session's first turn ends, the plugin sends one row of its own, `plugin_status`, through its copy, and another only when what it says changes (10 at most per session, counted from when the plugin loads; a new session after `/clear` has its own). The row carries the session's identity, the plugin's stamps and `mainwave.telemetry.issues`: the codes of what it found, from the fixed list below, in that order. A row with nothing wrong carries no list. Mainwave shows the organization each code with what fixes it.
@@ -270,15 +270,16 @@ In rough order, each in a later version:
 
 ## Install
 
-Needs Claude Code 2.1.317 or later.
+Needs Claude Code 2.1.326 or later.
 
 `claude --version` shows the version, and `claude update` updates a native install. Other installs update through their package manager: `brew upgrade claude-code`, `winget upgrade Anthropic.ClaudeCode`, `sudo apt update && sudo apt upgrade claude-code` (dnf and apk alike) or `npm install -g @anthropic-ai/claude-code@latest`. Homebrew, WinGet and Linux package installs do not update by themselves by default.
 
 On an older version the session is unaffected, as the plugin fails open, but the plugin sends less or nothing:
 
+- From 2.1.323 to 2.1.325, which read `engines` in `plugin.json`, Claude Code does not load the plugin, so it stamps and sends nothing.
 - Below 2.1.299, its hooks module does not load, so it stamps and sends nothing.
 - From 2.1.299 to 2.1.316, its copy's spans lack `gen_ai.provider.name`, and on early versions of that range its keyless copy has gaps too (rows that name the wrong parent span, subagents' requests missing).
-- From 2.1.317 to 2.1.325, which give a plugin no `$.session.info`, it sends no `mainwave.claude_code.stop_failure` marker, and the plan snapshot carries no `prompt.id`.
+- From 2.1.317 to 2.1.322, which give a plugin no `$.session.info`, it sends no `mainwave.claude_code.stop_failure` marker, and the plan snapshot carries no `prompt.id`.
 
 The version that counts is the one each session runs, and a person who has updated Claude Code in their terminal may still run older copies elsewhere:
 
@@ -289,7 +290,7 @@ The version that counts is the one each session runs, and a person who has updat
 
 An organization can turn older versions away: the managed setting `requiredMinimumVersion`, set to the floor, makes Claude Code below it exit at startup (it is read from Claude Code 2.1.163 on).
 
-`plugin.json` states the floor too, as `engines`. Claude Code reads `engines` only from 2.1.323 on, so today it turns no version away: every version that reads it is above the floor.
+`plugin.json` states the floor too, as `engines`. Claude Code reads `engines` only from 2.1.323 on, so it turns away 2.1.323 to 2.1.325, and older versions load the plugin as above.
 
 ### For a whole organization (org sync)
 

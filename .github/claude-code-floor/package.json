@@ -3,6 +3,6 @@
   "private": true,
   "description": "The oldest Claude Code version the plugin supports, which CI also tests against. It changes only by hand, with the README and plugin.json's engines.",
   "devDependencies": {
-    "@anthropic-ai/claude-code": "2.1.317"
+    "@anthropic-ai/claude-code": "2.1.326"
   }
 }

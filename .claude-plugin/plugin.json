@@ -7,7 +7,7 @@
     "name": "Mainwave"
   },
   "engines": {
-    "claude-code": ">=2.1.317"
+    "claude-code": ">=2.1.326"
   },
   "types": "./types/index.d.ts"
 }
