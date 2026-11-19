@@ -476,7 +476,7 @@ async function readLayer($: EngineInterface, source: 'user' | 'project' | 'local
  * The plugin's options the gate reads, once per load and again before each send, so a change reaches records already queued: the data
  * points the person opts in to and the packs they add, from their own user settings (gate.ts, `setOptIn`, `setPersonPacks`), and the
  * packs the organization chooses, in its managed settings, and its data collection settings from Mainwave, as this load had them or the
- * store keeps them (orgsettings.ts, `applyStoredSettings`: its explicit settings per data point too).
+ * store keeps them (orgsettings.ts, `applyStoredSettings`: its explicit settings per data point, and what it gives in force, too).
  * A user layer that cannot be read opts in to nothing; a layer or a store that cannot be read holds identifier and content values back,
  * as its packs are not known. A batch sent again under its idempotency key goes through the gate as it is then, as with any setting:
  * the collector keeps the copy it took first.

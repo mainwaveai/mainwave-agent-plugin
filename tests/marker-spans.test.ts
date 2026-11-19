@@ -7,7 +7,8 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
 import type { Overrides } from '../hooks/gate.ts'
-import { ACCOUNT, boot, EMAIL, infoCall, LOGGED_AT, memoryStore, network, ORG, type Layers, type Post } from './rig.ts'
+import vendored from './fixtures/data-points.ts'
+import { ACCOUNT, boot, EMAIL, infoCall, LOGGED_AT, memoryStore, network, ORG, type Layers, type Post, type Reply } from './rig.ts'
 
 const keyless = { options: {} }
 const START = 1_800_000_000_000
@@ -38,7 +39,7 @@ const TRANSCRIPT = `${HOME}/.claude/projects/-repo/s-1.jsonl`
 /** The message Claude Code writes in place of a failed response, as its transcript line holds it. */
 const failedLine = (uuid: string, error: string) => JSON.stringify({ type: 'assistant', uuid, isApiErrorMessage: true, error, apiErrorStatus: 429, message: { role: 'assistant', content: [{ type: 'text', text: 'API Error: Rate limited, retry in 30s' }] } })
 
-type World = { posts: Post[]; runs: string[][]; reads: string[] }
+type World = { posts: Post[]; runs: string[][]; reads: string[]; store: ReturnType<typeof memoryStore> }
 
 /** What the engine answers of the session: its id, the prompt it is on, and its transcript's last message and lines. */
 const engine = { sessionId: 's-1', promptId: 'prompt-1' as string | undefined, last: undefined as { uuid: string; text: string } | undefined, transcript: '', noInfo: false, infoThere: false }
@@ -47,10 +48,13 @@ let answer: Record<string, unknown> = {}
 
 let mockClock: ReturnType<typeof mock.clock>
 
-function world(on: On, opts: { overrides?: Overrides; env?: Record<string, string>; merged?: Record<string, unknown>; files?: Record<string, unknown>; dirs?: readonly string[]; held?: Promise<void> } = {}): World {
+function world(
+  on: On,
+  opts: { overrides?: Overrides; store?: Record<string, unknown>; settings?: () => Reply; env?: Record<string, string>; merged?: Record<string, unknown>; files?: Record<string, unknown>; dirs?: readonly string[]; held?: Promise<void> } = {},
+): World {
   mockClock = mock.clock(on, { now: START })
-  memoryStore(on, opts.overrides ? { dataPoints: opts.overrides } : {})
-  const posts = network(on)
+  const store = memoryStore(on, opts.store ?? (opts.overrides ? { dataPoints: opts.overrides } : {}))
+  const posts = network(on, undefined, undefined, opts.settings)
   const layers: Layers = {}
   if (opts.merged) Object.assign(layers, { undefined: opts.merged })
   boot(on, { entrypoint: 'cli', env: { HOME, ...opts.env }, layers })
@@ -104,7 +108,7 @@ function world(on: On, opts: { overrides?: Overrides; env?: Record<string, strin
     if (argv[0] === 'gh') return { value: { exitCode: 0, stdout: '{"changedFiles":2,"additions":30,"deletions":4}', stderr: '' } } as never
     return { value: { exitCode: 1, stdout: '', stderr: 'no' } } as never
   })
-  return { posts, runs, reads }
+  return { posts, runs, reads, store }
 }
 
 async function row($: Engine, event = 'api_request') {
@@ -221,6 +225,52 @@ describe("with the markers' keys on", () => {
     const stop = one(posts, 'mainwave.claude_code.stop_failure')!
     expect(stop.attrs).toEqual(expect.objectContaining({ 'mainwave.claude_code.stop_failure.error': 'rate_limit', 'prompt.id': 'prompt-1' }))
     expect(JSON.stringify(posts.map(p => p.body))).not.toContain('retry in 30s')
+  })
+})
+
+describe("with the organization's settings as Mainwave answers them", () => {
+  // The answer's real shape: the organization set file paths and tool input itself, and its settings page shows every other data point
+  // at the default of Mainwave's catalog, all on, as `in_force` says. The markers' keys (`repo`, `work.item`) are among those.
+  const SET = { 'file.path': 'on', 'tool.input': 'on' }
+  const IN_FORCE = Object.fromEntries((vendored as unknown as { data_points: { id: string; required?: boolean; default?: string }[] }).data_points.filter(d => !d.required).map(d => [d.id, d.default!]))
+  const reply = (inForce: Record<string, string> | undefined): Reply => ({
+    status: 200,
+    text: JSON.stringify({ revision: 3, catalog_version: 1, data_points: SET, ...(inForce ? { in_force: inForce } : {}), redaction_packs: ['secrets'], default_data_points: [], redaction_packs_default: true }),
+  })
+  const KEPT = { dataCollectionSettings: { organizationId: ORG, revision: 3, dataPoints: SET, inForce: IN_FORCE, redactionPacks: ['secrets'] } }
+
+  /** `session`, but with the settings' answer in before the work. */
+  async function answered($: Engine, w: World) {
+    await $.session.start({ cwd: '/repo', surface: null, isInteractive: false } as never)
+    await row($)
+    await mockClock.advance(1)
+    return session($, w)
+  }
+
+  test('a commit, a pull request and a ticket: each marker goes, and the store keeps what is in force for a later session', keyless, async ($, on) => {
+    const w = world(on, { settings: () => reply(IN_FORCE) })
+    const posts = await answered($, w)
+    expect(markersOf(posts).map(s => s.name).sort()).toEqual([...stopIf(hasInfo()), 'mainwave.subscription.snapshot', 'vcs.change.opened', 'vcs.commit.created', 'work.item.created'])
+    expect(one(posts, 'vcs.commit.created')!.attrs).toEqual(expect.objectContaining({ 'vcs.commit.sha': SHA, 'vcs.commit.file.paths': ['src/login.ts'] }))
+    expect(one(posts, 'vcs.change.opened')!.attrs['vcs.change.title']).toBe('Fix login')
+    expect(w.store.data.get('dataCollectionSettings')).toEqual(KEPT.dataCollectionSettings)
+  })
+
+  test('a later session: what the store keeps in force applies before Mainwave answers, and while it cannot', keyless, async ($, on) => {
+    const posts = await session($, world(on, { store: KEPT, settings: () => ({ status: 503 }) }))
+    expect(markersOf(posts).map(s => s.name).sort()).toEqual([...stopIf(hasInfo()), 'mainwave.subscription.snapshot', 'vcs.change.opened', 'vcs.commit.created', 'work.item.created'])
+  })
+
+  test("an answer without in_force (an older Mainwave's): its explicit settings alone, so no commit, pull request or ticket marker", keyless, async ($, on) => {
+    const w = world(on, { settings: () => reply(undefined) })
+    const posts = await answered($, w)
+    expect(markersOf(posts).map(s => s.name).sort()).toEqual([...stopIf(hasInfo()), 'mainwave.subscription.snapshot'])
+    expect(w.runs).toEqual([])
+  })
+
+  test("a repository switch at 0 keeps the repository as Claude Code sends it, so no commit or pull request marker; the ticket goes", keyless, async ($, on) => {
+    const posts = await answered($, world(on, { settings: () => reply(IN_FORCE), env: { OTEL_METRICS_INCLUDE_REPOSITORY: '0' } }))
+    expect(markersOf(posts).map(s => s.name).sort()).toEqual([...stopIf(hasInfo()), 'mainwave.subscription.snapshot', 'work.item.created'])
   })
 })
 

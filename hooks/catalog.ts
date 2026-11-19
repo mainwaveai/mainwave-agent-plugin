@@ -100,8 +100,8 @@ export const CATALOG: readonly DataPoint[] = [
 export const DATA_POINTS: ReadonlyMap<DataPointId, DataPoint> = new Map(CATALOG.map(d => [d.id, d]))
 
 /**
- * What each data point that has a setting is with no organization settings: `on` or `off`. The one table of defaults: settings
- * fetched for the organization go in front of it. The rule: metadata on, identifiers and content off, in Claude Code and Cowork alike,
+ * What each data point that has a setting is with no organization settings: `on` or `off`. The plugin's table of defaults: settings
+ * fetched for the organization go in front of it, what they give in force (Mainwave's defaults) included. The rule: metadata on, identifiers and content off, in Claude Code and Cowork alike,
  * until the organization's settings turn them on. Claude Code's switches don't turn a data point on: one the session's environment
  * sets to `0` turns the data points it governs that are on here to `claude` (gate.ts). Required data points are not here: they are
  * always sent.
