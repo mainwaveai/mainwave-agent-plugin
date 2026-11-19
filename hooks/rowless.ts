@@ -155,16 +155,17 @@ const validPath = (path: string) => path !== '' && !path.split('/').some(p => p 
 /**
  * A remote's `host/path`, lowercased, as Claude Code normalizes it: an scp-style `git@host:path`, or an `https`, `http` or `ssh` URL,
  * with any user and a trailing `.git` dropped. A remote session's git proxy on a loopback address (`/git/<owner>/<name>`) stands for
- * GitHub, or for the host its path starts with. Null for anything else (a local path, a `file:` URL).
+ * GitHub, or for the host its path starts with, in a remote session (`CLAUDE_CODE_REMOTE`) alone. Null for anything else (a local path,
+ * a `file:` URL).
  */
-function remoteSlug(raw: string): string | null {
+function remoteSlug(raw: string, remoteSession: boolean): string | null {
   const text = raw.trim()
   const scp = /^git@([^:/@]+):(.+?)(?:\.git)?$/.exec(text)
   if (scp) return validPath(scp[2]!) ? `${scp[1]}/${scp[2]}`.toLowerCase() : null
   const url = /^(?:https?|ssh):\/\/(?:[^@/?#]*@)?([^/?#@]+)\/(.+?)(?:\.git)?$/i.exec(text)
   if (!url || !validPath(url[2]!)) return null
   const [host, path] = [url[1]!, url[2]!]
-  if (LOOPBACK_HOST.test(host) && path.startsWith('git/')) {
+  if (remoteSession && LOOPBACK_HOST.test(host) && path.startsWith('git/')) {
     const rest = path.slice(4)
     const parts = rest.split('/')
     return (parts.length >= 3 && parts[0]!.includes('.') ? rest : `github.com/${rest}`).toLowerCase()
@@ -178,18 +179,19 @@ function remoteSlug(raw: string): string | null {
  * its provider where the host is a known one's. A Bitbucket Server remote (an `scm/` path, or SSH on port 7999) gets that server's
  * address and provider. Empty for a remote that is not a repository's address, or that carries credentials after a query.
  */
-export function repoAttributes(remote: string | null | undefined): Record<string, string> {
+export function repoAttributes(remote: string | null | undefined, opts: { remoteSession?: boolean } = {}): Record<string, string> {
   if (typeof remote !== 'string') return {}
   const cut = remote.search(/[?#]/)
   if (cut >= 0 && remote.includes('@', cut)) return {}
-  const slug = remoteSlug((cut >= 0 ? remote.slice(0, cut) : remote).replace(/\/+$/, ''))
+  const slug = remoteSlug((cut >= 0 ? remote.slice(0, cut) : remote).replace(/\/+$/, ''), opts.remoteSession === true)
   if (slug === null) return {}
   const [first = '', ...rest] = slug.split('/')
   const host = first.replace(/:\d+$/, '')
   const segments = rest.filter(s => s.length > 0)
   const name = segments.at(-1)
   if (!host || !name || host.includes('@') || (host.includes(':') && !/^\[[0-9a-f:.]+\]$/i.test(host)) || segments.some(s => s.includes('@'))) return {}
-  const known = PROVIDER_HOSTS[host]
+  // A known provider's host is known with or without `www.`; any other host is written as the remote names it.
+  const known = PROVIDER_HOSTS[host.replace(/^www\./, '')]
   const webHost = known !== undefined ? WEB_HOST[known]! : host
   const provider = known ?? (webHost === 'gitea.com' ? 'gitea' : undefined)
   const scmAt = segments.length - 3
@@ -284,6 +286,22 @@ function row(state: Rowless, head: Attrs, event: string, atMs: number, attribute
   if (state.promptId !== undefined) out['prompt.id'] = state.promptId
   for (const [k, v] of attributes) if (v !== undefined) out[k] = v
   return { event, atMs, attributes: out }
+}
+
+/**
+ * Whether a user message's text is one Claude Code inserted rather than one the person typed: a background task's notification, a
+ * command's output or caveat, a compaction's summary.
+ */
+export function insertedText(text: string): boolean {
+  const t = typedText(text).trimStart()
+  return /^<[a-z][a-z0-9-]*>/.test(t) || t.startsWith('This session is being continued from a previous conversation')
+}
+
+/** The rules a settings layer's `permissions.allow` lists; none for a layer of another shape. */
+export function permissionRules(layer: unknown): string[] {
+  const permissions = layer !== null && typeof layer === 'object' ? (layer as { permissions?: unknown }).permissions : undefined
+  const allow = permissions !== null && typeof permissions === 'object' ? (permissions as { allow?: unknown }).allow : undefined
+  return Array.isArray(allow) ? allow.filter((r): r is string => typeof r === 'string') : []
 }
 
 /**
@@ -470,7 +488,7 @@ export type Settling = {
   judged?: string
   /** When the call began to run, allowed (`tool.run`); undefined where it never ran. */
   ranAtMs?: number
-  /** After an ask the call was allowed, and the same check now allows it outright: the person or host saved the permission. */
+  /** After an ask the call was allowed, and the same check now allows it by a rule written in a settings file: the answer was saved. */
   permanent?: boolean
   startMs: number
   endMs: number
@@ -486,8 +504,8 @@ export type Settling = {
  *
  * - a verdict the check reached alone (`allow`, `deny`): `hook` or `config`, settled as the call began to run, or as the check refused it;
  * - an ask, then run: `config` where auto mode's classifier or, nobody being there to ask, Claude Code itself settled it; else the
- *   person's or the host's answer, `user_permanent` where they saved it (the check now allows the call outright), else
- *   `user_temporary`. Settled as it began to run;
+ *   person's or the host's answer, `user_permanent` where they saved it in a settings file (the check now allows the call by a rule
+ *   written there), else `user_temporary` (allowed once, or for the session). Settled as it began to run;
  * - an ask that never ran and ended refused: `config` where the classifier refused it or nobody could be asked; `user_reject` for the
  *   person's no or the host's; `user_abort` where the person's turn was interrupted while it asked. Settled as the call ended.
  *

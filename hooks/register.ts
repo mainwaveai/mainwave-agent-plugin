@@ -42,13 +42,13 @@ import {
   linearTicket, MARKER_IDENTITY, MARKER_KEYS, markerResource, outputTexts, parseNumstat, parsePrStats, placeAttributes, prAttributes, prCreateOf, prLookup, prNumberOf, prUrlOf, STOP_FAILURE,
   opaqueId, STOP_FAILURE_ERROR, SUBSCRIPTION_SNAPSHOT, ticketSpan, type MarkerKind,
 } from './markers.ts'
-import { isCowork, parseResourceAttributes, type BuiltSpan, type CopiedRow } from './otlp.ts'
+import { isCowork, isTruthy, parseResourceAttributes, type BuiltSpan, type CopiedRow } from './otlp.ts'
 import {
   agentSpawned, callerCtx, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild, type RowIn,
 } from './rebuild.ts'
 import {
   accountDeviceOf, costOf, decisionOf, decisionRow, headOf, hostIdentityOf, joinPath, madeCommit, newRowless, promptIdFrom, promptRow, providerOf, remoteSessionIdOf, repoAttributes, requestRow, responseRow,
-  responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, typedText, uuidOf, type HostFacts, type HostIdentityEnv, type MadeCommit, type Rowless, type Verdict,
+  insertedText, permissionRules, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, typedText, uuidOf, type HostFacts, type HostIdentityEnv, type MadeCommit, type Rowless, type Verdict,
 } from './rowless.ts'
 import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsPending, settingsSummary, settingsUnavailable } from './orgsettings.ts'
 import { contentLimit } from './protect.ts'
@@ -91,7 +91,7 @@ type SkillParams = Parameters<Hook<'skill.prompt'>>
 type SkillCatchParams = Parameters<CatchHandler<Hook<'skill.prompt'>>>
 
 /**
- * The calls on `$` newer than the floor (2.1.317), as the latest Claude Code declares them: `$.session.info()`, a range of a file, the
+ * The calls on `$` the floor's declarations (2.1.326) may not type as the latest Claude Code declares them: `$.session.info()`, a range of a file, the
  * session's newest messages. Each call is spelled on `$` as ever, typed through this so the type check holds on the floor's
  * declarations too; on an engine without one, the call throws, and its caller catches.
  */
@@ -1450,14 +1450,15 @@ function hostFactsOf($: EngineInterface): Promise<HostFacts> {
 
 /**
  * The person's message the transcript ends on, as the text of a turn that began with none: what a host submitted before the plugin's
- * hooks were in place. '' where the transcript ends on anything else (a tool's results, the model's message) or can't be read.
+ * hooks were in place. '' where the transcript ends on anything else (a tool's results, the model's message, a message Claude Code
+ * inserted itself) or can't be read.
  */
 async function transcriptPrompt($: EngineInterface): Promise<string> {
   try {
     const last = await ($ as unknown as Newer).session.messages({ last: 1 })
     const message = Array.isArray(last) ? last.at(-1) : undefined
-    if (message?.role !== 'user' || (message.toolResults?.length ?? 0) > 0) return ''
-    return typeof message.text === 'string' ? message.text : ''
+    if (message?.role !== 'user' || (message.toolResults?.length ?? 0) > 0 || typeof message.text !== 'string') return ''
+    return insertedText(message.text) ? '' : message.text
   } catch {
     return ''
   }
@@ -1466,7 +1467,8 @@ async function transcriptPrompt($: EngineInterface): Promise<string> {
 /** The session's repository, as its `origin` remote names it (`repoAttributes`); none where it is in none, or it can't be read. */
 async function readRepo($: EngineInterface): Promise<Record<string, string>> {
   try {
-    return repoAttributes((await $.session.repo())?.remote)
+    const [repo, remote] = await Promise.all([$.session.repo(), settle($.env.get('CLAUDE_CODE_REMOTE'))])
+    return repoAttributes(repo?.remote, { remoteSession: isTruthy(remote) })
   } catch {
     return {}
   }
@@ -1609,10 +1611,10 @@ export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1]
     let text = e.text !== '' ? e.text : (submitted ?? '')
     const first = e.agentId === undefined && !mainTurnSeen
     if (e.agentId === undefined) mainTurnSeen = true
-    if (text === '' && first && isCopying()) text = await transcriptPrompt($)
+    if (e.agentId === undefined) await decideRowless($)
+    if (text === '' && first && rowless) text = await transcriptPrompt($)
     if (e.agentId === undefined && text !== '' && (await hostFactsOf($)).cowork === true) text = typedText(text)
     if (e.agentId === undefined && isCopying()) capturePrompt(capture, text)
-    if (e.agentId === undefined) await decideRowless($)
     // The repository the turn runs in, read again each turn: the session may have moved to another, or the remote changed.
     if (rowless && e.agentId === undefined) repoNow = readRepo($)
     const r = await rebuildOf($)
@@ -1930,7 +1932,7 @@ export async function toolRunHook($: ToolRunParams[0], e: ToolRunParams[1], next
       const v = verdicts.get(id)
       if (v?.decision === 'ask' && (v.approver === 'person' || v.approver === 'host') && judgments.get(id) !== 'allow') {
         const { input } = endedCall(e as unknown as ToolCallParams[1])
-        saved.set(id, $.tool.check({ tool: e.tool, input }).then(r => r.decision === 'allow', () => undefined))
+        saved.set(id, $.tool.check({ tool: e.tool, input }).then(r => (r.decision === 'allow' && typeof r.rule === 'string' ? ruleSavedIn($, r.rule) : false), () => undefined))
         if (saved.size > MAX_VERDICTS) saved.delete(saved.keys().next().value!)
       }
     }
@@ -1938,6 +1940,15 @@ export async function toolRunHook($: ToolRunParams[0], e: ToolRunParams[1], next
     // The call's decision goes as it began.
   }
   return next(e)
+}
+
+/**
+ * Whether a permission rule is written in a settings file, the person's, the project's or its local one: an answer saved there is
+ * Claude Code's `user_permanent`. One kept for the session alone, or a mode the answer switched to, is not.
+ */
+async function ruleSavedIn($: EngineInterface, rule: string): Promise<boolean> {
+  const layers = await Promise.all((['user', 'project', 'local'] as const).map(source => $.settings.read({ source }).catch(() => undefined)))
+  return layers.some(layer => permissionRules(layer).includes(rule))
 }
 
 /** A call runs whatever the hook did: the hook calls `next` last, so it never had. */
@@ -2095,6 +2106,8 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
       await markersMade($)
       await flushOutsideCost($).catch(() => undefined)
       await sweepNow($, true)
+      // What waits for the settings' first answer goes now, before the meter collects for the last time.
+      await flushHeldCopies()
       // The setup's status as the session ends, rows given their time: queued with the own rows below.
       statusTimer?.cancel()
       statusTimer = null

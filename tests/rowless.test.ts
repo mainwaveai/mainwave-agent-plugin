@@ -5,7 +5,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { accountDeviceOf, costOf, decisionOf, typedText, decisionSource, headOf, hostIdentityOf, joinPath, madeCommit, refusalKind, repoAttributes, promptIdFrom, responseTextOf, seedCost, newRowless, promptRow, providerOf, remoteSessionIdOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
+import { accountDeviceOf, costOf, decisionOf, insertedText, permissionRules, typedText, decisionSource, headOf, hostIdentityOf, joinPath, madeCommit, refusalKind, repoAttributes, promptIdFrom, responseTextOf, seedCost, newRowless, promptRow, providerOf, remoteSessionIdOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
 import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, infoCall, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, PROD, records, type Post, type Reply } from './rig.ts'
 
 const keyless = { options: {} }
@@ -690,6 +690,16 @@ describe('the permission wait, the repository and the first prompt, in the rows 
     for (const issues of status) expect(issues).toEqual(expect.arrayContaining(['rows_skipped', 'settings_unavailable']))
   })
 
+  test("a session that ends while its first answer is still out sends what waited, its metrics too", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, settings: () => 'hang' })
+    await start($)
+    await turn($, 'my first prompt')
+    await end($)
+    expect(w.built().length).toBe(5)
+    expect(points(w.posts).find(p => p.name === 'claude_code.cost.usage')?.value).toBe(0.01)
+    expect(points(w.posts).some(p => p.name === 'claude_code.token.usage')).toBe(true)
+  })
+
   test('a first answer that hangs: the rows and spans go under the defaults once the request times out', keyless, async ($, on) => {
     const w = world(on, { accountFile: ACCOUNT_FILE, settings: () => 'hang' })
     await start($)
@@ -727,6 +737,14 @@ describe('in Cowork', () => {
     expect(promptsOf(w)).toEqual([[String(typed.length), typed]])
     const rows = w.built()
     expect(rows.find(r => r.attributes['event.name'] === 'api_request')!.attributes['prompt.id']).toBe(rows[0]!.attributes['prompt.id'])
+  })
+
+  test("a first turn whose transcript ends on a message Claude Code inserted builds no prompt row", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: [{ role: 'user', text: '<task-notification>\n<task-id>b1</task-id>\n</task-notification>', toolUses: [] }] })
+    await start($)
+    await turn($, '')
+    await w.clock.advance(5_000)
+    expect(promptsOf(w)).toEqual([])
   })
 
   test('a first turn whose transcript ends on a tool\'s results builds no prompt row', keyless, async ($, on) => {
@@ -833,6 +851,17 @@ describe('in Cowork', () => {
 })
 
 describe('rowless.ts', () => {
+  test("the messages Claude Code inserts are not the person's; a settings layer's allow rules", () => {
+    expect(insertedText('<task-notification>\n<task-id>b1</task-id>')).toBe(true)
+    expect(insertedText("<system-reminder>The user's timezone is UTC.</system-reminder>\n<local-command-stdout>ok</local-command-stdout>")).toBe(true)
+    expect(insertedText('This session is being continued from a previous conversation that ran out of context.')).toBe(true)
+    expect(insertedText("<system-reminder>The user's timezone is UTC.</system-reminder>\nplease check")).toBe(false)
+    expect(insertedText('a < b, check it')).toBe(false)
+    expect(permissionRules({ permissions: { allow: ['Bash(touch:*)', 3], deny: ['Read'] } })).toEqual(['Bash(touch:*)'])
+    expect(permissionRules({ permissions: {} })).toEqual([])
+    expect(permissionRules(undefined)).toEqual([])
+  })
+
   test("Cowork's reminders ahead of what the person typed are dropped; anything else is kept", () => {
     const reminder = "<system-reminder>The user's timezone is UTC.</system-reminder>"
     expect(typedText(`${reminder}\nhello`)).toBe('hello')
@@ -885,8 +914,12 @@ describe('rowless.ts', () => {
     expect(of('https://git.example.com/scm/proj/repo.git')).toEqual(server)
     expect(of('ssh://git@git.example.com:7999/proj/repo.git')).toEqual(server)
     // A remote session's git proxy on a loopback address.
-    expect(of('http://proxy@127.0.0.1:41234/git/acme/api')['vcs.repository.url.full']).toBe('https://github.com/acme/api')
-    expect(of('http://proxy@127.0.0.1:41234/git/git.example.com/o/r')['vcs.repository.url.full']).toBe('https://git.example.com/o/r')
+    expect(repoAttributes('http://proxy@127.0.0.1:41234/git/acme/api', { remoteSession: true })['vcs.repository.url.full']).toBe('https://github.com/acme/api')
+    expect(repoAttributes('http://proxy@127.0.0.1:41234/git/git.example.com/o/r', { remoteSession: true })['vcs.repository.url.full']).toBe('https://git.example.com/o/r')
+    // Outside a remote session, a loopback address is the remote's own.
+    expect(of('http://proxy@127.0.0.1:41234/git/acme/api')['vcs.provider.name']).toBeUndefined()
+    // A known provider's host with `www.`.
+    expect(of('https://www.github.com/acme/api')).toEqual(of('https://github.com/acme/api'))
     // Not a repository's address on the web, or credentials after a query: nothing.
     for (const bad of ['/srv/repos/x.git', 'file:///srv/x.git', 'https://git.example.com/o/r?token=a@b', 'https://git.example.com/', '', null, undefined]) expect(of(bad)).toEqual({})
   })
