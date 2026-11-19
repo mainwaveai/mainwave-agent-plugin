@@ -20,8 +20,8 @@
 //
 // Where no row has reached the plugin by the time the first turn of a load begins (a built-in plugin runs first and sends them on
 // past it), the plugin builds the rows Mainwave reads a session from out of Claude Code's own events instead (rowless.ts): a prompt
-// row as each turn begins, a request row as each model request answers, and a decision and a result row for each tool call, with what
-// the session spends outside them in the cost metric. They go through the rebuild and the copy as Claude Code's rows would, under the
+// row as each turn begins, a request row as each model request answers, and a decision and a result row for each tool call (its
+// permission settled as `tool.check`, `tool.judge` and `tool.run` say), with what the session spends outside them in the cost metric. They go through the rebuild and the copy as Claude Code's rows would, under the
 // host's identity or the account file's, so the spans and metrics go too. The first row of Claude Code's that comes ends it for the
 // load, and a row seen before a reload keeps it from starting.
 
@@ -29,10 +29,10 @@ import { atom, read, update } from 'claude-code'
 import type { CatchHandler, EngineInterface, Frozen, Hook, Next, Register, StreamHook, TelemetryAttribute, TelemetryLogResult, TelemetryRecordEntry, Timer, TurnStepResult } from 'claude-code'
 
 import type { RowIdentity } from '../types'
-import { capturePrompt, captureTool, dropStreamedText, newCapture, rowFill, setStreamedText, streamChunk, streamedText, streamedThinking, streamStart, type Capture } from './capture.ts'
+import { captureCommit, capturePrompt, captureTool, dropStreamedText, newCapture, rowFill, setStreamedText, streamChunk, streamedText, streamedThinking, streamStart, type Capture } from './capture.ts'
 import { MCP_SERVER_ROW, PLUGIN_STATUS_ROW, SKILL_PROMPT_ROW, type Switch } from './catalog.ts'
 import { mcpParts } from './derive.ts'
-import { allows, configureGate, currentGate, gateAttributes, gateMarker, gateRow, gateSpan, metricAllowed, resetPacks, setOptIn, setOverrides } from './gate.ts'
+import { allows, configureGate, currentGate, gateAttributes, gateMarker, gateRow, gateSpan, metricAllowed, openGate, resetPacks, setOptIn, setOverrides } from './gate.ts'
 import { classifyGlab, glabConfigDir, glabHosts, glabTexts, instanceOf, mrAttributes, mrFromApi, mrLookup, mrUrlOf, parseMrJson, repositoryIdOf, sameUrl, stripDraft, type MrDetails, type MrRef } from './glab.ts'
 import { endSession } from './http.ts'
 import { identityOf, isOrgId, mergeIdentity } from './identity.ts'
@@ -46,8 +46,11 @@ import { isCowork, parseResourceAttributes, type BuiltSpan, type CopiedRow } fro
 import {
   agentSpawned, callerCtx, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild, type RowIn,
 } from './rebuild.ts'
-import { accountDeviceOf, costOf, decisionRow, hostIdentityOf, isRefusal, newRowless, promptIdFrom, promptRow, providerOf, remoteSessionIdOf, requestRow, responseRow, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, uuidOf, type HostFacts, type HostIdentityEnv, type Rowless, type Verdict } from './rowless.ts'
-import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsSummary, settingsUnavailable } from './orgsettings.ts'
+import {
+  accountDeviceOf, costOf, decisionOf, decisionRow, headOf, hostIdentityOf, joinPath, madeCommit, newRowless, promptIdFrom, promptRow, providerOf, remoteSessionIdOf, repoAttributes, requestRow, responseRow,
+  responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, typedText, uuidOf, type HostFacts, type HostIdentityEnv, type MadeCommit, type Rowless, type Verdict,
+} from './rowless.ts'
+import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsPending, settingsSummary, settingsUnavailable } from './orgsettings.ts'
 import { contentLimit } from './protect.ts'
 import { adopt, collectorMalformed, collectorOf, configure, enqueue, ensureTimer, finish, isCopying, readOptions, snapshot } from './sender.ts'
 import {
@@ -74,6 +77,9 @@ type StepParams = Parameters<StreamHook<'turn.step'>>
 type ToolCallParams = Parameters<Hook<'tool.call'>>
 type ToolCatchParams = Parameters<CatchHandler<Hook<'tool.call'>>>
 type ToolCheckParams = Parameters<Hook<'tool.check'>>
+type ToolRunParams = Parameters<Hook<'tool.run'>>
+type ToolRunCatchParams = Parameters<CatchHandler<Hook<'tool.run'>>>
+type ToolJudgeParams = Parameters<Hook<'tool.judge'>>
 type MeasureParams = Parameters<Hook<'session.measure'>>
 type PromptParams = Parameters<Hook<'prompt.submit'>>
 type PromptCatchParams = Parameters<CatchHandler<Hook<'prompt.submit'>>>
@@ -90,7 +96,10 @@ type SkillCatchParams = Parameters<CatchHandler<Hook<'skill.prompt'>>>
  * declarations too; on an engine without one, the call throws, and its caller catches.
  */
 type Newer = {
-  session: { info: () => Promise<{ promptId?: string; transcriptPath?: string; platform?: string }>; messages: (args: { last: number }) => Promise<readonly { role: string; uuid?: string }[] | { deny: string }> }
+  session: {
+    info: () => Promise<{ promptId?: string; transcriptPath?: string; platform?: string }>
+    messages: (args: { last: number }) => Promise<readonly { role: string; uuid?: string; text?: unknown; toolResults?: readonly unknown[] }[] | { deny: string }>
+  }
   fs: { read: (path: string, range: { offset: number; length: number }) => Promise<string> }
 }
 
@@ -163,10 +172,20 @@ let resourceAttrs: Promise<Record<string, string>> | null = null
 let idleSubmitted: { text: string } | undefined
 /** A main-loop turn is running, from its `turn.start` to its `turn.complete`: a prompt submitted then is not one a turn starts with. */
 let mainTurnOpen = false
+/** A main-loop turn has begun in this load. */
+let mainTurnSeen = false
 /** When each tool call the plugin builds rows for began, by its id, until it ends. */
 let callStarts = new Map<string, number>()
 /** The permission check's verdict on each of those calls (`allow`, `deny` or `ask`), by its id, until it ends. */
 let verdicts = new Map<string, Verdict>()
+/** What auto mode's classifier answered about each of those calls it was asked about (`tool.judge`), by its id, until it ends. */
+let judgments = new Map<string, string>()
+/** When each of those calls began to run, allowed (`tool.run`), by its id, until it ends. */
+let runs = new Map<string, number>()
+/** For a call allowed after an ask: whether the check now allows it outright (the permission was saved), by its id, until it ends. */
+let saved = new Map<string, Promise<boolean | undefined>>()
+/** The session's repository, as its `origin` remote names it, for the rows built: read as each main-loop turn begins. */
+let repoNow: Promise<Record<string, string>> | null = null
 /** Each subagent's type and whether Claude Code ships it, by its id, as its spawn said. */
 let agentTypes = new Map<string, { type: string; builtIn: boolean }>()
 /** Where the session's requests go and whether a person types into it, read once per load. */
@@ -325,6 +344,19 @@ async function readOverrides($: EngineInterface): Promise<void> {
   }
 }
 
+/**
+ * Whether the repository goes on the records the plugin builds where no row comes: only where its data point is on in its own right,
+ * as for everything else the plugin reads itself. Claude Code would add it only with its own switch on, and none of its rows come.
+ */
+function builtRepoAllowed(gate: ReturnType<typeof currentGate>): boolean {
+  return allows(gate, 'repo', false)
+}
+
+/** Attributes without the repository's (`vcs.*`): what the plugin built, where the repository may not go on it. */
+function withoutRepo<T>(attributes: Readonly<Record<string, T>>): Record<string, T> {
+  return Object.fromEntries(Object.entries(attributes).filter(([k]) => !k.startsWith('vcs.')))
+}
+
 /** The gate in force, once this load has read its settings. */
 async function gateOf($: EngineInterface) {
   gateRead ??= readGate($).catch(() => undefined)
@@ -343,7 +375,9 @@ async function makeRebuild($: EngineInterface): Promise<Rebuild> {
   ])
   const limit = positiveInt(spanLimit) ?? positiveInt(anyLimit)
   return newRebuild({
-    gate: currentGate,
+    // While the rows are built and the organization's settings have yet to first answer, everything is built: what goes is decided
+    // once the answer is in (`emit`).
+    gate: () => (rowless && settingsPending() !== undefined ? openGate() : currentGate()),
     claudeTraces,
     ...(parseTraceparent(traceparent) ? { traceparent: parseTraceparent(traceparent)! } : {}),
     ...(limit !== undefined ? { valueLengthLimit: limit } : {}),
@@ -377,12 +411,30 @@ async function rebuildOf($: EngineInterface): Promise<Rebuild | null> {
  * `plugin`, a measure of a data point that is off not at all.
  */
 async function emit($: EngineInterface, out: Emit): Promise<void> {
+  if (out.spans.length === 0 && out.measures.length === 0) return
+  // Built while the organization's settings have yet to first answer: it waits for the answer, as a row's copy does.
+  const pending = rowless ? settingsPending() : undefined
+  if (pending !== undefined) {
+    ensureTimer($)
+    holdCopy($, pending, () => emitNow($, out, true))
+    return
+  }
+  await emitNow($, out, rowless)
+}
+
+/**
+ * Queues spans and measures through the gate in force. `built`, what the plugin built where no row comes: strictly, only what is on
+ * in its own right, as for what it reads itself into a row, and with the repository only where it may go on what the plugin builds.
+ */
+async function emitNow($: EngineInterface, out: Emit, built: boolean): Promise<void> {
   const gate = await gateOf($)
+  const strip = built && !builtRepoAllowed(gate)
   for (const m of out.measures) {
-    if (metricAllowed(gate, m.name)) add(meter, { ...m, attributes: { ...gateAttributes(gate, m.name, m.attributes), ...routeStamps() } })
+    const attributes = strip ? withoutRepo(m.attributes) : m.attributes
+    if (metricAllowed(gate, m.name, built)) add(meter, { ...m, attributes: { ...gateAttributes(gate, m.name, attributes, {}, built), ...routeStamps() } })
   }
   for (const span of out.spans) {
-    const gated = gateSpan(gate, span)
+    const gated = gateSpan(gate, strip ? { ...span, attributes: withoutRepo(span.attributes) } : span, built)
     await enqueue($, { s: 'traces', d: { ...gated, attributes: { ...gated.attributes, ...routeStamps() } } })
   }
 }
@@ -430,7 +482,7 @@ async function flushOwn($: EngineInterface): Promise<void> {
   for (let o = own.shift(); o !== undefined; o = own.shift()) {
     const at = new Date(o.atMs).toISOString()
     const attributes = {
-      ...applyStamps({ ...common, 'event.name': o.event, 'event.timestamp': at, ...o.attributes }, {
+      ...applyStamps({ ...(rowless && !builtRepoAllowed(gate) ? withoutRepo(common) : common), 'event.name': o.event, 'event.timestamp': at, ...o.attributes }, {
         'mainwave.plugin.name': PLUGIN_NAME, 'mainwave.plugin.version': VERSION, 'mainwave.plugin.entrypoint': ep, 'mainwave.telemetry.route': 'plugin',
       }),
       ...issuesStamp(o.issues ?? []),
@@ -1217,7 +1269,7 @@ export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams
  * is the plugin's own: a fault in either never holds the exporter's row, and a fault in the rebuild never holds the copy. The row's
  * copy is queued before what the row completes, as the row came first.
  */
-async function copyRow($: EngineInterface, e: Frozen<TelemetryRecordEntry>, attributes: Record<string, TelemetryAttribute>): Promise<void> {
+async function copyRow($: EngineInterface, e: Frozen<TelemetryRecordEntry>, attributes: Record<string, TelemetryAttribute>, built = false): Promise<void> {
   let out: Awaited<ReturnType<typeof observe>> = null
   try {
     out = await observe($, e)
@@ -1232,14 +1284,63 @@ async function copyRow($: EngineInterface, e: Frozen<TelemetryRecordEntry>, attr
   }
   try {
     // The copy goes through the gate: what it holds back removed, what the plugin read and it allows added, the protections applied.
-    const gated = gateAttributes(await gateOf($), e.event, attributes, rowFill(capture, e.event, e.attributes))
-    await enqueue($, { s: 'logs', d: copyOf(e, gated, out?.rowCtx) })
+    // What the plugin read is taken now, for this row alone. Where the organization's settings have yet to first answer and nothing
+    // of theirs applies, the copy waits for them beside the row, a few seconds at most: the row goes on at once.
+    const fill = rowFill(capture, e.event, e.attributes)
+    const copy = async () => {
+      const gate = await gateOf($)
+      // A row the plugin built carries the repository only where it may go on what the plugin builds.
+      const gated = gateAttributes(gate, e.event, built && !builtRepoAllowed(gate) ? withoutRepo(attributes) : attributes, fill)
+      await enqueue($, { s: 'logs', d: copyOf(e, gated, out?.rowCtx) })
+    }
+    const pending = settingsPending()
+    if (pending === undefined) await copy()
+    else {
+      // The send timer runs from the row, as it would for a copy queued at once.
+      ensureTimer($)
+      holdCopy($, pending, copy)
+    }
   } catch {
     // Lost to the copy alone.
   }
   if (out !== null) await emit($, out).catch(() => undefined)
   // The session's identity may be known now: the plugin's own rows waiting for it go, beside the row.
   if (own.length > 0 || markers.length > 0) void flushOwn($).catch(() => undefined)
+}
+
+/** How long a row's copy waits, at most, for the organization's settings to first answer. */
+export const SETTINGS_WAIT_MS = 6_000
+/** The copies waiting for the settings' first answer, and what ends their wait at once (the session's end). */
+const heldCopies = new Set<Promise<void>>()
+/** The last copy held: each goes after the one before, so they are queued in the order their rows came. */
+let lastHeld: Promise<void> = Promise.resolve()
+let releaseHeld: () => void = () => {}
+let released = new Promise<void>(resolve => (releaseHeld = resolve))
+
+/** Queues a row's copy once the settings have first answered, `SETTINGS_WAIT_MS` have passed, or the session ends. Never throws. */
+function holdCopy($: EngineInterface, pending: Promise<void>, copy: () => Promise<void>): void {
+  // A timer, not a sleep: a sleep is the row's hook's own, and ends with it.
+  const limit = new Promise<void>(resolve => {
+    try {
+      const timer = $.clock.after(SETTINGS_WAIT_MS, () => resolve())
+      void pending.then(() => timer.cancel())
+    } catch {
+      resolve()
+    }
+  })
+  const before = lastHeld
+  const p = Promise.race([pending, limit, released]).then(() => before).then(copy).catch(() => undefined)
+  lastHeld = p
+  heldCopies.add(p)
+  void p.finally(() => heldCopies.delete(p))
+}
+
+/** The copies still waiting go now, through the settings in force: the session is ending. */
+async function flushHeldCopies(): Promise<void> {
+  releaseHeld()
+  if (heldCopies.size > 0) await Promise.allSettled([...heldCopies])
+  // After a /clear or a resume the process goes on: a later copy may wait again.
+  released = new Promise<void>(resolve => (releaseHeld = resolve))
 }
 
 // ── Rowless: the rows built from Claude Code's events (rowless.ts) ──────────────────────────────────────────────────────────────
@@ -1323,6 +1424,16 @@ function endRowless(): void {
 /** The attributes the rows built now start with: the organization's resource attributes, the device, the session and who it is. */
 async function rowlessHead($: EngineInterface): Promise<Record<string, TelemetryAttribute>> {
   resourceAttrs ??= settle($.env.get('OTEL_RESOURCE_ATTRIBUTES')).then(parseResourceAttributes, () => ({}))
+  const facts = hostFactsOf($)
+  entrypoint ??= readEntrypoint($)
+  repoNow ??= readRepo($)
+  const [resource, sessionId, host, device, ep, repo] = await Promise.all([resourceAttrs, sessionIdOf($), facts, keyDevice ?? {}, entrypoint, repoNow])
+  // No person types into it: its start said so, or it runs under an SDK (`claude -p` among them), which a reload's load still knows.
+  return rowHead(resource, accountCommon ?? device, sessionId, { ...host, nonInteractive: nonInteractive || ep.startsWith('sdk') }, repo)
+}
+
+/** Where the session's requests go and whether it is Cowork's, read once per load. */
+function hostFactsOf($: EngineInterface): Promise<HostFacts> {
   hostFacts ??= Promise.all([
     readSignInEnv($), settle($.env.get('ANTHROPIC_BASE_URL')), settle($.env.get('CLAUDE_CODE_IS_COWORK')), settle($.env.get('CLAUDE_CODE_ENTRYPOINT')),
     settle($.env.get('CLAUDE_CODE_REMOTE_SESSION_ID')),
@@ -1334,10 +1445,57 @@ async function rowlessHead($: EngineInterface): Promise<Record<string, Telemetry
       ...(remoteSessionId !== undefined ? { remoteSessionId } : {}),
     }
   })
-  entrypoint ??= readEntrypoint($)
-  const [resource, sessionId, host, device, ep] = await Promise.all([resourceAttrs, sessionIdOf($), hostFacts, keyDevice ?? {}, entrypoint])
-  // No person types into it: its start said so, or it runs under an SDK (`claude -p` among them), which a reload's load still knows.
-  return rowHead(resource, accountCommon ?? device, sessionId, { ...host, nonInteractive: nonInteractive || ep.startsWith('sdk') })
+  return hostFacts
+}
+
+/**
+ * The person's message the transcript ends on, as the text of a turn that began with none: what a host submitted before the plugin's
+ * hooks were in place. '' where the transcript ends on anything else (a tool's results, the model's message) or can't be read.
+ */
+async function transcriptPrompt($: EngineInterface): Promise<string> {
+  try {
+    const last = await ($ as unknown as Newer).session.messages({ last: 1 })
+    const message = Array.isArray(last) ? last.at(-1) : undefined
+    if (message?.role !== 'user' || (message.toolResults?.length ?? 0) > 0) return ''
+    return typeof message.text === 'string' ? message.text : ''
+  } catch {
+    return ''
+  }
+}
+
+/** The session's repository, as its `origin` remote names it (`repoAttributes`); none where it is in none, or it can't be read. */
+async function readRepo($: EngineInterface): Promise<Record<string, string>> {
+  try {
+    return repoAttributes((await $.session.repo())?.remote)
+  } catch {
+    return {}
+  }
+}
+
+/** How long the read of HEAD for a call's commit may take, after the call: its result row waits for it. */
+export const HEAD_READ_MS = 500
+
+/**
+ * Where HEAD is in the repository the session is in: the git folder found from the session's directory up (a `.git` folder, or a
+ * worktree's `.git` file naming its own), read with `$.fs`, as no host command runs in Cowork. Undefined where none is found.
+ */
+async function readHead($: EngineInterface): Promise<MadeCommit | undefined> {
+  const read = async (path: string) => {
+    const text = await $.fs.read(path)
+    if (typeof text !== 'string') throw new Error('not text')
+    return text
+  }
+  let dir = (await $.session.cwd()).replace(/\\/g, '/').replace(/\/+$/, '')
+  for (let depth = 0; depth < 64 && dir !== ''; depth++) {
+    const pointer = await read(`${dir}/.git`).catch(() => undefined)
+    const gitDir = pointer !== undefined ? /^gitdir: (.+)$/m.exec(pointer)?.[1]?.trim() : undefined
+    if (gitDir !== undefined) return headOf(joinPath(dir, gitDir), read)
+    if (await read(`${dir}/.git/HEAD`).then(() => true, () => false)) return headOf(`${dir}/.git`, read)
+    const up = dir.slice(0, dir.lastIndexOf('/'))
+    if (up === dir) break
+    dir = up
+  }
+  return undefined
 }
 
 /** A row built from Claude Code's events, as Claude Code's own go: stamped, through the rebuild, and copied. */
@@ -1348,7 +1506,7 @@ async function feedRow($: EngineInterface, row: RowIn): Promise<void> {
   const attributes = applyStamps(row.attributes, {
     'mainwave.plugin.name': PLUGIN_NAME, 'mainwave.plugin.version': VERSION, 'mainwave.plugin.entrypoint': ep, [BUILT_FROM_STAMP]: 'events',
   })
-  await copyRow($, e, attributes)
+  await copyRow($, e, attributes, true)
 }
 
 /** Claude Code's id of the prompt the session is on, so the rows built of its turn carry the one its own records do; undefined where it can't be read. */
@@ -1445,10 +1603,18 @@ export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1]
     mainTurnOpen = true
   }
   try {
-    // The turn's prompt: its own text, else (a host that starts the turn with none) the prompt submitted to start it.
-    const text = e.text !== '' ? e.text : (submitted ?? '')
+    // The turn's prompt: its own text, else (a host that starts the turn with none) the prompt submitted to start it, else, for the
+    // load's first turn, the person's message the transcript ends on (a host can submit it before the plugin's hooks are in place).
+    // In Cowork, without the blocks Cowork puts ahead of what the person typed, as Claude Code's own prompt rows go.
+    let text = e.text !== '' ? e.text : (submitted ?? '')
+    const first = e.agentId === undefined && !mainTurnSeen
+    if (e.agentId === undefined) mainTurnSeen = true
+    if (text === '' && first && isCopying()) text = await transcriptPrompt($)
+    if (e.agentId === undefined && text !== '' && (await hostFactsOf($)).cowork === true) text = typedText(text)
     if (e.agentId === undefined && isCopying()) capturePrompt(capture, text)
     if (e.agentId === undefined) await decideRowless($)
+    // The repository the turn runs in, read again each turn: the session may have moved to another, or the remote changed.
+    if (rowless && e.agentId === undefined) repoNow = readRepo($)
     const r = await rebuildOf($)
     // The prompt row, built where none comes: before the turn, as Claude Code logs it.
     // A turn no prompt began (a continuation) has no prompt row, as in Claude Code.
@@ -1649,22 +1815,46 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
     try {
       const endMs = await $.clock.now()
       const verdict = id !== undefined ? verdicts.get(id) : undefined
-      if (id !== undefined) verdicts.delete(id)
+      const judged = id !== undefined ? judgments.get(id) : undefined
+      const ranAtMs = id !== undefined ? runs.get(id) : undefined
+      const permanent = id !== undefined ? saved.get(id) : undefined
+      if (id !== undefined) {
+        verdicts.delete(id)
+        judgments.delete(id)
+        runs.delete(id)
+        saved.delete(id)
+      }
       // The decision and result rows, built where none comes: a refused call has its decision alone, as in Claude Code. The decision
       // goes first, so a refused call's spans go as it ends.
       const built = rowless && id !== undefined && startMs !== undefined
-      const settled = result as { isError?: boolean; deny?: unknown; text?: unknown } | undefined
-      // A refused call ends in an error, like a call whose tool failed: the check and the error's text say which. One the check refused
-      // outright, or asked about and that ended in Claude Code's text of a refusal (the person's, or the ask's own reason), was refused.
-      const refused = settled?.deny !== undefined || verdict?.decision === 'deny' || (verdict?.decision === 'ask' && settled?.isError === true && isRefusal(settled.text, verdict.reason))
+      const settled = result as { isError?: boolean; deny?: unknown; text?: unknown; result?: unknown } | undefined
+      const isError = settled?.isError === true
+      // Whether it was refused, who settled it and when: the check's verdict, the classifier's, whether it ran, and whether the
+      // permission an ask was answered with was saved (asked of the check as the call began to run, answered by now).
+      const decision = decisionOf({
+        ...(verdict !== undefined ? { verdict } : {}),
+        ...(judged !== undefined ? { judged } : {}),
+        ...(ranAtMs !== undefined ? { ranAtMs } : {}),
+        ...(built && permanent !== undefined ? { permanent: (await Promise.race([permanent, $.clock.sleep(HEAD_READ_MS).then(() => undefined)])) === true } : {}),
+        startMs: startMs ?? endMs, endMs, denied: settled?.deny !== undefined, isError, text: settled?.text,
+      })
+      const refused = decision.refused
       const call = { tool: e.tool, id: id!, ...(e.agentId !== undefined ? { agentId: e.agentId } : {}) }
       const head = built ? await rowlessHead($) : undefined
-      if (built) await feedRow($, decisionRow(rowlessState, head!, { ...call, refused, ...(verdict !== undefined ? { verdict } : {}) }, startMs!))
+      if (built) await feedRow($, decisionRow(rowlessState, head!, { ...call, refused, ...(decision.source !== undefined ? { source: decision.source } : {}) }, decision.atMs))
       await emit($, toolEnd(r, id, result as never, endMs))
       if (built && !refused) {
         const { tool: _tool, tool_use_id: _id, agentId: _agent, consent: _consent, requestMeta: _meta, ...input } = e as unknown as Record<string, unknown>
         const text = settled?.text
-        await feedRow($, resultRow(rowlessState, head!, { ...call, startMs: startMs!, endMs, isError: settled?.isError === true, input, ...(typeof text === 'string' ? { text } : {}) }))
+        // A shell call that reported a commit: HEAD's, where HEAD now names it, as Claude Code's result row names it. Read only where the
+        // repository may go on the row (or may yet, the settings' first answer pending).
+        const repoMayGo = settingsPending() !== undefined || builtRepoAllowed(currentGate())
+        const reported = !isError && repoMayGo && ended?.tool === 'Bash' ? commitsInOutput(outputTexts(settled?.result)) : []
+        const commit = reported.length > 0 ? madeCommit(reported, await Promise.race([readHead($).catch(() => undefined), $.clock.sleep(HEAD_READ_MS).then(() => undefined)])) : undefined
+        if (commit !== undefined) captureCommit(capture, id!, commit)
+        await feedRow($, resultRow(rowlessState, head!, {
+          ...call, startMs: startMs!, ...(ranAtMs !== undefined ? { runStartMs: ranAtMs } : {}), endMs, isError, input, ...(typeof text === 'string' ? { text } : {}), ...(commit !== undefined ? { commit } : {}),
+        }))
       }
     } catch {
       // The call's spans go with what the rows say.
@@ -1691,11 +1881,13 @@ export async function toolCheckHook($: ToolCheckParams[0], e: ToolCheckParams[1]
   const verdict = await next(e)
   try {
     const id = (e as { tool_use_id?: unknown }).tool_use_id
+    const approver = (e as { approver?: unknown }).approver
     const v = verdict as Verdict | undefined
     if (rowless && typeof id === 'string' && typeof v?.decision === 'string') {
       verdicts.set(id, {
         decision: v.decision, ...(typeof v.rule === 'string' ? { rule: v.rule } : {}), ...(typeof v.hook === 'string' ? { hook: v.hook } : {}),
         ...(typeof v.setting === 'string' ? { setting: v.setting } : {}), ...(typeof v.reason === 'string' ? { reason: v.reason } : {}),
+        ...(typeof approver === 'string' ? { approver } : {}),
       })
       if (verdicts.size > MAX_VERDICTS) verdicts.delete(verdicts.keys().next().value!)
     }
@@ -1703,6 +1895,54 @@ export async function toolCheckHook($: ToolCheckParams[0], e: ToolCheckParams[1]
     // The call's decision row says accept.
   }
   return verdict
+}
+
+/**
+ * Auto mode's classifier answered about a call, while the plugin builds the rows: its answer, kept for the call's decision row (an
+ * ask it settled is the mode's, not a person's). The question goes on and the answer comes back unchanged.
+ */
+export async function toolJudgeHook($: ToolJudgeParams[0], e: ToolJudgeParams[1], next: ToolJudgeParams[2]) {
+  const answer = await next(e)
+  try {
+    const id = (e as { tool_use_id?: unknown }).tool_use_id
+    const decision = (answer as { decision?: unknown } | undefined)?.decision
+    if (rowless && typeof id === 'string' && typeof decision === 'string') {
+      judgments.set(id, decision)
+      if (judgments.size > MAX_VERDICTS) judgments.delete(judgments.keys().next().value!)
+    }
+  } catch {
+    // The call's decision names no classifier.
+  }
+  return answer
+}
+
+/**
+ * A call was allowed and is about to run, while the plugin builds the rows: when, which ends the wait for its permission
+ * (`claude_code.tool.blocked_on_user`) and starts its run. After an ask someone answered, the check is asked again, beside the call,
+ * whether it now allows the call outright: the answer was saved. The call runs untouched, and nothing here holds it.
+ */
+export async function toolRunHook($: ToolRunParams[0], e: ToolRunParams[1], next: ToolRunParams[2]) {
+  try {
+    const id = e.tool_use_id
+    if (rowless && typeof id === 'string' && callStarts.has(id)) {
+      runs.set(id, await $.clock.now())
+      if (runs.size > MAX_VERDICTS) runs.delete(runs.keys().next().value!)
+      const v = verdicts.get(id)
+      if (v?.decision === 'ask' && (v.approver === 'person' || v.approver === 'host') && judgments.get(id) !== 'allow') {
+        const { input } = endedCall(e as unknown as ToolCallParams[1])
+        saved.set(id, $.tool.check({ tool: e.tool, input }).then(r => r.decision === 'allow', () => undefined))
+        if (saved.size > MAX_VERDICTS) saved.delete(saved.keys().next().value!)
+      }
+    }
+  } catch {
+    // The call's decision goes as it began.
+  }
+  return next(e)
+}
+
+/** A call runs whatever the hook did: the hook calls `next` last, so it never had. */
+export function toolRunCatch($: ToolRunCatchParams[0], e: ToolRunCatchParams[1], next: ToolRunCatchParams[2]) {
+  return next(e)
 }
 
 /**
@@ -1865,6 +2105,7 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
       // Claude Code's meter collects once more as the process ends; after a /clear or a resume the process goes on, and so does it.
       if (e.reason !== 'clear' && e.reason !== 'resume') await collectNow($)
     }
+    await flushHeldCopies()
     await finish($, next.budget)
     // Never the value: only that it does not fit.
     if (collectorMalformed()) $.ui.log('mainwave: copy off: the collectorUrl option is not an https URL (or http on loopback)', { to: 'debug' })
@@ -1930,8 +2171,13 @@ export const register: Register = on => {
   resourceAttrs = null
   idleSubmitted = undefined
   mainTurnOpen = false
+  mainTurnSeen = false
   callStarts = new Map()
   verdicts = new Map()
+  judgments = new Map()
+  runs = new Map()
+  saved = new Map()
+  repoNow = null
   agentTypes = new Map()
   hostFacts = null
   nonInteractive = false
@@ -1951,6 +2197,8 @@ export const register: Register = on => {
   on('turn.complete', turnCompleteHook)
   on('tool.call', toolCallHook).catch(toolCatch)
   on('tool.check', toolCheckHook)
+  on('tool.judge', toolJudgeHook)
+  on('tool.run', toolRunHook).catch(toolRunCatch)
   on('session.measure', measureHook)
   on('command.run', commandHook).catch(commandCatch)
   on('prompt.submit', promptHook).catch(promptCatch)

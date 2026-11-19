@@ -5,11 +5,13 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { accountDeviceOf, costOf, decisionSource, hostIdentityOf, isRefusal, promptIdFrom, responseTextOf, seedCost, newRowless, promptRow, providerOf, remoteSessionIdOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
-import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, infoCall, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, PROD, records, type Post } from './rig.ts'
+import { accountDeviceOf, costOf, decisionOf, typedText, decisionSource, headOf, hostIdentityOf, joinPath, madeCommit, refusalKind, repoAttributes, promptIdFrom, responseTextOf, seedCost, newRowless, promptRow, providerOf, remoteSessionIdOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
+import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, infoCall, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, PROD, records, type Post, type Reply } from './rig.ts'
 
 const keyless = { options: {} }
 const START = 1_800_000_000_000
+/** How long the settings hook takes to answer an ask. */
+const ANSWER_MS = 2_000
 const HOME = '/home/dev'
 /** Claude's account file as a login leaves it (example values). */
 const ACCOUNT_FILE = { userID: DEVICE, oauthAccount: { organizationUuid: ORG, emailAddress: EMAIL, accountUuid: ACCOUNT } }
@@ -19,7 +21,7 @@ const HOST_EMAIL = 'host@example.com'
 const BUILT = 'mainwave.telemetry.built_from'
 const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 300, cache_creation_input_tokens: 40, ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 40 }
 
-type World = { env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown> }
+type World = { messages?: unknown[]; settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown> }
 
 function world(on: On, opts: World = {}) {
   const clock = mock.clock(on, { now: START })
@@ -29,7 +31,7 @@ function world(on: On, opts: World = {}) {
   const posts = network(on, (_n, post) => {
     const answer = keylessAnswer(post)
     return { status: answer.status, text: answer.text }
-  })
+  }, undefined, opts.settings)
   // Claude Code 2.1.326 on hands each plugin a row as it loads, so a turn that begins with none seen means none comes.
   const rig = boot(on, { entrypoint: opts.entrypoint ?? 'cli', env: { HOME, ...opts.env }, version: opts.version ?? '2.1.328' })
   // `$.session.machine()`, by a glob: Claude Code before 2.1.328 has no such call, and refuses a hook that names it.
@@ -48,9 +50,13 @@ function world(on: On, opts: World = {}) {
   on('fs.read', (_$, e) => {
     const path = (e as unknown as { path: string }).path
     if (path === `${HOME}/.claude.json` && opts.accountFile !== undefined) return { value: JSON.stringify(opts.accountFile) } as never
+    if (opts.files?.[path] !== undefined) return { value: opts.files[path] } as never
     throw new Error(`no file at ${path} in test`)
   })
   on('session.id', () => ({ value: 's-1' }) as never)
+  on('session.cwd', () => ({ value: '/work/app' }) as never)
+  on('session.messages', () => ({ value: opts.messages ?? [] }) as never)
+  on('session.repo', () => ({ value: opts.repo === undefined || opts.repo === null ? null : { root: '/work/app', remote: opts.repo.remote, internal: false, name: null } }) as never)
   // The session's cost after each request, in turn; `spend` adds a cost outside any request of a turn.
   const costs = [...(opts.costs ?? [0.01, 0.03, 0.06, 0.1])]
   let cost = opts.costBefore ?? 0
@@ -73,15 +79,28 @@ function world(on: On, opts: World = {}) {
     cost = Math.round(((costs.shift() ?? 0) + cost) * 1e9) / 1e9
     return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: { ...USAGE, model: 'claude-haiku-5-5' } } as never
   })
-  // The permission check: an ask for a command outside the working folder, an allow for the rest.
-  on('tool.check', (_$, e) => ((e as { input?: { command?: string } }).input?.command === 'touch /outside' ? { decision: 'ask', reason: 'needs approval' } : { decision: 'allow' }) as never)
+  // The permission check: an ask for a command outside the working folder, and for one a settings hook on the permission request
+  // answers (`touch /asked`); an allow for the rest. With `saved`, the answer was saved: the check allows the command outright.
+  on('tool.check', (_$, e) => {
+    const command = (e as { input?: { command?: string } }).input?.command
+    if (command === 'touch /outside') return { decision: 'ask', reason: 'needs approval' } as never
+    if (command?.startsWith('touch /asked')) return (opts.saved ? { decision: 'allow', rule: 'Bash(touch:*)' } : { decision: 'ask', reason: 'needs approval' }) as never
+    return { decision: 'allow' } as never
+  })
+  // Nobody is asked in a test: the settings hook answers `touch /asked`, after two seconds, and says no to `touch /asked, refused`.
+  on('classic.PermissionRequest', async (_$, e) => {
+    const command = (e as { tool_input?: { command?: string } }).tool_input?.command
+    if (!command?.startsWith('touch /asked')) return {} as never
+    await clock.advance(ANSWER_MS)
+    return { decision: command === 'touch /asked, refused' ? { behavior: 'deny', message: 'not now' } : { behavior: 'allow' } } as never
+  })
+  // The tool itself, once the call is allowed and has begun to run.
   on('tool.call', async (_$, e) => {
     await clock.advance(25)
     const input = e as unknown as { command?: string }
     if (input.command === 'rm -rf x') return { deny: 'refused in test' } as never
-    // An ask the session settles no ends the call in an error, as a failed tool does.
-    if (input.command === 'touch /outside') return { ref: 1, isError: true, result: 'Error: needs approval', text: 'Error: needs approval' } as never
     if (input.command === 'false') return { ref: 1, isError: true, result: 'Error: exit 1', text: 'Error: exit 1' } as never
+    if (input.command === 'git commit -m x') return { result: { stdout: '[feature/login 1a2b3c4] x\n 1 file changed', stderr: '', interrupted: false, isImage: false, noOutputExpected: false } } as never
     return { result: { stdout: 'hi', stderr: '', interrupted: false, isImage: false, noOutputExpected: false } } as never
   })
   const logs = () => posts.filter(p => new URL(p.url).pathname === '/v1/logs').flatMap(records)
@@ -499,7 +518,245 @@ describe('the rows built from events', () => {
   })
 })
 
+describe('the permission wait, the repository and the first prompt, in the rows built from events', () => {
+  const ofCall = (w: ReturnType<typeof world>, id: string) => w.built().filter(r => r.attributes['tool_use_id'] === id).map(r => r.attributes)
+  const blockedOf = (w: ReturnType<typeof world>) => spans(w.posts).filter(s => s.name === 'claude_code.tool.blocked_on_user').map(s => s.attrs)
+
+  test('an ask answered after two seconds: the decision is settled as the call begins to run, so its wait lasts the two seconds, and the result times the run alone', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE })
+    await start($)
+    await $.turn.start({ turnId: 't1', text: 'go' } as never)
+    await $.tool.call({ tool: 'Bash', command: 'touch /asked', description: 'x', tool_use_id: 'toolu_ask' } as never)
+    await w.clock.advance(5_000)
+    await end($)
+    const [decision, result] = ofCall(w, 'toolu_ask')
+    // Nobody can be asked in a test: a settings hook on the permission request answered, which reads as Claude Code's own (`config`).
+    expect(decision).toEqual(expect.objectContaining({ 'event.name': 'tool_decision', decision: 'accept', source: 'config', 'event.timestamp': new Date(START + ANSWER_MS).toISOString() }))
+    expect(result).toEqual(expect.objectContaining({ 'event.name': 'tool_result', success: 'true', duration_ms: '25' }))
+    expect(blockedOf(w)).toEqual([expect.objectContaining({ decision: 'accept', source: 'config', duration_ms: ANSWER_MS })])
+    const run = spans(w.posts).find(s => s.name === 'claude_code.tool.execution')!
+    expect(run.attrs['duration_ms']).toBe(25)
+  })
+
+  test('an ask refused, nobody there to ask: a reject at the call\'s end, the configuration\'s', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE })
+    await start($)
+    await $.turn.start({ turnId: 't1', text: 'go' } as never)
+    await $.tool.call({ tool: 'Bash', command: 'touch /asked, refused', description: 'x', tool_use_id: 'toolu_no' } as never)
+    await $.tool.call({ tool: 'Bash', command: 'touch /outside', description: 'x', tool_use_id: 'toolu_none' } as never)
+    await w.clock.advance(5_000)
+    await end($)
+    expect(ofCall(w, 'toolu_no').map(a => [a['event.name'], a['decision'], a['source']])).toEqual([['tool_decision', 'reject', 'config']])
+    expect(ofCall(w, 'toolu_none').map(a => [a['event.name'], a['decision'], a['source']])).toEqual([['tool_decision', 'reject', 'config']])
+    expect(blockedOf(w).map(a => [a['decision'], a['source'], a['duration_ms']])).toEqual([['reject', 'config', ANSWER_MS], ['reject', 'config', 0]])
+  })
+
+  test('a call the check allows outright: the configuration\'s, and no wait', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, saved: true })
+    await start($)
+    await $.turn.start({ turnId: 't1', text: 'go' } as never)
+    await $.tool.call({ tool: 'Bash', command: 'touch /asked', description: 'x', tool_use_id: 'toolu_rule' } as never)
+    await w.clock.advance(5_000)
+    await end($)
+    expect(ofCall(w, 'toolu_rule')[0]).toEqual(expect.objectContaining({ decision: 'accept', source: 'config', 'event.timestamp': new Date(START).toISOString() }))
+    expect(blockedOf(w).map(a => a['duration_ms'])).toEqual([0])
+  })
+
+  test("with repo on, every built row, span and point names the origin remote's repository, after the session and before who it is, read again each turn", keyless, async ($, on) => {
+    const repo = { remote: 'git@github.com:Acme/API.git' as string | null }
+    const w = world(on, { accountFile: ACCOUNT_FILE, repo, store: { dataPoints: { repo: 'on' } } })
+    await start($)
+    await turn($, 'go', 'toolu_1')
+    repo.remote = 'https://gitlab.com/group/sub/tool.git'
+    await turn($, 'again', 'toolu_2')
+    await w.clock.advance(5_000)
+    await end($)
+    const rows = w.built()
+    expect(rows.length).toBe(10)
+    const first = rows.filter(r => r.attributes['prompt.id'] === rows[0]!.attributes['prompt.id'])
+    for (const r of first) {
+      expect(r.attributes).toEqual(expect.objectContaining({ 'vcs.repository.url.full': 'https://github.com/acme/api', 'vcs.owner.name': 'acme', 'vcs.repository.name': 'api', 'vcs.provider.name': 'github' }))
+      const keys = Object.keys(r.attributes)
+      expect(keys.slice(keys.indexOf('session.id'), keys.indexOf('session.id') + 6)).toEqual(['session.id', 'vcs.repository.url.full', 'vcs.owner.name', 'vcs.repository.name', 'vcs.provider.name', 'organization.id'])
+      expect(contractViolations(r.attributes)).toEqual([])
+    }
+    expect(rows.at(-1)!.attributes).toEqual(expect.objectContaining({ 'vcs.repository.url.full': 'https://gitlab.com/group/sub/tool', 'vcs.owner.name': 'group/sub', 'vcs.repository.name': 'tool', 'vcs.provider.name': 'gitlab' }))
+    for (const x of spans(w.posts)) expect(typeof x.attrs['vcs.repository.name']).toBe('string')
+    for (const x of points(w.posts)) expect(typeof x.attrs['vcs.repository.name']).toBe('string')
+  })
+
+  test('with repo off (the default), no row names the repository; nor in a session in none', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, repo: { remote: 'git@github.com:acme/api.git' } })
+    await start($)
+    await turn($)
+    await w.clock.advance(5_000)
+    expect(w.built().length).toBe(5)
+    for (const r of w.built()) expect(Object.keys(r.attributes).filter(k => k.startsWith('vcs.'))).toEqual([])
+  })
+
+  // Claude Code adds the repository only with its switch on, and none of its rows come: what the plugin builds carries it only where
+  // repo is on in its own right, whatever the switch.
+  for (const repository of ['1', '0']) {
+    test(`with repo as Claude Code sends it and its switch at ${repository}, the repository goes on nothing the plugin built: no row, span or point`, keyless, async ($, on) => {
+      const w = world(on, { accountFile: ACCOUNT_FILE, repo: { remote: 'git@github.com:acme/api.git' }, env: { OTEL_METRICS_INCLUDE_REPOSITORY: repository }, store: { dataPoints: { repo: 'claude' } } })
+      await start($)
+      await turn($)
+      await w.clock.advance(5_000)
+      await end($)
+      expect(w.built().length).toBe(5)
+      expect(spans(w.posts).length).toBeGreaterThan(0)
+      expect(points(w.posts).length).toBeGreaterThan(0)
+      expect(JSON.stringify(w.posts.map(p => p.body))).not.toContain('vcs.')
+    })
+  }
+
+  test("a commit a shell call made goes on its result as Claude Code names it: HEAD's commit and branch, and in its parameters", keyless, async ($, on) => {
+    const sha = `1a2b3c4${'d'.repeat(33)}`
+    const files = { '/work/app/.git/HEAD': 'ref: refs/heads/feature/login\n', '/work/app/.git/refs/heads/feature/login': `${sha}\n` }
+    const w = world(on, { accountFile: ACCOUNT_FILE, repo: { remote: 'git@github.com:acme/api.git' }, files, store: { dataPoints: { repo: 'on', 'bash.command': 'on' } } })
+    await start($)
+    await $.turn.start({ turnId: 't1', text: 'go' } as never)
+    await $.tool.call({ tool: 'Bash', command: 'git commit -m x', description: 'x', tool_use_id: 'toolu_commit' } as never)
+    await $.tool.call({ tool: 'Bash', command: 'echo hi', description: 'x', tool_use_id: 'toolu_echo' } as never)
+    await w.clock.advance(5_000)
+    const result = ofCall(w, 'toolu_commit').find(a => a['event.name'] === 'tool_result')!
+    expect(result).toEqual(expect.objectContaining({ 'vcs.ref.head.revision': sha, 'vcs.ref.head.name': 'feature/login', 'vcs.ref.head.type': 'branch' }))
+    const keys = Object.keys(result)
+    expect(keys.slice(keys.indexOf('vcs.ref.head.revision'), keys.indexOf('vcs.ref.head.revision') + 3)).toEqual(['vcs.ref.head.revision', 'vcs.ref.head.name', 'vcs.ref.head.type'])
+    expect(JSON.parse(String(result['tool_parameters']))).toEqual(expect.objectContaining({ full_command: 'git commit -m x', git_commit_id: sha, git_branch: 'feature/login' }))
+    const echo = ofCall(w, 'toolu_echo').find(a => a['event.name'] === 'tool_result')!
+    expect(Object.keys(echo).filter(k => k.startsWith('vcs.ref.'))).toEqual([])
+    expect(JSON.parse(String(echo['tool_parameters']))['git_commit_id']).toBeUndefined()
+  })
+
+  /** Mainwave's answer, setting the content data points to `value`. */
+  const contentAnswer = (value: 'on' | 'off'): Reply => {
+    const points = { 'prompt.text': value, 'response.text': value, 'tool.input': value, 'tool.result': value, 'bash.command': value, 'file.path': value, 'web.url': value }
+    return { status: 200, text: JSON.stringify({ revision: 1, catalog_version: 1, data_points: points, in_force: points, redaction_packs: ['secrets'], default_data_points: [], redaction_packs_default: false }) }
+  }
+  /** The answer, held until the test lets it go: it arrives after the first turn has run, as a slow first answer does. */
+  function slowAnswer(reply: Reply) {
+    let release = () => {}
+    const settings = () => new Promise<Reply>(resolve => (release = () => resolve(reply)))
+    return { settings, release: () => release() }
+  }
+  const contentOf = (w: ReturnType<typeof world>) => {
+    const rows = w.built()
+    const by = (event: string) => rows.filter(r => r.attributes['event.name'] === event).map(r => r.attributes)
+    const tool = spans(w.posts).find(x => x.name === 'claude_code.tool') as { attrs: Record<string, unknown>; events?: { name: string }[] } | undefined
+    return {
+      prompt: by('user_prompt').map(a => a['prompt']),
+      response: by('assistant_response').map(a => a['response']),
+      input: by('tool_result').map(a => typeof a['tool_input']),
+      command: tool?.attrs['full_command'],
+      output: (tool?.events ?? []).some(e => e.name === 'tool.output'),
+    }
+  }
+
+  test('the first answer arrives after the first turn ran: its rows and spans wait for it, and carry what it turns on; the turn waited for nothing', keyless, async ($, on) => {
+    const slow = slowAnswer(contentAnswer('on'))
+    const w = world(on, { accountFile: ACCOUNT_FILE, settings: slow.settings })
+    await start($)
+    // The whole turn runs while the answer is still held: nothing of it waits for the answer.
+    await turn($, 'my first prompt')
+    await w.clock.advance(1_000)
+    expect(w.built()).toEqual([])
+    slow.release()
+    await w.clock.advance(5_000)
+    expect(contentOf(w)).toEqual({ prompt: ['my first prompt'], response: ['ok'], input: ['string'], command: 'echo hi', output: true })
+  })
+
+  test('the first answer turns the content off: what was built before it goes without it, though everything was built', keyless, async ($, on) => {
+    const slow = slowAnswer(contentAnswer('off'))
+    const w = world(on, { accountFile: ACCOUNT_FILE, settings: slow.settings, store: { dataPoints: { 'prompt.text': 'on', 'response.text': 'on', 'tool.input': 'on', 'tool.result': 'on', 'bash.command': 'on' } } })
+    await start($)
+    await turn($, 'my first prompt')
+    slow.release()
+    await w.clock.advance(5_000)
+    expect(contentOf(w)).toEqual({ prompt: ['<REDACTED>'], response: ['<REDACTED>'], input: ['undefined'], command: undefined, output: false })
+    expect(JSON.stringify(w.posts.map(p => p.body))).not.toContain('my first prompt')
+  })
+
+  test('no first answer comes: after a few seconds the rows and spans go under the defaults, and the request failing says so on the status row', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, settings: () => 'reject' })
+    await start($)
+    await turn($, 'my first prompt')
+    await w.clock.advance(5_000 + 6_000)
+    await end($)
+    expect(contentOf(w)).toEqual({ prompt: ['<REDACTED>'], response: ['<REDACTED>'], input: ['undefined'], command: undefined, output: false })
+    expect(JSON.stringify(w.posts.map(p => p.body))).not.toContain('my first prompt')
+    const status = w.logs().filter(r => r.attributes['event.name'] === 'plugin_status').map(r => r.attributes['mainwave.telemetry.issues'])
+    expect(status.length).toBeGreaterThan(0)
+    for (const issues of status) expect(issues).toEqual(expect.arrayContaining(['rows_skipped', 'settings_unavailable']))
+  })
+
+  test('a first answer that hangs: the rows and spans go under the defaults once the request times out', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, settings: () => 'hang' })
+    await start($)
+    await turn($, 'my first prompt')
+    await w.clock.advance(1_000)
+    expect(w.built()).toEqual([])
+    await w.clock.advance(15_000)
+    expect(contentOf(w).prompt).toEqual(['<REDACTED>'])
+    expect(w.built().length).toBe(5)
+  })
+
+  test("a session's first prompt row, built before the organization's settings first answer, carries what they turn on", keyless, async ($, on) => {
+    const settings = (): Reply => ({
+      status: 200,
+      text: JSON.stringify({ revision: 1, catalog_version: 1, data_points: { 'prompt.text': 'on' }, in_force: { 'prompt.text': 'on' }, redaction_packs: ['secrets'], default_data_points: [], redaction_packs_default: false }),
+    })
+    const w = world(on, { accountFile: ACCOUNT_FILE, settings })
+    await start($)
+    await turn($, 'the very first prompt')
+    await w.clock.advance(10_000)
+    expect(w.built().filter(r => r.attributes['event.name'] === 'user_prompt').map(r => r.attributes['prompt'])).toEqual(['the very first prompt'])
+  })
+})
+
 describe('in Cowork', () => {
+  const REMINDER = "<system-reminder>The user's timezone is America/New_York (UTC-05:00). Message sent at Thu 2026-11-19 16:50 local time.</system-reminder>\n"
+  const typed = 'please check the deploy'
+  const promptsOf = (w: ReturnType<typeof world>) => w.built().filter(r => r.attributes['event.name'] === 'user_prompt').map(r => [r.attributes['prompt_length'], r.attributes['prompt']])
+
+  test("a first turn that starts with no text and no prompt seen submitted takes the person's message the transcript ends on, without Cowork's reminder", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', store: { dataPoints: { 'prompt.text': 'on' } }, messages: [{ role: 'user', text: REMINDER + typed, toolUses: [] }] })
+    await start($)
+    await turn($, '')
+    await w.clock.advance(5_000)
+    expect(promptsOf(w)).toEqual([[String(typed.length), typed]])
+    const rows = w.built()
+    expect(rows.find(r => r.attributes['event.name'] === 'api_request')!.attributes['prompt.id']).toBe(rows[0]!.attributes['prompt.id'])
+  })
+
+  test('a first turn whose transcript ends on a tool\'s results builds no prompt row', keyless, async ($, on) => {
+    const results = { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'toolu_0', text: 'done', isError: false }] }
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: [results] })
+    await start($)
+    await turn($, '', 'toolu_1')
+    await w.clock.advance(5_000)
+    expect(promptsOf(w)).toEqual([])
+  })
+
+  test("a Cowork prompt's own text goes without the reminder, its length the text's, and its row filled", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', store: { dataPoints: { 'prompt.text': 'on' } } })
+    await start($)
+    await turn($, REMINDER + typed)
+    await turn($, 'again')
+    await w.clock.advance(5_000)
+    expect(promptsOf(w)).toEqual([[String(typed.length), typed], ['5', 'again']])
+  })
+
+  test("outside Cowork the prompt is the turn's as it came, and only the load's first turn reads the transcript", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, store: { dataPoints: { 'prompt.text': 'on' } }, messages: [{ role: 'user', text: typed, toolUses: [] }] })
+    await start($)
+    await turn($, REMINDER + typed, 'toolu_1')
+    // A later turn with no text (a continuation) reads nothing: no prompt row.
+    await turn($, '', 'toolu_2')
+    await w.clock.advance(5_000)
+    expect(promptsOf(w)).toEqual([[String((REMINDER + typed).length), REMINDER + typed]])
+  })
+
   const COWORK_ENVS: [string, World][] = [
     ['the entry point remote_cowork', { entrypoint: 'remote_cowork' }],
     ['CLAUDE_CODE_IS_COWORK', { entrypoint: 'sdk-ts', env: { CLAUDE_CODE_IS_COWORK: 'true' } }],
@@ -576,6 +833,103 @@ describe('in Cowork', () => {
 })
 
 describe('rowless.ts', () => {
+  test("Cowork's reminders ahead of what the person typed are dropped; anything else is kept", () => {
+    const reminder = "<system-reminder>The user's timezone is UTC.</system-reminder>"
+    expect(typedText(`${reminder}\nhello`)).toBe('hello')
+    expect(typedText(`${reminder}\n${reminder}\n\nhello`)).toBe('hello')
+    expect(typedText(`hello ${reminder}`)).toBe(`hello ${reminder}`)
+    expect(typedText('hello')).toBe('hello')
+    expect(typedText(reminder)).toBe('')
+  })
+
+  test('a decision: who settled it and when, from the check, the classifier, the run and the answer saved', () => {
+    const base = { startMs: 100, endMs: 900, denied: false, isError: false }
+    const ask = (approver?: string) => ({ decision: 'ask', atMs: 110, ...(approver !== undefined ? { approver } : {}) })
+    // The check alone: allowed as it began to run, refused as it refused.
+    expect(decisionOf({ ...base, verdict: { decision: 'allow', rule: 'Bash(ls:*)', atMs: 110 }, ranAtMs: 120 })).toEqual({ refused: false, source: 'config', atMs: 120 })
+    expect(decisionOf({ ...base, verdict: { decision: 'allow', hook: 'PreToolUse', atMs: 110 }, ranAtMs: 120 })).toEqual({ refused: false, source: 'hook', atMs: 120 })
+    expect(decisionOf({ ...base, verdict: { decision: 'deny', atMs: 110 }, isError: true })).toEqual({ refused: true, source: 'config', atMs: 110 })
+    // An ask, answered: the person's or the host's, saved or not; the classifier's; Claude Code's own where nobody could be asked.
+    expect(decisionOf({ ...base, verdict: ask('person'), ranAtMs: 700 })).toEqual({ refused: false, source: 'user_temporary', atMs: 700 })
+    expect(decisionOf({ ...base, verdict: ask('person'), ranAtMs: 700, permanent: true })).toEqual({ refused: false, source: 'user_permanent', atMs: 700 })
+    expect(decisionOf({ ...base, verdict: ask('host'), ranAtMs: 700 })).toEqual({ refused: false, source: 'user_temporary', atMs: 700 })
+    expect(decisionOf({ ...base, verdict: ask('person'), judged: 'allow', ranAtMs: 300 })).toEqual({ refused: false, source: 'config', atMs: 300 })
+    expect(decisionOf({ ...base, verdict: ask(), ranAtMs: 700 })).toEqual({ refused: false, source: 'config', atMs: 700 })
+    // An ask refused, as the call ended: the person's no, their interruption, the host's no, the classifier's, nobody to ask, a hook.
+    const no = (text: string, approver?: string, judged?: string) => decisionOf({ ...base, verdict: ask(approver), isError: true, text, ...(judged !== undefined ? { judged } : {}) })
+    expect(no("The user doesn't want to proceed with this tool use.", 'person')).toEqual({ refused: true, source: 'user_reject', atMs: 900 })
+    expect(no("The user doesn't want to take this action right now. STOP", 'person')).toEqual({ refused: true, source: 'user_abort', atMs: 900 })
+    expect(no('Refused by the host', 'host')).toEqual({ refused: true, source: 'user_reject', atMs: 900 })
+    expect(no('Blocked by auto mode', 'person', 'deny')).toEqual({ refused: true, source: 'config', atMs: 900 })
+    expect(no('Permission to use Bash has been denied. IMPORTANT: ...')).toEqual({ refused: true, source: 'config', atMs: 900 })
+    expect(no('not now')).toEqual({ refused: true, source: 'config', atMs: 900 })
+    // A settings hook that refused a person's ask can't be told from another refusal: no source.
+    expect(no('not now', 'person')).toEqual({ refused: true, atMs: 900 })
+    // An ask that never ran and did not fail; a call no check saw, denied by a hook or not.
+    expect(decisionOf({ ...base, verdict: ask('person') })).toEqual({ refused: false, atMs: 100 })
+    expect(decisionOf({ ...base, denied: true })).toEqual({ refused: true, atMs: 900 })
+    expect(decisionOf({ ...base, ranAtMs: 150 })).toEqual({ refused: false, atMs: 150 })
+  })
+
+  test("a repository's attributes from its origin remote, as Claude Code derives them", () => {
+    const of = (remote: string | null | undefined) => repoAttributes(remote)
+    expect(of('git@github.com:Acme/API.git')).toEqual({ 'vcs.repository.url.full': 'https://github.com/acme/api', 'vcs.owner.name': 'acme', 'vcs.repository.name': 'api', 'vcs.provider.name': 'github' })
+    expect(Object.keys(of('git@github.com:acme/api.git'))).toEqual(['vcs.repository.url.full', 'vcs.owner.name', 'vcs.repository.name', 'vcs.provider.name'])
+    expect(of('https://user:secret@gitlab.com/group/sub/tool.git')).toEqual({ 'vcs.repository.url.full': 'https://gitlab.com/group/sub/tool', 'vcs.owner.name': 'group/sub', 'vcs.repository.name': 'tool', 'vcs.provider.name': 'gitlab' })
+    expect(of('ssh://git@ssh.github.com:443/acme/api.git')['vcs.repository.url.full']).toBe('https://github.com/acme/api')
+    expect(of('git@altssh.bitbucket.org:team/app.git')).toEqual({ 'vcs.repository.url.full': 'https://bitbucket.org/team/app', 'vcs.owner.name': 'team', 'vcs.repository.name': 'app', 'vcs.provider.name': 'bitbucket' })
+    expect(of('https://gitea.com/o/r')['vcs.provider.name']).toBe('gitea')
+    expect(of('https://git.example.com/o/r.git')).toEqual({ 'vcs.repository.url.full': 'https://git.example.com/o/r', 'vcs.owner.name': 'o', 'vcs.repository.name': 'r' })
+    // Bitbucket Server: an `scm/` path, or SSH on port 7999.
+    const server = { 'vcs.repository.url.full': 'https://git.example.com/projects/proj/repos/repo', 'vcs.owner.name': 'proj', 'vcs.repository.name': 'repo', 'vcs.provider.name': 'bitbucket' }
+    expect(of('https://git.example.com/scm/proj/repo.git')).toEqual(server)
+    expect(of('ssh://git@git.example.com:7999/proj/repo.git')).toEqual(server)
+    // A remote session's git proxy on a loopback address.
+    expect(of('http://proxy@127.0.0.1:41234/git/acme/api')['vcs.repository.url.full']).toBe('https://github.com/acme/api')
+    expect(of('http://proxy@127.0.0.1:41234/git/git.example.com/o/r')['vcs.repository.url.full']).toBe('https://git.example.com/o/r')
+    // Not a repository's address on the web, or credentials after a query: nothing.
+    for (const bad of ['/srv/repos/x.git', 'file:///srv/x.git', 'https://git.example.com/o/r?token=a@b', 'https://git.example.com/', '', null, undefined]) expect(of(bad)).toEqual({})
+  })
+
+  test("the head names the repository after the session, the resource's own where it names an address", () => {
+    const repo = repoAttributes('git@github.com:acme/api.git')
+    const head = rowHead({}, { 'organization.id': ORG, 'user.email': EMAIL }, 's-1', undefined, repo)
+    expect(Object.keys(head)).toEqual(['session.id', 'vcs.repository.url.full', 'vcs.owner.name', 'vcs.repository.name', 'vcs.provider.name', 'organization.id', 'user.email'])
+    const resource = { 'vcs.repository.url.full': 'https://git.example.com/a/b', 'deployment.environment': 'ci' }
+    const fromResource = rowHead(resource, {}, 's-1', undefined, repo)
+    expect(fromResource).toEqual({ ...resource, 'session.id': 's-1' })
+    expect(Object.keys(fromResource)).toEqual(['vcs.repository.url.full', 'deployment.environment', 'session.id'])
+  })
+
+  test('HEAD from a git folder: a branch by its loose ref or packed-refs, in a worktree its common folder; a detached commit; none unreadable', async () => {
+    const sha = 'a'.repeat(40)
+    const reader = (files: Record<string, string>) => async (path: string) => {
+      if (files[path] === undefined) throw new Error(`no ${path}`)
+      return files[path]!
+    }
+    expect(await headOf('/r/.git', reader({ '/r/.git/HEAD': 'ref: refs/heads/main\n', '/r/.git/refs/heads/main': `${sha}\n` }))).toEqual({ commitId: sha, branch: 'main' })
+    expect(await headOf('/r/.git', reader({ '/r/.git/HEAD': 'ref: refs/heads/fix/x\n', '/r/.git/packed-refs': `# pack-refs\n${'b'.repeat(40)} refs/heads/main\n${sha} refs/heads/fix/x\n` }))).toEqual({ commitId: sha, branch: 'fix/x' })
+    const worktree = { '/r/.git/worktrees/w/HEAD': 'ref: refs/heads/w\n', '/r/.git/worktrees/w/commondir': '../..\n', '/r/.git/refs/heads/w': sha }
+    expect(await headOf('/r/.git/worktrees/w', reader(worktree))).toEqual({ commitId: sha, branch: 'w' })
+    expect(await headOf('/r/.git', reader({ '/r/.git/HEAD': `${sha}\n` }))).toEqual({ commitId: sha })
+    expect(await headOf('/r/.git', reader({ '/r/.git/HEAD': 'ref: refs/heads/gone\n' }))).toBeUndefined()
+    await expect(headOf('/r/.git', reader({}))).rejects.toThrow()
+    expect(joinPath('/r/.git/worktrees/w', '../..')).toBe('/r/.git')
+    expect(joinPath('/r/app', '/elsewhere/.git/worktrees/x')).toBe('/elsewhere/.git/worktrees/x')
+    expect(madeCommit(['aaaaaaa'], { commitId: sha, branch: 'main' })).toEqual({ commitId: sha, branch: 'main' })
+    expect(madeCommit(['bbbbbbb'], { commitId: sha })).toBeUndefined()
+    expect(madeCommit([], { commitId: sha })).toBeUndefined()
+  })
+
+  test("a result's duration is its run's, from when it began to run; its commit after its sizes", () => {
+    const s = newRowless()
+    const r = resultRow(s, {}, { tool: 'Bash', id: 't', startMs: 0, runStartMs: 2_000, endMs: 2_025, isError: false, commit: { commitId: 'c'.repeat(40) } }).attributes
+    expect(r['duration_ms']).toBe('25')
+    expect(r['vcs.ref.head.revision']).toBe('c'.repeat(40))
+    expect(r['vcs.ref.head.name']).toBeUndefined()
+    expect(r['vcs.ref.head.type']).toBeUndefined()
+  })
+
   test("the prompt row's id is Claude Code's where the session says it, of an id's shape", () => {
     expect(promptIdFrom({ transcriptPath: '', sysname: 'Darwin', promptId: 'prompt-from-claude-1' })).toBe('prompt-from-claude-1')
     expect(promptIdFrom({ promptId: 'has space' })).toBeUndefined()
@@ -592,13 +946,11 @@ describe('rowless.ts', () => {
     expect(responseTextOf('ok', undefined)).toBe('ok')
   })
 
-  test("Claude Code's texts of a refusal: the person's, one no one could be asked about, the ask's own reason; not a tool's own failure", () => {
-    expect(isRefusal("The user doesn't want to proceed with this tool use. The tool use was rejected.", undefined)).toBe(true)
-    expect(isRefusal('Error: Permission to use Bash has been denied. IMPORTANT: ...', undefined)).toBe(true)
-    expect(isRefusal("Error: touch in '/tmp/x' needs approval.", "touch in '/tmp/x' needs approval.")).toBe(true)
-    expect(isRefusal('Error: Exit code 1', 'needs approval for this')).toBe(false)
-    expect(isRefusal('Error: x', 'x')).toBe(false)
-    expect(isRefusal(undefined, undefined)).toBe(false)
+  test("Claude Code's texts of a refusal: the person's no, and the person's interruption; not a tool's own failure", () => {
+    expect(refusalKind("The user doesn't want to proceed with this tool use. The tool use was rejected.")).toBe('reject')
+    expect(refusalKind("The user doesn't want to take this action right now. STOP what you are doing and wait for the user to tell you how to proceed.")).toBe('abort')
+    expect(refusalKind('Error: Exit code 1')).toBeUndefined()
+    expect(refusalKind(undefined)).toBeUndefined()
   })
 
   test("the shares start from nothing where the session began as the plugin loaded, else from the session's cost then", () => {
@@ -632,7 +984,8 @@ describe('rowless.ts', () => {
     expect(decisionSource({ decision: 'allow', rule: 'Bash(echo:*)' })).toBe('config')
     expect(decisionSource({ decision: 'deny', hook: 'guard' })).toBe('hook')
     expect(decisionSource({ decision: 'ask', rule: 'x' })).toBeUndefined()
-    expect(decisionSource({ decision: 'allow' })).toBeUndefined()
+    // A verdict that names nothing behind it is the mode's or the session's own: Claude Code names it `config`.
+    expect(decisionSource({ decision: 'allow' })).toBe('config')
     const s = newRowless()
     const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
     const req = (agent?: { type: string; builtIn: boolean }) => requestRow(s, {}, { model: 'm', usage, agentId: 'a1', ...(agent ? { agent } : {}), startMs: 0, endMs: 1, sdk: false }).attributes

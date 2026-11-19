@@ -99,8 +99,8 @@ const MAX_PROMPTS = 20
 
 /** What the hooks read, kept until the rows that need it pass. One per load. */
 export type Capture = {
-  /** Each tool call's name and input, by its id. */
-  tools: Map<string, { name: string; input: Readonly<Record<string, unknown>> }>
+  /** Each tool call's name and input, by its id, and the commit it made where its result row is built (`captureCommit`). */
+  tools: Map<string, { name: string; input: Readonly<Record<string, unknown>>; commit?: { commitId: string; branch?: string } }>
   /** The prompts submitted lately, newest last. */
   prompts: string[]
   /** The text and thinking each loop's request is streaming: the main loop's as `main`, a subagent's by its id. */
@@ -117,6 +117,12 @@ export function captureTool(c: Capture, id: string | undefined, name: string, in
   c.tools.delete(id)
   c.tools.set(id, { name, input })
   while (c.tools.size > MAX_TOOLS) c.tools.delete(c.tools.keys().next().value!)
+}
+
+/** A call made a commit: its result row's `tool_parameters` name it (`git_commit_id`) and its branch (`git_branch`), as Claude Code's do. */
+export function captureCommit(c: Capture, id: string, commit: { commitId: string; branch?: string }): void {
+  const tool = c.tools.get(id)
+  if (tool) tool.commit = commit
 }
 
 /** A prompt was submitted, or a turn began with one. */
@@ -211,6 +217,10 @@ export function rowFill(c: Capture, event: string, attributes: Readonly<Record<s
       if (!tool) return {}
       const parameters = toolParameters(tool.name, tool.input)
       if (event !== 'tool_result') return { parameters }
+      if (tool.commit !== undefined) {
+        parameters['git_commit_id'] = tool.commit.commitId
+        if (tool.commit.branch !== undefined) parameters['git_branch'] = tool.commit.branch
+      }
       // The call's last row: its input is let go.
       c.tools.delete(id as string)
       return { parameters, attributes: { tool_input: isAccountMemoryTool(tool.name) ? notRecorded(JSON.stringify(tool.input)) : toolInputPreview(tool.input) } }
