@@ -38,7 +38,7 @@ import { endSession } from './http.ts'
 import { identityOf, isOrgId, mergeIdentity } from './identity.ts'
 import { add, collect, newMeter, type Meter } from './meter.ts'
 import {
-  against, CHANGE_OPENED, cliCanSend, cliHookKinds, COMMIT_CREATED, commitAttributes, commitLookup, commitsInOutput, errorTypeOf, gitCommits, JIRA_TOOL, jiraTicket, KIND_SPAN, LINEAR_TOOL,
+  against, apiErrorIn, CHANGE_OPENED, cliCanSend, cliHookKinds, COMMIT_CREATED, commitAttributes, commitLookup, commitsInOutput, gitCommits, JIRA_TOOL, jiraTicket, KIND_SPAN, LINEAR_TOOL,
   linearTicket, MARKER_IDENTITY, MARKER_KEYS, markerResource, outputTexts, parseNumstat, parsePrStats, placeAttributes, prAttributes, prCreateOf, prLookup, prNumberOf, prUrlOf, STOP_FAILURE,
   opaqueId, STOP_FAILURE_ERROR, SUBSCRIPTION_SNAPSHOT, ticketSpan, type MarkerKind,
 } from './markers.ts'
@@ -83,12 +83,16 @@ type SpawnParams = Parameters<Hook<'agent.spawn'>>
 type SpawnCatchParams = Parameters<CatchHandler<Hook<'agent.spawn'>>>
 type SkillParams = Parameters<Hook<'skill.prompt'>>
 type SkillCatchParams = Parameters<CatchHandler<Hook<'skill.prompt'>>>
-type PostToolParams = Parameters<Hook<'classic.PostToolUse'>>
-type PostToolCatchParams = Parameters<CatchHandler<Hook<'classic.PostToolUse'>>>
-type PromptSubmitParams = Parameters<Hook<'classic.UserPromptSubmit'>>
-type PromptSubmitCatchParams = Parameters<CatchHandler<Hook<'classic.UserPromptSubmit'>>>
-type StopFailureParams = Parameters<Hook<'classic.StopFailure'>>
-type StopFailureCatchParams = Parameters<CatchHandler<Hook<'classic.StopFailure'>>>
+
+/**
+ * The calls on `$` newer than the floor (2.1.317), as the latest Claude Code declares them: `$.session.info()`, a range of a file, the
+ * session's newest messages. Each call is spelled on `$` as ever, typed through this so the type check holds on the floor's
+ * declarations too; on an engine without one, the call throws, and its caller catches.
+ */
+type Newer = {
+  session: { info: () => Promise<{ promptId?: string; transcriptPath?: string; platform?: string }>; messages: (args: { last: number }) => Promise<readonly { role: string; uuid?: string }[] | { deny: string }> }
+  fs: { read: (path: string, range: { offset: number; length: number }) => Promise<string> }
+}
 
 /** The session's identity as its rows say (types/index.d.ts). */
 const identityAtom = atom({ plugin: 'mainwave', key: 'identity' } as const, {})
@@ -634,6 +638,19 @@ async function readText($: EngineInterface, path: string): Promise<string | unde
   }
 }
 
+/**
+ * Whether a regular file is at a path (a link followed), as the CLI's hook command tests it (`[ -f "$f" ]`): its metadata alone, never
+ * its contents. A script there that can't be read counts as there, as it does for that test: the CLI's hook then fails and sends
+ * nothing, and so does the plugin. That is the price of never reading it.
+ */
+async function isFile($: EngineInterface, path: string): Promise<boolean> {
+  try {
+    return (await $.fs.stat(path)).kind === 'file'
+  } catch {
+    return false
+  }
+}
+
 /** The settings merged over every source, as Claude Code reads them; `{}` when they cannot be read. */
 async function mergedSettings($: EngineInterface): Promise<Record<string, unknown>> {
   try {
@@ -836,7 +853,7 @@ async function cliHooksOf($: EngineInterface): Promise<ReadonlySet<MarkerKind>> 
     const there = new Map<string, Promise<boolean>>()
     for (const [kind, scripts] of cliHookKinds(settings, home || undefined)) {
       for (const script of scripts) {
-        if (!there.has(script)) there.set(script, readText($, script).then(t => t !== undefined))
+        if (!there.has(script)) there.set(script, isFile($, script))
         if (await there.get(script)) {
           out.add(kind)
           break
@@ -935,14 +952,28 @@ async function prMarker($: EngineInterface, title: string | undefined, texts: re
 }
 
 /**
- * The session a marker was made in: the one its hook event names (every classic event carries it), else the one the plugin's rows
- * last named. The event's is right even just after a /clear, before any row of the new session has come.
+ * The session a marker was made in: the one the engine names as its event runs (`$.session.id()`), else the one the plugin's rows
+ * last named. The engine's is right even just after a /clear, before any row of the new session has come.
  */
-async function sessionOf($: EngineInterface, eventSession: unknown): Promise<TelemetryAttribute | undefined> {
-  const named = opaqueId(eventSession)
+async function sessionOf($: EngineInterface): Promise<TelemetryAttribute | undefined> {
+  const named = opaqueId(await sessionIdOf($))
   if (named !== undefined) return named
   const r = await rebuildOf($)
   return r?.common['session.id']
+}
+
+/** What `$.session.info()` says of the session (the prompt it is on, its transcript); empty where it can't be read, or has no such call (2.1.325 and earlier). */
+async function infoOf($: EngineInterface): Promise<{ promptId?: string; transcriptPath?: string }> {
+  try {
+    const info: unknown = await ($ as unknown as Newer).session.info()
+    if (!isRecord(info)) return {}
+    return {
+      ...(typeof info['promptId'] === 'string' ? { promptId: info['promptId'] } : {}),
+      ...(typeof info['transcriptPath'] === 'string' && info['transcriptPath'] !== '' ? { transcriptPath: info['transcriptPath'] } : {}),
+    }
+  } catch {
+    return {}
+  }
 }
 
 /**
@@ -973,7 +1004,7 @@ async function mrMarker($: EngineInterface, call: { kind: 'create' | 'api'; titl
       const legacy = await readText($, `${home}/.config/glab-cli/config.yml`)
       let platform: string | undefined
       try {
-        platform = (await $.session.info()).platform
+        platform = (await ($ as unknown as Newer).session.info()).platform
       } catch {
         platform = undefined
       }
@@ -990,13 +1021,27 @@ async function mrMarker($: EngineInterface, call: { kind: 'create' | 'api'; titl
   return [{ kind: 'glab', name: CHANGE_OPENED, atMs, attributes: { ...mrAttributes(mr, repositoryIdOf(mr.url, details.projectId), title, details.filesChanged), ...place } }]
 }
 
-/** The markers of one tool call that ended: a shell command's commits, pull request and merge request; an MCP save's ticket. */
-async function toolMarkers($: EngineInterface, e: PostToolParams[1]): Promise<void> {
-  const session = await sessionOf($, e.session_id)
-  const tool = e.tool_name
-  const input = isRecord(e.tool_input) ? e.tool_input : {}
-  const agentId = typeof e.agent_id === 'string' && e.agent_id !== '' ? e.agent_id : undefined
-  const cwd = typeof e.cwd === 'string' && e.cwd !== '' ? e.cwd : undefined
+/** One tool call that ended, as the marker work reads it: the tool, its own arguments, the call's id and the subagent that made it. */
+type EndedCall = { tool: string; input: Record<string, unknown>; toolUseId?: string; agentId?: string }
+
+/** Whether a call can make a marker at all: a shell command that commits or opens a request, or a Linear or Jira save. */
+function mayMark(call: EndedCall): boolean {
+  if (call.tool === 'Bash') {
+    const command = call.input['command']
+    return typeof command === 'string' && (gitCommits(command).length > 0 || prCreateOf(command) !== undefined || classifyGlab(command) !== undefined)
+  }
+  return LINEAR_TOOL.test(call.tool) || JIRA_TOOL.test(call.tool)
+}
+
+/**
+ * The markers of one tool call that ended: a shell command's commits, pull request and merge request; an MCP save's ticket. `response`
+ * is the tool's record (`result`): Bash's `{ stdout, stderr }`, an MCP tool's content blocks. The folder a commit is looked up in is
+ * the session's as the call ended.
+ */
+async function toolMarkers($: EngineInterface, call: EndedCall, response: unknown): Promise<void> {
+  const [session, folder] = await Promise.all([sessionOf($), settle($.session.cwd())])
+  const { tool, input, agentId } = call
+  const cwd = folder || undefined
   const made: OwnMarker[] = []
   if (tool === 'Bash') {
     const command = input['command']
@@ -1005,40 +1050,26 @@ async function toolMarkers($: EngineInterface, e: PostToolParams[1]): Promise<vo
     const pr = prCreateOf(command)
     const glab = classifyGlab(command)
     if (calls.length === 0 && pr === undefined && glab === undefined) return
-    const place = await placeOf($, agentId, e.tool_use_id)
-    const texts = outputTexts(e.tool_response)
+    const place = await placeOf($, agentId, call.toolUseId)
+    const texts = outputTexts(response)
     if (calls.length > 0) made.push(...(await commitMarkers($, calls, texts, cwd, place)))
     if (pr !== undefined) made.push(...(await prMarker($, pr.title, texts, place)))
-    if (glab !== undefined) made.push(...(await mrMarker($, glab, e.tool_response, place)))
+    if (glab !== undefined) made.push(...(await mrMarker($, glab, response, place)))
   } else if (LINEAR_TOOL.test(tool) || JIRA_TOOL.test(tool)) {
     const linear = LINEAR_TOOL.test(tool)
-    const ticket = linear ? linearTicket(tool, input, e.tool_response) : jiraTicket(tool, e.tool_response)
+    const ticket = linear ? linearTicket(tool, input, response) : jiraTicket(tool, response)
     if (ticket === undefined || !(await markerWanted($, linear ? 'linear' : 'jira'))) return
-    made.push({ kind: linear ? 'linear' : 'jira', name: ticketSpan(ticket), atMs: await $.clock.now(), attributes: { ...ticket, ...(await placeOf($, agentId, e.tool_use_id)) } })
+    made.push({ kind: linear ? 'linear' : 'jira', name: ticketSpan(ticket), atMs: await $.clock.now(), attributes: { ...ticket, ...(await placeOf($, agentId, call.toolUseId)) } })
   }
   await queueMarkers($, made, session)
 }
 
-/** A tool call ended (PostToolUse): its markers are made beside it, never holding it. The event and its result go on unchanged. */
-export async function postToolHook($: PostToolParams[0], e: PostToolParams[1], next: PostToolParams[2]) {
-  const result = await next(e)
-  try {
-    if (isCopying()) beside(() => toolMarkers($, e))
-  } catch {
-    // No marker for that call.
-  }
-  return result
-}
-
-/** A PostToolUse goes on whatever the hook did; once it has gone on, its result stands. */
-export function postToolCatch($: PostToolCatchParams[0], e: PostToolCatchParams[1], next: PostToolCatchParams[2]) {
-  return next(e)
-}
-
 /** The plan snapshot for a prompt, from Claude Code's account record, when its data point is on and the CLI's hook does not send it. */
-async function snapshotMarker($: EngineInterface, promptId: unknown, eventSession: unknown): Promise<void> {
+async function snapshotMarker($: EngineInterface): Promise<void> {
+  // The session and the prompt the session is on, before anything waits. A prompt typed into a running turn joins that turn's prompt:
+  // its snapshot carries that prompt's ID, as UserPromptSubmit's `prompt_id` does.
+  const [session, { promptId }] = await Promise.all([sessionOf($), infoOf($)])
   if (!(await markerWanted($, 'snapshot'))) return
-  const session = await sessionOf($, eventSession)
   const [home, profile, configDir] = await Promise.all([settle($.env.get('HOME')), settle($.env.get('USERPROFILE')), settle($.env.get('CLAUDE_CONFIG_DIR'))])
   const base = configDir || home || profile || undefined
   if (base === undefined) return
@@ -1050,44 +1081,61 @@ async function snapshotMarker($: EngineInterface, promptId: unknown, eventSessio
   await queueMarkers($, [{ kind: 'snapshot', name: SUBSCRIPTION_SNAPSHOT, atMs, attributes, account: snap.accountUuid }], session)
 }
 
-/** A prompt submitted (UserPromptSubmit): the plan snapshot goes beside it. The event and its result go on unchanged. */
-export async function promptSubmitHook($: PromptSubmitParams[0], e: PromptSubmitParams[1], next: PromptSubmitParams[2]) {
-  const result = await next(e)
-  try {
-    if (isCopying()) beside(() => snapshotMarker($, e.prompt_id, e.session_id))
-  } catch {
-    // No snapshot for that prompt.
-  }
-  return result
-}
+/**
+ * How much of the transcript's end is read for a failed turn's message, four times more at each read that does not find it (a large
+ * line written after it, such as a pasted image's, can push it out), up to what one read takes; how often, and how long apart.
+ */
+export const TRANSCRIPT_TAIL_BYTES = 65_536
+export const TRANSCRIPT_TRIES = 5
+/** The most `$.fs.read` takes in one read: 4 MiB. */
+const MAX_READ_BYTES = 4 * 1024 * 1024
+export const TRANSCRIPT_RETRY_MS = 100
 
-/** A UserPromptSubmit goes on whatever the hook did; once it has gone on, its result stands. */
-export function promptSubmitCatch($: PromptSubmitCatchParams[0], e: PromptSubmitCatchParams[1], next: PromptSubmitCatchParams[2]) {
-  return next(e)
-}
-
-/** A turn ended on an API error (StopFailure): the kind of error, and nothing else of it. The event and its result go on unchanged. */
-export async function stopFailureHook($: StopFailureParams[0], e: StopFailureParams[1], next: StopFailureParams[2]) {
-  const result = await next(e)
-  try {
-    const error = errorTypeOf(e.error)
-    if (error !== undefined && isCopying()) {
-      beside(async () => {
-        if (!(await markerWanted($, 'stop'))) return
-        const atMs = await $.clock.now()
-        const place = await placeOf($, undefined)
-        await queueMarkers($, [{ kind: 'stop', name: STOP_FAILURE, atMs, attributes: { [STOP_FAILURE_ERROR]: error, ...placeAttributes({ promptId: e.prompt_id }), ...place } }], await sessionOf($, e.session_id))
-      })
+/**
+ * The kind of API error a main-loop turn ended on: the `error` its transcript records on the message Claude Code wrote in place of
+ * the failed response, the turn's last (StopFailure's). Read from the transcript's end, a few times while the line is not written yet;
+ * undefined where there is no transcript, the last message records no API error, or it can't be read.
+ */
+async function turnErrorOf($: EngineInterface, transcriptPath: string, messageId: string): Promise<string | undefined> {
+  for (let i = 0; i < TRANSCRIPT_TRIES; i++) {
+    if (i > 0) await $.clock.sleep(TRANSCRIPT_RETRY_MS)
+    try {
+      const size = (await $.fs.stat(transcriptPath)).size
+      const window = Math.min(TRANSCRIPT_TAIL_BYTES * 4 ** i, MAX_READ_BYTES)
+      const text = await ($ as unknown as Newer).fs.read(transcriptPath, { offset: Math.max(0, size - window), length: window })
+      const error = apiErrorIn(text, messageId)
+      if (error !== null) return error
+    } catch {
+      // Not there yet, or not readable this time: read again.
     }
-  } catch {
-    // No span for that failure.
   }
-  return result
+  return undefined
 }
 
-/** A StopFailure goes on whatever the hook did; once it has gone on, its result stands. */
-export function stopFailureCatch($: StopFailureCatchParams[0], e: StopFailureCatchParams[1], next: StopFailureCatchParams[2]) {
-  return next(e)
+/** The id of the session's last message where it is the model's (a failed turn's is the one Claude Code wrote in its place). */
+async function lastAnswerId($: EngineInterface): Promise<string | undefined> {
+  try {
+    const last = await ($ as unknown as Newer).session.messages({ last: 1 })
+    const message = Array.isArray(last) ? last.at(-1) : undefined
+    return message?.role === 'assistant' && typeof message.uuid === 'string' && message.uuid !== '' ? message.uuid : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** A main-loop turn ended on an API error: the kind of error, and nothing else of it, where the transcript says which. */
+async function stopMarker($: EngineInterface, place: Record<string, TelemetryAttribute>): Promise<void> {
+  // The session, its prompt and the failed turn's message as the turn ended, before anything waits; the message only where there is
+  // a transcript to find it in, read as soon as that is known.
+  const info = infoOf($)
+  const [session, { promptId, transcriptPath }, messageId] = await Promise.all([
+    sessionOf($), info, info.then(i => (i.transcriptPath === undefined ? undefined : lastAnswerId($))),
+  ])
+  if (transcriptPath === undefined || messageId === undefined || !(await markerWanted($, 'stop'))) return
+  const atMs = await $.clock.now()
+  const error = await turnErrorOf($, transcriptPath, messageId)
+  if (error === undefined) return
+  await queueMarkers($, [{ kind: 'stop', name: STOP_FAILURE, atMs, attributes: { [STOP_FAILURE_ERROR]: error, ...placeAttributes({ promptId }), ...place } }], session)
 }
 
 /** A new session in the same process (/clear, resume): what the last one queued goes under its identity, and this one starts over. */
@@ -1290,7 +1338,7 @@ async function feedRow($: EngineInterface, row: RowIn): Promise<void> {
 /** Claude Code's id of the prompt the session is on, so the rows built of its turn carry the one its own records do; undefined where it can't be read. */
 async function promptIdOf($: EngineInterface): Promise<string | undefined> {
   try {
-    return promptIdFrom(await $.session.info())
+    return promptIdFrom(await ($ as unknown as Newer).session.info())
   } catch {
     return undefined
   }
@@ -1402,6 +1450,13 @@ export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1]
 /** A turn ended: a main-loop interaction is sent. */
 export async function turnCompleteHook($: TurnCompleteParams[0], e: TurnCompleteParams[1], next: TurnCompleteParams[2]) {
   let out: Emit | null = null
+  // A main-loop turn an API error ended: where it failed, read before its interaction closes.
+  let failedAt: Record<string, TelemetryAttribute> | undefined
+  try {
+    if (e.reason === 'error' && e.agentId === undefined && isCopying()) failedAt = await placeOf($, undefined)
+  } catch {
+    failedAt = undefined
+  }
   try {
     const r = await rebuildOf($)
     if (r !== null) out = turnComplete(r, e, await $.clock.now())
@@ -1410,6 +1465,11 @@ export async function turnCompleteHook($: TurnCompleteParams[0], e: TurnComplete
   }
   const result = await next(e)
   if (out !== null) await emit($, out).catch(() => undefined)
+  // Its marker, beside the turn's end, never holding it.
+  if (failedAt !== undefined) {
+    const place = failedAt
+    beside(() => stopMarker($, place))
+  }
   // The setup's status, as a main-loop turn ends: beside the turn, never holding it.
   if ((e as { agentId?: string }).agentId === undefined) void statusAtTurnEnd($).catch(() => undefined)
   return result
@@ -1512,18 +1572,31 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
   return result
 }
 
-/** One tool call: when it began and ended, and what it did. The call and its result pass through untouched. */
+/** The call's own arguments, and who made it: what the engine adds beside the arguments is not the tool's input. */
+function endedCall(e: ToolCallParams[1]): EndedCall {
+  const { tool, tool_use_id: id, agentId, consent: _consent, requestMeta: _meta, ...input } = e as unknown as { tool: string; tool_use_id?: string; agentId?: string; consent?: string; requestMeta?: unknown } & Record<string, unknown>
+  return { tool, input, ...(typeof id === 'string' && id !== '' ? { toolUseId: id } : {}), ...(typeof agentId === 'string' && agentId !== '' ? { agentId } : {}) }
+}
+
+/**
+ * One tool call: when it began and ended, and what it did; once it ended without error, its markers, beside it. The call and its
+ * result pass through untouched.
+ */
 export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], next: ToolCallParams[2]) {
   let r: Rebuild | null = null
+  let ended: EndedCall | undefined
+  try {
+    ended = endedCall(e)
+  } catch {
+    ended = undefined
+  }
   try {
     r = await rebuildOf($)
     if (r !== null) {
-      // The call's own arguments: what the engine adds beside them is not the tool's input.
-      const { tool, tool_use_id: id, agentId: _agent, consent: _consent, requestMeta: _meta, ...input } = e as unknown as { tool: string; tool_use_id?: string; agentId?: string; consent?: string; requestMeta?: unknown } & Record<string, unknown>
-      captureTool(capture, id, tool, input)
+      if (ended !== undefined) captureTool(capture, ended.toolUseId, ended.tool, ended.input)
       const startMs = await $.clock.now()
       toolStart(r, e as never, startMs)
-      if (rowless && id !== undefined) callStarts.set(id, startMs)
+      if (rowless && e.tool_use_id !== undefined) callStarts.set(e.tool_use_id, startMs)
     }
   } catch {
     r = null
@@ -1571,6 +1644,16 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
     } catch {
       // The call's spans go with what the rows say.
     }
+  }
+  // A refused or failed call makes no marker.
+  try {
+    if (ended !== undefined && result.deny === undefined && result.isError !== true && isCopying() && mayMark(ended)) {
+      const marking = ended
+      const response: unknown = result.result
+      beside(() => toolMarkers($, marking, response))
+    }
+  } catch {
+    // No marker for that call.
   }
   return result
 }
@@ -1648,6 +1731,12 @@ export async function promptHook($: PromptParams[0], e: PromptParams[1], next: P
     r = null
   }
   const result = await next(e)
+  // The plan snapshot, beside the prompt that entered, never holding it.
+  try {
+    if (result.drop === undefined && isCopying()) beside(() => snapshotMarker($))
+  } catch {
+    // No snapshot for that prompt.
+  }
   // Queued after the prompt has gone on: the send queue never holds it. A dropped prompt starts no turn to take its command over.
   try {
     if (r !== null && result.drop !== undefined) out = { spans: [...(out?.spans ?? []), ...promptDropped(r, await $.clock.now()).spans], measures: [...(out?.measures ?? [])] }
@@ -1825,10 +1914,6 @@ export const register: Register = on => {
   on('prompt.submit', promptHook).catch(promptCatch)
   on('agent.spawn', spawnHook).catch(spawnCatch)
   on('skill.prompt', skillHook).catch(skillCatch)
-
-  on('classic.PostToolUse', postToolHook).catch(postToolCatch)
-  on('classic.UserPromptSubmit', promptSubmitHook).catch(promptSubmitCatch)
-  on('classic.StopFailure', stopFailureHook).catch(stopFailureCatch)
 
   on('session.end', sessionEnd)
 }

@@ -26,6 +26,10 @@
 // data points (a command's class, a subagent's type, a failed call's error class) and no identifier or content: no command, file
 // path, tool input or output, repository, prompt or response.
 //
+// One more session runs, also without the env block: its one prompt the mock refuses as rate limited, Claude Code's retries off:
+// its turn ends on an API error, and the plugin must send one failure marker carrying the kind the session's transcript records (from
+// 2.1.326; on 2.1.325 and earlier, which give a plugin no `$.session.info`, none), though `claude -p` exits as the turn ends.
+//
 // The plugin asks Mainwave for its organization's data collection settings once the rows name the organization and email, on the API
 // beside the collector the copy goes to. In the keyless pass that is production's API, which the test-only hooks send here too, and
 // the receiver answers as Mainwave's settings API would, with settings that turn a metadata data point off (`file.kind`) and add a
@@ -248,6 +252,8 @@ function keylessAnswer(headers, body) {
 }
 
 let overloaded = false
+/** Whether the session's main loop is refused as rate limited, with retries off, so its turn ends on an API error. */
+let refusing = false
 /**
  * The test-only plugin that sends the plugin's requests to production's collector to the receiver (under `/prod`), built in a
  * temporary folder: its manifest lives only there, as this repository holds one plugin (scripts/check-layout.sh).
@@ -274,6 +280,10 @@ const server = createServer(async (req, res) => {
     const parsed = JSON.parse(body)
     // The main loop's second request is refused once as overloaded: Claude Code retries it, and logs only the attempt that answered.
     const results = (parsed.messages ?? []).flatMap(m => (Array.isArray(m.content) ? m.content.filter(b => b?.type === 'tool_result') : []))
+    if (refusing && (parsed.messages ?? []).some(m => textOf(m.content).includes('E2E_FAILTASK'))) {
+      res.writeHead(429, { 'content-type': 'application/json', 'request-id': 'req_e2e_rate_limited', 'retry-after': '0' })
+      return res.end(JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message: 'Refused in the end-to-end test' } }))
+    }
     if (!overloaded && results.length === 1 && textOf(parsed.messages?.[0]?.content).includes('E2E_MAINTASK')) {
       overloaded = true
       res.writeHead(529, { 'content-type': 'application/json', 'request-id': 'req_e2e_overloaded' })
@@ -323,9 +333,10 @@ const base = `http://127.0.0.1:${server.address().port}`
 /**
  * One session, its telemetry captured. `details` turns prompt and tool-detail logging on; `envBlock` false runs it without Mainwave's
  * env block, the plugin sending keyless; `auto` runs it in auto mode; `rowless` loads skip.ts ahead of the plugin, so no row of Claude
- * Code's reaches it.
+ * Code's reaches it; `fail` gives it a prompt the model refuses as rate limited instead, with Claude Code's retries off.
  */
-async function session(details, envBlock, auto, rowless = false) {
+async function session(details, envBlock, auto, rowless = false, fail = false) {
+  refusing = fail
   captured = { exporter: { logs: [], traces: [], metrics: [] }, plugin: { logs: [], traces: [], metrics: [] }, settings: [], other: [] }
   messageId = 0
   classified = { asked: 0, refused: 0 }
@@ -361,6 +372,7 @@ async function session(details, envBlock, auto, rowless = false) {
     ANTHROPIC_API_KEY: 'sk-ant-e2e-not-a-key',
     ANTHROPIC_BASE_URL: base,
     DISABLE_AUTOUPDATER: '1',
+    ...(fail ? { CLAUDE_CODE_MAX_RETRIES: '0' } : {}),
     MW_E2E_RECEIVER: `${base}/prod`,
   }
   // Without the env block: no telemetry settings at all. The organization and email reach the rows as a login would put them there.
@@ -384,7 +396,7 @@ async function session(details, envBlock, auto, rowless = false) {
   })
 
   const args = [
-    '-p', 'E2E_MAINTASK: run the steps, then say ok.',
+    '-p', fail ? 'E2E_FAILTASK: say ok.' : 'E2E_MAINTASK: run the steps, then say ok.',
     // Ahead of the plugin, so its hooks run first, as the security default's do.
     ...(rowless ? ['--plugin-dir', skip] : []),
     '--plugin-dir', root,
@@ -1203,6 +1215,38 @@ for (const [pass, details, envBlock, auto, rowless] of passes) {
   // With the env block the rows name no email (only the organization, through OTEL_RESOURCE_ATTRIBUTES), so the plugin asks nothing
   // and the settings written in its store stand.
   if (envBlock && result.captured.settings.length > 0) problems.push(`${pass}: the plugin asked for settings with no email to ask with`)
+}
+
+// A turn that ends on an API error (a rate limit), keyless: the plugin sends one failure marker, its kind the word the session's
+// transcript records on the message Claude Code wrote in place of the response (`rate_limit`, StopFailure's), under the session's
+// identity and in its session, from 2.1.326; 2.1.325 and earlier give a plugin no `$.session.info`, and there none goes. The process
+// exits as the turn ends: the marker must go all the same.
+{
+  console.log('\na turn that ends on an API error, sent keyless:')
+  const result = await session(false, false, false, false, true)
+  results.push(result)
+  const before = problems.length
+  for (const s of SIGNALS) for (const p of result.captured.plugin[s]) if (p.status !== 200) problems.push(`keyless ingest refused a ${s} request (${p.status}): ${p.error}`)
+  const stops = spansOf(result.captured.plugin.traces).filter(s => MARKER_SPANS.has(s.name))
+  const want = atLeast(CLAUDE_VERSION, '2.1.326') ? 1 : 0
+  if (stops.length !== want || stops.some(s => s.name !== 'mainwave.claude_code.stop_failure')) problems.push(`markers: ${stops.map(s => s.name).join(', ') || 'none'}, not ${want} failure marker${want === 1 ? '' : 's'}`)
+  // What the transcript recorded: the kind the marker must carry.
+  // None where the session wrote no transcript (it never started, or was killed): that is a problem below, not a crash here.
+  const projects = join(result.config, 'projects')
+  const folders = existsSync(projects) ? readdirSync(projects, { withFileTypes: true }).filter(d => d.isDirectory()).map(d => join(projects, d.name)) : []
+  const errorLines = folders.flatMap(d => readdirSync(d).filter(f => f.endsWith('.jsonl')).map(f => join(d, f)))
+    .flatMap(f => readFileSync(f, 'utf8').split('\n')).flatMap(l => { try { const r = JSON.parse(l); return r.isApiErrorMessage === true ? [r] : [] } catch { return [] } })
+  const recorded = errorLines.map(r => r.error)
+  if (recorded.length !== 1 || recorded[0] !== 'rate_limit') problems.push(`the transcript records ${JSON.stringify(recorded)}, not one rate_limit: the mock did not end the turn as meant`)
+  for (const s of stops) {
+    if (s.attrs['mainwave.claude_code.stop_failure.error']?.v !== recorded[0]) problems.push(`the failure marker's kind is ${JSON.stringify(s.attrs['mainwave.claude_code.stop_failure.error']?.v)}, not the transcript's ${JSON.stringify(recorded[0])}`)
+    if (s.attrs['organization.id']?.v !== ORG || s.attrs['user.email']?.v !== EMAIL) problems.push("the failure marker is not under the session's identity")
+    if (s.attrs['session.id']?.v !== errorLines[0]?.sessionId) problems.push(`the failure marker names session ${JSON.stringify(s.attrs['session.id']?.v)}, not the transcript's ${JSON.stringify(errorLines[0]?.sessionId)}`)
+    if (s.resource['mainwave.source']?.v !== 'hook.anthropic') problems.push("the failure marker's resource is not hook.anthropic's")
+    if (JSON.stringify(s).includes('Refused in the end-to-end test')) problems.push("the failure marker carries the error's text")
+  }
+  console.log(`  failure markers: ${stops.length}${stops.length ? ` (${stops.map(s => s.attrs['mainwave.claude_code.stop_failure.error']?.v).join(', ')})` : ''}`)
+  for (let i = before; i < problems.length; i++) problems[i] = `a turn that ends on an API error: ${problems[i]}`
 }
 server.close()
 

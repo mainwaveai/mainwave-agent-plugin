@@ -6,7 +6,7 @@ import { describe, expect, test } from 'claude-code/testing'
 
 import { classifyGlab, glabConfigDir, glabHosts, glabTexts, mrAttributes, mrFromApi, mrUrlOf, parseApiCall, repositoryIdOf, sameUrl, shellSegments, stripDraft } from '../hooks/glab.ts'
 import {
-  cliCanSend, cliHookKinds, cliScriptOf, commitAttributes, commitsInOutput, errorTypeOf, gitCommits, isPrCreate, JIRA_TOOL, jiraTicket, LINEAR_TOOL, linearTicket, markerResource, MAX_FILES, outputTexts,
+  apiErrorIn, cliCanSend, cliHookKinds, cliScriptOf, commitAttributes, commitsInOutput, errorTypeOf, gitCommits, isPrCreate, JIRA_TOOL, jiraTicket, LINEAR_TOOL, linearTicket, markerResource, MAX_FILES, outputTexts,
   parseNumstat, parsePrStats, placeAttributes, prAttributes, prCreateOf, prLookup, prNumberOf, prUrlOf, ticketSpan,
 } from '../hooks/markers.ts'
 import { limitKeySegment, snapshotOf, snapshotOfText } from '../hooks/snapshot.ts'
@@ -273,5 +273,27 @@ describe("a marker's resource and place", () => {
     })
     expect(errorTypeOf('rate_limit')).toBe('rate_limit')
     expect(errorTypeOf('Rate limit: retry in 30s')).toBeUndefined()
+  })
+})
+
+describe("a turn's API error, from its transcript", () => {
+  const line = (row: Record<string, unknown>) => JSON.stringify(row)
+  const failed = line({ type: 'assistant', uuid: 'm-2', isApiErrorMessage: true, error: 'overloaded', apiErrorStatus: 529, message: { content: [{ type: 'text', text: 'API Error: 529 m-1 retry' }] } })
+
+  test("the kind on the message Claude Code wrote in place of the failed response, read by the message's id", () => {
+    // The tail can start mid-line; another line can name the id; only the message's own line counts.
+    const text = ['ial":true}', line({ type: 'last-prompt', leafUuid: 'm-2' }), failed, line({ type: 'cost-state' })].join('\n')
+    expect(apiErrorIn(text, 'm-2')).toBe('overloaded')
+  })
+
+  test('a message that records no API error: none; one not written yet: null, so it is read again', () => {
+    expect(apiErrorIn(line({ type: 'assistant', uuid: 'm-3', message: { content: [] } }), 'm-3')).toBeUndefined()
+    expect(apiErrorIn(failed, 'm-9')).toBeNull()
+    expect(apiErrorIn('', 'm-2')).toBeNull()
+  })
+
+  test('a word, never free text', () => {
+    expect(apiErrorIn(line({ uuid: 'm-4', isApiErrorMessage: true, error: 'Rate limited: retry in 30s' }), 'm-4')).toBeUndefined()
+    expect(apiErrorIn(line({ uuid: 'm-5', isApiErrorMessage: 'true', error: 'rate_limit' }), 'm-5')).toBeUndefined()
   })
 })
