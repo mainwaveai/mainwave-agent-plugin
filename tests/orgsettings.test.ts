@@ -94,12 +94,12 @@ describe('asking Mainwave', () => {
     expect(logs.join('')).not.toContain(EMAIL)
   })
 
-  test('no more once a repository stops the copy', keyless, async ($, on) => {
+  test('nothing asked where a repository names the collector option, as the copy goes nowhere', keyless, async ($, on) => {
     const { clock, posts } = world(on, { settings: () => answer({}), layers: { project: collectorOption('https://collector.example.com') } })
     await row($, 'api_request', { cost_usd: 0.1 })
     await clock.advance(TICK)
     await clock.advance(2 * REFRESH_MS)
-    expect(posts.settings.length).toBeLessThanOrEqual(1)
+    expect(posts.settings).toEqual([])
   })
 
   test("the person's collectorUrl names where to ask: Mainwave's dev API beside its dev collector, read before the first request", keyless, async ($, on) => {
