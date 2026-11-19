@@ -20,13 +20,19 @@ import type { RowIdentity } from '../types'
 import { capturePrompt, captureTool, newCapture, rowFill, streamChunk, streamedThinking, streamStart, type Capture } from './capture.ts'
 import { MCP_SERVER_ROW, SKILL_PROMPT_ROW, type Switch } from './catalog.ts'
 import { mcpParts } from './derive.ts'
-import { allows, configureGate, currentGate, gateAttributes, gateRow, gateSpan, metricAllowed, resetPacks, setOptIn, setOverrides } from './gate.ts'
+import { allows, configureGate, currentGate, gateAttributes, gateMarker, gateRow, gateSpan, metricAllowed, resetPacks, setOptIn, setOverrides } from './gate.ts'
+import { classifyGlab, glabConfigDir, glabHosts, glabTexts, instanceOf, mrAttributes, mrFromApi, mrLookup, mrUrlOf, parseMrJson, repositoryIdOf, sameUrl, stripDraft, type MrDetails, type MrRef } from './glab.ts'
 import { endSession } from './http.ts'
 import { identityOf, isOrgId, mergeIdentity } from './identity.ts'
 import { add, collect, newMeter, type Meter } from './meter.ts'
-import type { CopiedRow } from './otlp.ts'
 import {
-  agentSpawned, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
+  against, CHANGE_OPENED, cliCanSend, cliHookKinds, COMMIT_CREATED, commitAttributes, commitLookup, commitsInOutput, errorTypeOf, gitCommits, JIRA_TOOL, jiraTicket, KIND_SPAN, LINEAR_TOOL,
+  linearTicket, MARKER_IDENTITY, MARKER_KEYS, markerResource, outputTexts, parseNumstat, parsePrStats, placeAttributes, prAttributes, prCreateOf, prLookup, prNumberOf, prUrlOf, STOP_FAILURE,
+  STOP_FAILURE_ERROR, SUBSCRIPTION_SNAPSHOT, ticketSpan, type MarkerKind,
+} from './markers.ts'
+import type { BuiltSpan, CopiedRow } from './otlp.ts'
+import {
+  agentSpawned, callerCtx, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
 } from './rebuild.ts'
 import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsSummary } from './orgsettings.ts'
 import { contentLimit } from './protect.ts'
@@ -35,6 +41,7 @@ import {
   approvalsOf, approved, permitted, DESKTOP_UNDER_APPDATA, DESKTOP_UNDER_HOME, distinct, enabledPlugins, fileServers, foldersUp, globalServers, join, managedDirs, manifestServerFiles, MAX_PLUGINS, parse,
   pluginServers, projectEntry, serverAttributes, toolSpelling, type Approvals, type McpServer,
 } from './servers.ts'
+import { snapshotOfText } from './snapshot.ts'
 import { applyStamps, entrypointOf, filterStamps, PLUGIN_NAME, stripOwned } from './stamps.ts'
 import { VERSION } from './version.ts'
 
@@ -60,6 +67,12 @@ type SpawnParams = Parameters<Hook<'agent.spawn'>>
 type SpawnCatchParams = Parameters<CatchHandler<Hook<'agent.spawn'>>>
 type SkillParams = Parameters<Hook<'skill.prompt'>>
 type SkillCatchParams = Parameters<CatchHandler<Hook<'skill.prompt'>>>
+type PostToolParams = Parameters<Hook<'classic.PostToolUse'>>
+type PostToolCatchParams = Parameters<CatchHandler<Hook<'classic.PostToolUse'>>>
+type PromptSubmitParams = Parameters<Hook<'classic.UserPromptSubmit'>>
+type PromptSubmitCatchParams = Parameters<CatchHandler<Hook<'classic.UserPromptSubmit'>>>
+type StopFailureParams = Parameters<Hook<'classic.StopFailure'>>
+type StopFailureCatchParams = Parameters<CatchHandler<Hook<'classic.StopFailure'>>>
 
 /** The session's identity as its rows say (types/index.d.ts). */
 const identityAtom = atom({ plugin: 'mainwave', key: 'identity' } as const, {})
@@ -101,6 +114,13 @@ let recentArgs: { text: string; atMs: number }[] = []
 
 /** One of the plugin's own rows; `text`, for a skill's row, the text it carries, marked sent once the row is queued. */
 type OwnRow = { event: string; atMs: number; attributes: Record<string, TelemetryAttribute>; text?: string }
+/** A marker (markers.ts), waiting for the session's identity like an own row; `account`, a snapshot's, sent only for the session's. */
+type OwnMarker = { kind: MarkerKind; name: string; atMs: number; attributes: Record<string, TelemetryAttribute>; account?: string; session?: TelemetryAttribute }
+/** The markers waiting for the session's identity; and, once read for this load, the kinds whose markers the CLI's hooks send. */
+let markers: OwnMarker[] = []
+let cliKinds: Promise<ReadonlySet<MarkerKind>> | null = null
+/** The marker work under way, beside the calls and prompts it came from: the session's end waits a little for it. */
+let making = new Set<Promise<void>>()
 
 /** How many own rows wait at most; how many skill texts keep their ID; how long, and how many, arguments are remembered. */
 const MAX_OWN = 1_000
@@ -309,7 +329,7 @@ async function collectNow($: EngineInterface): Promise<void> {
  * session that follows); until then they wait on. Taken one at a time, so a fault loses one row at most.
  */
 async function flushOwn($: EngineInterface): Promise<void> {
-  if (own.length === 0 || !isCopying()) return
+  if ((own.length === 0 && markers.length === 0) || !isCopying()) return
   const r = await rebuildOf($)
   if (r === null || Object.keys(r.common).length === 0) return
   if (endedSession !== undefined && r.common['session.id'] === endedSession) return
@@ -331,6 +351,13 @@ async function flushOwn($: EngineInterface): Promise<void> {
       if (row !== null && (await enqueue($, { s: 'logs', d: row })) && o.text !== undefined && row.attributes['skill.text'] !== undefined) sent.add(o.text)
     } finally {
       if (o.text !== undefined) waiting.delete(o.text)
+    }
+  }
+  for (let m = markers.shift(); m !== undefined; m = markers.shift()) {
+    try {
+      await sendMarker($, r.common, m, ep)
+    } catch {
+      // That marker is lost to the copy alone.
     }
   }
 }
@@ -504,6 +531,294 @@ function skillRow(skill: string, source: string, text: string, atMs: number): Ow
   }
 }
 
+// ── Markers ───────────────────────────────────────────────────────────────────
+
+/** How long the lookups of one tool call's markers may take: git's for its commits, gh's for a pull request, glab's for a merge request. */
+export const GIT_LOOKUP_MS = 5_000
+export const GH_LOOKUP_MS = 5_000
+export const GLAB_LOOKUP_MS = 2_500
+/** At most this many markers wait for the session's identity; and how long the session's end waits for those being made. */
+const MAX_MARKERS = 200
+export const MARKER_END_WAIT_MS = 500
+
+/** Runs marker work beside the event it came from, never failing it; the session's end can wait for it. */
+function beside(work: () => Promise<void>): void {
+  const p = work().catch(() => undefined)
+  making.add(p)
+  void p.finally(() => making.delete(p))
+}
+
+/** Waits, a short while at most, for the markers being made: a commit made just before the session ends goes with it. */
+async function markersMade($: EngineInterface): Promise<void> {
+  if (making.size === 0) return
+  await Promise.race([Promise.allSettled([...making]), $.clock.sleep(MARKER_END_WAIT_MS)])
+}
+
+const isRecord = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v)
+
+/**
+ * The kinds of marker the CLI's hooks send in this session, read once per load: those whose hook the merged settings run and whose
+ * script is on this machine, where the session gives the CLI a key to send with. None where it has no key: its hooks then send
+ * nothing, and the plugin's markers stand in; nor where the CLI was never installed, as its hook command then does nothing.
+ */
+async function cliKindsOf($: EngineInterface): Promise<ReadonlySet<MarkerKind>> {
+  cliKinds ??= (async () => {
+    const settings = await mergedSettings($)
+    const [endpoint, headers, home] = await Promise.all([settle($.env.get('OTEL_EXPORTER_OTLP_ENDPOINT')), settle($.env.get('OTEL_EXPORTER_OTLP_HEADERS')), settle($.env.get('HOME'))])
+    const out = new Set<MarkerKind>()
+    if (!cliCanSend(endpoint, headers, settings['otelHeadersHelper'])) return out
+    const there = new Map<string, Promise<boolean>>()
+    for (const [kind, scripts] of cliHookKinds(settings, home || undefined)) {
+      for (const script of scripts) {
+        if (!there.has(script)) there.set(script, readText($, script).then(t => t !== undefined))
+        if (await there.get(script)) {
+          out.add(kind)
+          break
+        }
+      }
+    }
+    return out
+  })().catch(() => new Set<MarkerKind>())
+  return cliKinds
+}
+
+/**
+ * Whether a kind of marker goes from the plugin at all: the plugin copies, the data point of the marker's key is on, and the CLI's
+ * hook for it does not send it already. Asked before any lookup, so nothing runs for a marker that would not go.
+ */
+async function markerWanted($: EngineInterface, kind: MarkerKind): Promise<boolean> {
+  if (!isCopying()) return false
+  const point = MARKER_KEYS[KIND_SPAN[kind]]?.point
+  if (point !== undefined && !allows(await gateOf($), point, false)) return false
+  return !(await cliKindsOf($)).has(kind)
+}
+
+/** Queues markers to go once the session's identity is known, as the plugin's own rows do. */
+async function queueMarkers($: EngineInterface, made: readonly OwnMarker[], session?: TelemetryAttribute): Promise<void> {
+  if (made.length === 0) return
+  markers.push(...(session === undefined ? made : made.map(m => ({ ...m, session }))))
+  if (markers.length > MAX_MARKERS) markers.splice(0, markers.length - MAX_MARKERS)
+  await flushOwn($)
+}
+
+/**
+ * One marker as a span of its own: the session's identity, the marker's attributes, the plugin's stamps, in a trace of its own, at
+ * the time it was made; through the gate, and queued with its resource. A snapshot of an account other than the session's (the
+ * account record names whoever signed in last) is not sent.
+ */
+async function sendMarker($: EngineInterface, common: Readonly<Record<string, TelemetryAttribute>>, m: OwnMarker, ep: string): Promise<void> {
+  if (m.account !== undefined && (m.account !== common['user.account_uuid'] || (m.attributes['organization.id'] ?? common['organization.id']) !== common['organization.id'])) return
+  const identity: Record<string, TelemetryAttribute> = {}
+  for (const k of MARKER_IDENTITY) if (common[k] !== undefined) identity[k] = common[k]!
+  // A marker made in a session a /clear has since ended goes under that session, not the one that follows.
+  if (m.session !== undefined) identity['session.id'] = m.session
+  const attributes = applyStamps({ ...identity, ...m.attributes }, {
+    'mainwave.plugin.name': PLUGIN_NAME, 'mainwave.plugin.version': VERSION, 'mainwave.plugin.entrypoint': ep, 'mainwave.telemetry.route': 'plugin',
+  })
+  const span: BuiltSpan = { traceId: randomHex(32), spanId: randomHex(16), name: m.name, startMs: m.atMs, endMs: m.atMs, attributes }
+  const gated = gateMarker(await gateOf($), span)
+  if (gated !== null) await enqueue($, { s: 'traces', d: gated }, base => markerResource(base, m.kind))
+}
+
+/** A command on the host; undefined when it cannot run (no host commands here, as in Cowork), fails, or runs past its time. */
+async function runQuietly($: EngineInterface, argv: readonly string[], init: { cwd?: string; env?: Record<string, string>; timeoutMs: number }): Promise<string | undefined> {
+  if (init.timeoutMs <= 0) return undefined
+  try {
+    const r = await $.process.run(argv, init)
+    return r.exitCode === 0 ? r.stdout : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** Where a marker made at a tool call sits: the span the call ran in, the call, and the subagent. */
+async function placeOf($: EngineInterface, agentId: string | undefined, toolCallId?: string): Promise<Record<string, TelemetryAttribute>> {
+  const r = await rebuildOf($)
+  const caller = r === null ? undefined : callerCtx(r, agentId)
+  return placeAttributes({ ...(caller ? { caller } : {}), toolCallId, agentId })
+}
+
+/** The commits a shell command made: each looked up by the name git printed, in the folder it ran in, within one time budget. */
+async function commitMarkers($: EngineInterface, calls: readonly { dir?: string }[], texts: readonly string[], cwd: string | undefined, place: Record<string, TelemetryAttribute>): Promise<OwnMarker[]> {
+  const shas = commitsInOutput(texts)
+  if (shas.length === 0 || !(await markerWanted($, 'git'))) return []
+  const dirs = [...new Set([...calls.map(c => (c.dir === undefined ? cwd : against(cwd, c.dir))), cwd])]
+  const atMs = await $.clock.now()
+  const deadline = atMs + GIT_LOOKUP_MS
+  const out: OwnMarker[] = []
+  for (const sha of shas) {
+    for (const dir of dirs) {
+      const stdout = await runQuietly($, commitLookup(sha), { ...(dir !== undefined ? { cwd: dir } : {}), env: { GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' }, timeoutMs: deadline - (await $.clock.now()) })
+      const commit = parseNumstat(stdout)
+      if (commit === undefined || !commit.sha.startsWith(sha)) continue
+      out.push({ kind: 'git', name: COMMIT_CREATED, atMs, attributes: { ...commitAttributes(commit), ...place } })
+      break
+    }
+  }
+  return out
+}
+
+/** The pull request `gh pr create` opened, with its size where gh can say, looked up by its address. */
+async function prMarker($: EngineInterface, title: string | undefined, texts: readonly string[], place: Record<string, TelemetryAttribute>): Promise<OwnMarker[]> {
+  const url = prUrlOf(texts)
+  const number = url === undefined ? undefined : prNumberOf(url)
+  if (url === undefined || number === undefined || !(await markerWanted($, 'gh'))) return []
+  const atMs = await $.clock.now()
+  const stats = parsePrStats(await runQuietly($, prLookup(url), { timeoutMs: GH_LOOKUP_MS }))
+  return [{ kind: 'gh', name: CHANGE_OPENED, atMs, attributes: { ...prAttributes(url, number, title, stats), ...place } }]
+}
+
+/** The session the plugin's rows say it is in now, if any has said. */
+async function sessionNow($: EngineInterface): Promise<TelemetryAttribute | undefined> {
+  const r = await rebuildOf($)
+  return r?.common['session.id']
+}
+
+/**
+ * The merge request glab opened: from a `glab api` answer, else the address glab printed; its project's ID from the answer, else from
+ * `glab mr view`, run only for a host glab's own config names and believed only for the same address.
+ */
+async function mrMarker($: EngineInterface, call: { kind: 'create' | 'api'; title?: string }, response: unknown, place: Record<string, TelemetryAttribute>): Promise<OwnMarker[]> {
+  const texts = glabTexts(response)
+  let api: MrDetails = {}
+  let mr: MrRef | undefined
+  if (call.kind === 'api') {
+    for (const t of texts) {
+      const a = mrFromApi(t)
+      if (!a.webUrl) continue
+      api = a
+      mr = mrUrlOf(a.webUrl)
+      break
+    }
+  }
+  for (const t of texts) mr ??= mrUrlOf(t)
+  if (mr === undefined || !(await markerWanted($, 'glab'))) return []
+  const atMs = await $.clock.now()
+  let details: MrDetails = api
+  if (api.projectId === undefined) {
+    details = {}
+    const home = await settle($.env.get('HOME'))
+    if (home) {
+      const legacy = await readText($, `${home}/.config/glab-cli/config.yml`)
+      let platform: string | undefined
+      try {
+        platform = (await $.session.info()).platform
+      } catch {
+        platform = undefined
+      }
+      const dir = glabConfigDir(home, platform, legacy !== undefined)
+      const config = legacy ?? (await readText($, `${dir}/config.yml`))
+      if (glabHosts(config).has(instanceOf(mr.url) ?? '')) {
+        const env = { HOME: home, GLAB_CONFIG_DIR: dir, GLAB_NO_PROMPT: '1', GLAB_SEND_TELEMETRY: '0' }
+        const found = parseMrJson(await runQuietly($, mrLookup(mr), { cwd: home, env, timeoutMs: GLAB_LOOKUP_MS }))
+        if (sameUrl(found.webUrl, mr.url)) details = found
+      }
+    }
+  }
+  const title = stripDraft(details.title ?? api.title ?? call.title)
+  return [{ kind: 'glab', name: CHANGE_OPENED, atMs, attributes: { ...mrAttributes(mr, repositoryIdOf(mr.url, details.projectId), title, details.filesChanged), ...place } }]
+}
+
+/** The markers of one tool call that ended: a shell command's commits, pull request and merge request; an MCP save's ticket. */
+async function toolMarkers($: EngineInterface, e: PostToolParams[1]): Promise<void> {
+  const session = await sessionNow($)
+  const tool = e.tool_name
+  const input = isRecord(e.tool_input) ? e.tool_input : {}
+  const agentId = typeof e.agent_id === 'string' && e.agent_id !== '' ? e.agent_id : undefined
+  const cwd = typeof e.cwd === 'string' && e.cwd !== '' ? e.cwd : undefined
+  const made: OwnMarker[] = []
+  if (tool === 'Bash') {
+    const command = input['command']
+    if (typeof command !== 'string') return
+    const calls = gitCommits(command)
+    const pr = prCreateOf(command)
+    const glab = classifyGlab(command)
+    if (calls.length === 0 && pr === undefined && glab === undefined) return
+    const place = await placeOf($, agentId, e.tool_use_id)
+    const texts = outputTexts(e.tool_response)
+    if (calls.length > 0) made.push(...(await commitMarkers($, calls, texts, cwd, place)))
+    if (pr !== undefined) made.push(...(await prMarker($, pr.title, texts, place)))
+    if (glab !== undefined) made.push(...(await mrMarker($, glab, e.tool_response, place)))
+  } else if (LINEAR_TOOL.test(tool) || JIRA_TOOL.test(tool)) {
+    const linear = LINEAR_TOOL.test(tool)
+    const ticket = linear ? linearTicket(tool, input, e.tool_response) : jiraTicket(tool, e.tool_response)
+    if (ticket === undefined || !(await markerWanted($, linear ? 'linear' : 'jira'))) return
+    made.push({ kind: linear ? 'linear' : 'jira', name: ticketSpan(ticket), atMs: await $.clock.now(), attributes: { ...ticket, ...(await placeOf($, agentId, e.tool_use_id)) } })
+  }
+  await queueMarkers($, made, session)
+}
+
+/** A tool call ended (PostToolUse): its markers are made beside it, never holding it. The event and its result go on unchanged. */
+export async function postToolHook($: PostToolParams[0], e: PostToolParams[1], next: PostToolParams[2]) {
+  const result = await next(e)
+  try {
+    if (isCopying()) beside(() => toolMarkers($, e))
+  } catch {
+    // No marker for that call.
+  }
+  return result
+}
+
+/** A PostToolUse goes on whatever the hook did; once it has gone on, its result stands. */
+export function postToolCatch($: PostToolCatchParams[0], e: PostToolCatchParams[1], next: PostToolCatchParams[2]) {
+  return next(e)
+}
+
+/** The plan snapshot for a prompt, from Claude Code's account record, when its data point is on and the CLI's hook does not send it. */
+async function snapshotMarker($: EngineInterface, promptId: unknown): Promise<void> {
+  if (!(await markerWanted($, 'snapshot'))) return
+  const session = await sessionNow($)
+  const [home, profile, configDir] = await Promise.all([settle($.env.get('HOME')), settle($.env.get('USERPROFILE')), settle($.env.get('CLAUDE_CONFIG_DIR'))])
+  const base = configDir || home || profile || undefined
+  if (base === undefined) return
+  const atMs = await $.clock.now()
+  const snap = await snapshotOfText(await readText($, join(base, '.claude.json')))
+  if (snap === undefined) return
+  // No calling span: the prompt's interaction has not begun when it is submitted, and the one open is the turn before's.
+  const attributes = { 'mainwave.subscription.trigger': 'UserPromptSubmit', ...placeAttributes({ promptId }), ...snap.attributes }
+  await queueMarkers($, [{ kind: 'snapshot', name: SUBSCRIPTION_SNAPSHOT, atMs, attributes, account: snap.accountUuid }], session)
+}
+
+/** A prompt submitted (UserPromptSubmit): the plan snapshot goes beside it. The event and its result go on unchanged. */
+export async function promptSubmitHook($: PromptSubmitParams[0], e: PromptSubmitParams[1], next: PromptSubmitParams[2]) {
+  const result = await next(e)
+  try {
+    if (isCopying()) beside(() => snapshotMarker($, e.prompt_id))
+  } catch {
+    // No snapshot for that prompt.
+  }
+  return result
+}
+
+/** A UserPromptSubmit goes on whatever the hook did; once it has gone on, its result stands. */
+export function promptSubmitCatch($: PromptSubmitCatchParams[0], e: PromptSubmitCatchParams[1], next: PromptSubmitCatchParams[2]) {
+  return next(e)
+}
+
+/** A turn ended on an API error (StopFailure): the kind of error, and nothing else of it. The event and its result go on unchanged. */
+export async function stopFailureHook($: StopFailureParams[0], e: StopFailureParams[1], next: StopFailureParams[2]) {
+  const result = await next(e)
+  try {
+    const error = errorTypeOf(e.error)
+    if (error !== undefined && isCopying()) {
+      beside(async () => {
+        if (!(await markerWanted($, 'stop'))) return
+        const atMs = await $.clock.now()
+        const place = await placeOf($, undefined)
+        await queueMarkers($, [{ kind: 'stop', name: STOP_FAILURE, atMs, attributes: { [STOP_FAILURE_ERROR]: error, ...placeAttributes({ promptId: e.prompt_id }), ...place } }], await sessionNow($))
+      })
+    }
+  } catch {
+    // No span for that failure.
+  }
+  return result
+}
+
+/** A StopFailure goes on whatever the hook did; once it has gone on, its result stands. */
+export function stopFailureCatch($: StopFailureCatchParams[0], e: StopFailureCatchParams[1], next: StopFailureCatchParams[2]) {
+  return next(e)
+}
+
 /** A new session in the same process (/clear, resume): what the last one queued goes under its identity, and this one starts over. */
 async function nextSession($: EngineInterface): Promise<void> {
   await serversRead
@@ -578,7 +893,7 @@ export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams
     }
     if (out !== null) await emit($, out).catch(() => undefined)
     // The session's identity may be known now: the plugin's own rows waiting for it go, beside the row.
-    if (own.length > 0) void flushOwn($).catch(() => undefined)
+    if (own.length > 0 || markers.length > 0) void flushOwn($).catch(() => undefined)
   }
   return next({ ...e, attributes })
 }
@@ -870,6 +1185,7 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
     if (isCopying()) {
       // The settings as they stand now: what is queued goes through them as it is sent.
       await readOverrides($)
+      await markersMade($)
       await sweepNow($, true)
       // The plugin's own rows still waiting go under the session's identity, those of the settings read beside its start too.
       await serversRead
@@ -925,6 +1241,9 @@ export const register: Register = on => {
   argsInFlight = 0
   pendingArgs = new Map()
   recentArgs = []
+  markers = []
+  cliKinds = null
+  making = new Set()
   configure()
 
   on('session.start', sessionStart)
@@ -939,6 +1258,10 @@ export const register: Register = on => {
   on('prompt.submit', promptHook).catch(promptCatch)
   on('agent.spawn', spawnHook).catch(spawnCatch)
   on('skill.prompt', skillHook).catch(skillCatch)
+
+  on('classic.PostToolUse', postToolHook).catch(postToolCatch)
+  on('classic.UserPromptSubmit', promptSubmitHook).catch(promptSubmitCatch)
+  on('classic.StopFailure', stopFailureHook).catch(stopFailureCatch)
 
   on('session.end', sessionEnd)
 }

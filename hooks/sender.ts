@@ -42,7 +42,7 @@
 
 import type { EngineInterface, Timer } from 'claude-code'
 
-import { combinePacks, currentGate, gatePoint, gateResource, gateRow, gateSpan, optInOf, packsOf, setOptIn, setOrgPacks, setPersonPacks } from './gate.ts'
+import { combinePacks, currentGate, gateMarker, gatePoint, gateResource, gateRow, optInOf, packsOf, setOptIn, setOrgPacks, setPersonPacks } from './gate.ts'
 import { fetchWithin, type FetchOutcome } from './http.ts'
 import { applyStoredSettings } from './orgsettings.ts'
 import { logsBody, metricsBody, resourceOf, tracesBody, type BuiltSpan, type CopiedRow, type MetricPoint } from './otlp.ts'
@@ -311,9 +311,10 @@ function dropOldest(): void {
 
 /**
  * Queues one record. Called from the hooks: it waits on nothing but the resource, read once per load, and starts the timer if none
- * runs (after a /clear the session goes on without a `session.start`). Answers whether it was queued.
+ * runs (after a /clear the session goes on without a `session.start`). `resourceFor`, for a record with a resource of its own (a
+ * marker, markers.ts), makes it from the session's. Answers whether it was queued.
  */
-export async function enqueue($: EngineInterface, item: Item): Promise<boolean> {
+export async function enqueue($: EngineInterface, item: Item, resourceFor?: (base: Record<string, string>) => Record<string, string>): Promise<boolean> {
   // A refusal of the whole request (a collector that takes no keyless rows): what is queued is kept for a later load, and
   // nothing more is added, so a session does not grow and rewrite its outbox for a collector that will not take it.
   if (!isCopying() || stopped) return false
@@ -330,7 +331,8 @@ export async function enqueue($: EngineInterface, item: Item): Promise<boolean> 
     return false
   }
   resource ??= readResource($)
-  const res = await resource
+  const base = await resource
+  const res = resourceFor === undefined ? base : JSON.stringify(resourceFor(JSON.parse(base) as Record<string, string>))
   const size = JSON.stringify(item.d).length
   if (size > BATCH_BYTES) {
     counts.dropped += 1
@@ -444,7 +446,10 @@ function bodyOf(batch: readonly Queued[], nowMs: number): string {
   // switches, it goes only where it is on.
   const gated = batch.map(item => {
     const strict = item.adopted === true
-    if (item.s === 'traces') return { ...item, d: gateSpan(gate, item.d, strict) }
+    if (item.s === 'traces') {
+      const d = gateMarker(gate, item.d, strict)
+      return d === null ? null : { ...item, d }
+    }
     if (item.s === 'metrics') {
       const d = gatePoint(gate, item.d, strict)
       return d === null ? null : { ...item, d }

@@ -23,7 +23,7 @@
       "name": "Client and version",
       "class": "metadata",
       "required": true,
-      "description": "What ran the session (Claude Code version, entry point, Cowork surface, terminal, plan, provider, the plugin's version), and Claude Code's own event rows",
+      "description": "What ran the session (Claude Code version, entry point, Cowork surface, terminal, plan, provider, the plugin's version), the plugin's own status and the issues it hit, and Claude Code's own event rows",
       "example": "remote_cowork, 2.1.322"
     },
     {
@@ -31,7 +31,7 @@
       "name": "Usage and cost",
       "class": "metadata",
       "required": true,
-      "description": "Model, tokens, cost, request time, time to first token, effort, stop reason, query source; prompt, response, tool input and result sizes",
+      "description": "Model, tokens, cost, request time, time to first token, effort, stop reason, query source, the API error that ended a turn; prompt, response, tool input and result sizes",
       "example": "claude-opus-5-5, 2,914 output tokens, $0.04"
     },
     {
@@ -187,8 +187,8 @@
       "name": "What a command did",
       "class": "metadata",
       "default": "on",
-      "description": "Commits, reverts, pushes, branches opened, merges, tags, workflow runs and pull requests opened, merged or updated by shell commands that succeeded, as counts",
-      "example": "1 commit, 1 push",
+      "description": "Commits, reverts, pushes, branches opened, merges, tags, workflow runs and pull requests opened, merged or updated by shell commands that succeeded, as counts; and the size of each commit and pull request the plugin reports: files changed, lines added and removed, per file too, and whether a file is binary",
+      "example": "1 commit, 1 push; 3 files, 41 lines added",
       "metrics": [
         "claude_code.commit.count",
         "claude_code.pull_request.count"
@@ -210,6 +210,30 @@
           ],
           "records": [
             "claude_code.tool"
+          ]
+        },
+        {
+          "keys": [
+            "vcs.commit.parent_count",
+            "vcs.commit.files_changed",
+            "vcs.commit.lines_added",
+            "vcs.commit.lines_removed",
+            "vcs.commit.file.lines_added",
+            "vcs.commit.file.lines_removed",
+            "vcs.commit.file.is_binary"
+          ],
+          "records": [
+            "vcs.commit.created"
+          ]
+        },
+        {
+          "keys": [
+            "vcs.change.files_changed",
+            "vcs.change.lines_added",
+            "vcs.change.lines_removed"
+          ],
+          "records": [
+            "vcs.change.opened"
           ]
         }
       ]
@@ -249,12 +273,23 @@
       ]
     },
     {
+      "id": "account.plan",
+      "name": "Plan and usage limits",
+      "class": "metadata",
+      "default": "on",
+      "description": "The Claude plan, seat tier and roles, each rate limit with its usage and reset time, extra usage and trial status, as Claude reports them for the signed-in account",
+      "example": "Team, premium seat, 62% of the 5-hour limit",
+      "key_prefixes": [
+        "mainwave.subscription."
+      ]
+    },
+    {
       "id": "repo",
       "name": "Repository and branch",
       "class": "identifiers",
       "default": "on",
       "switch": "OTEL_METRICS_INCLUDE_REPOSITORY",
-      "description": "The Git remote's address, owner and name, the branch and the commit, and the branch, ref or tag a shell command opened, pushed, merged or tagged",
+      "description": "The Git remote's address, owner and name, the repository's ID and host, the branch and the commit and its parent, the number of a pull request or merge request, and the branch, ref or tag a shell command opened, pushed, merged or tagged. With it off, the plugin sends no commit or pull request records from sessions",
       "example": "github.com/acme/api",
       "key_prefixes": [
         "vcs."
@@ -283,13 +318,21 @@
       "class": "identifiers",
       "default": "on",
       "switch": "OTEL_LOG_TOOL_DETAILS",
-      "description": "The path of each file read, edited or written",
+      "description": "The path of each file read, edited or written, and of each file a commit changed",
       "example": "/Users/ana/acme/api/src/login.ts",
       "attributes": [
         {
           "keys": [
             "file_path",
             "workspace.host_paths"
+          ]
+        },
+        {
+          "keys": [
+            "vcs.commit.file.paths"
+          ],
+          "records": [
+            "vcs.commit.created"
           ]
         }
       ],
@@ -309,6 +352,29 @@
         {
           "keys": [
             "url.full"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "work.item",
+      "name": "Tickets",
+      "class": "identifiers",
+      "default": "on",
+      "description": "The ID and address of each Linear or Jira ticket the session created or updated, and the workspace or site it belongs to. With it off, the plugin sends no ticket records from sessions",
+      "example": "ENG-42, linear.app/acme/issue/ENG-42",
+      "attributes": [
+        {
+          "keys": [
+            "work.item.id",
+            "work.item.url",
+            "work.instance",
+            "work.item.op",
+            "work.vendor"
+          ],
+          "records": [
+            "work.item.created",
+            "work.item.updated"
           ]
         }
       ]
@@ -368,6 +434,25 @@
       ],
       "output_keys": [
         "bash_command"
+      ]
+    },
+    {
+      "id": "change.title",
+      "name": "Pull request titles",
+      "class": "content",
+      "default": "on",
+      "needs": "repo",
+      "description": "The title of each pull request or merge request a session opened",
+      "example": "Fix the login redirect on Safari",
+      "attributes": [
+        {
+          "keys": [
+            "vcs.change.title"
+          ],
+          "records": [
+            "vcs.change.opened"
+          ]
+        }
       ]
     },
     {

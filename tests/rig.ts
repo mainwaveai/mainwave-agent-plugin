@@ -30,7 +30,7 @@ export const CONTRACT: Record<string, (v: unknown) => boolean> = {
   ...Object.fromEntries(['branch_opened', 'push_ref', 'merge_ref', 'tag_name'].map(r => [`mainwave.command.${r}`, (v: unknown) => typeof v === 'string' && /^\S{1,256}$/.test(v)])),
 }
 /** The data points a person may opt in to: those off by default, every identifier and every piece of content. */
-export const OPT_IN_IDS = ['repo', 'file.path', 'web.url', 'mcp.url', 'bash.command', 'tool.input', 'tool.result', 'skill.text', 'prompt.text', 'response.text', 'response.thinking']
+export const OPT_IN_IDS = ['repo', 'file.path', 'web.url', 'work.item', 'mcp.url', 'bash.command', 'change.title', 'tool.input', 'tool.result', 'skill.text', 'prompt.text', 'response.text', 'response.thinking']
 /**
  * Explicit settings that turn on the identifiers and content Claude Code sends with Mainwave's org-wide setup captures on: as an
  * organization's settings would. For tests of what goes where once a data point is on, not of the defaults.

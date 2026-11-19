@@ -26,6 +26,7 @@ import { CATALOG, DATA_POINTS, DEFAULTS, METRIC_OWNERS, OUTPUT_OWNERS, OWN_ROWS,
 import type { BuiltSpan, CopiedRow, MetricPoint } from './otlp.ts'
 import { DEFAULT_PACKS, EXEMPT_KEYS, PACK_NAMES, type PackName } from './packs.ts'
 import { CONTENT_MAX_LENGTH, cut, redact } from './protect.ts'
+import { MARKER_KEYS } from './markers.ts'
 import { COMMAND_PREFIX, COMMAND_REF_KEYS, COUNT_RULES, filterStamps, OPT_IN_STAMP, REDACTION_COUNT } from './stamps.ts'
 
 export type Setting = 'on' | 'off' | 'claude'
@@ -497,6 +498,19 @@ export function gateSpan(gate: Gate, span: BuiltSpan, strict = false): BuiltSpan
     count += g.count
   }
   return { ...span, attributes: withOptIn(gate, withCount(attributes, count)), ...(span.events ? { events } : {}), ...(status ? { status } : {}) }
+}
+
+/**
+ * A span through the gate, a marker (markers.ts) among them: a marker goes only while the data point of its key is on and its key
+ * comes through the gate; null otherwise. Any other span as `gateSpan` has it.
+ */
+export function gateMarker(gate: Gate, span: BuiltSpan, strict = false): BuiltSpan | null {
+  const key = Object.prototype.hasOwnProperty.call(MARKER_KEYS, span.name) ? MARKER_KEYS[span.name] : undefined
+  if (key === undefined) return gateSpan(gate, span, strict)
+  if (key.point !== undefined && !allows(gate, key.point, false)) return null
+  // Strict: Claude Code sends none of a marker's values, so a data point set to as Claude Code sends it sends none of them either.
+  const gated = gateSpan(gate, span, true)
+  return gated.attributes[key.attribute] === undefined ? null : gated
 }
 
 /**
