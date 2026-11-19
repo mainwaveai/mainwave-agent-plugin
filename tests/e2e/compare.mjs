@@ -95,7 +95,7 @@ const CAPTURES = ['OTEL_LOG_TOOL_DETAILS', 'OTEL_LOG_TOOL_CONTENT', 'OTEL_LOG_US
  */
 const CAPTURED_DATA_POINTS = ['repo', 'file.path', 'web.url', 'bash.command', 'tool.input', 'tool.result', 'prompt.text', 'response.text']
 /** The content the rowless pass turns on, as an organization's settings would: the prompt, the response, and the tool input with what it holds. */
-const ROWLESS_CONTENT = ['prompt.text', 'response.text', 'tool.input', 'bash.command', 'file.path', 'web.url']
+const ROWLESS_CONTENT = ['prompt.text', 'response.text', 'tool.input', 'tool.result', 'bash.command', 'file.path', 'web.url']
 /** The keys that content goes under: compared apart, as the reference pass sends it as Claude Code does, with its switches at 0. */
 const CONTENT_KEYS = new Set(['prompt', 'prompt_text', 'response', 'tool_input', 'tool_parameters', 'full_command', 'bash_command', 'file_path', 'user_prompt', 'url.full', 'url.domain'])
 /**
@@ -152,7 +152,7 @@ function modelReply(req) {
     const refuse = classifiedAction(req).includes(REFUSED)
     if (refuse) classified.refused++
     const text = textOf(req.system).includes('<severity>') ? `<severity>${refuse ? 100 : 0}</severity>` : `<block>${refuse ? 'yes' : 'no'}</block>`
-    return { id, block: { type: 'text', text }, stop: 'end_turn', usage }
+    return { id, blocks: [{ type: 'text', text }], stop: 'end_turn', usage }
   }
   const first = textOf(req.messages?.[0]?.content)
   const tools = (req.tools ?? []).map(t => t?.name)
@@ -176,22 +176,30 @@ function modelReply(req) {
     ]
   }
   const block = results.length < script.length ? script[results.length] : { type: 'text', text: 'ok' }
-  return { id, block, stop: block.type === 'tool_use' ? 'tool_use' : 'end_turn', usage }
+  // The main task's first reply says something before its call, and its last answers in two blocks: Claude Code logs a response for
+  // each reply with text, its blocks joined, which the rows built without Claude Code's must match.
+  const main = first.includes('E2E_MAINTASK') && script.length > 0
+  const blocks = main && results.length === 0 ? [{ type: 'text', text: 'Let me check.' }, block]
+    : main && results.length >= script.length ? [{ type: 'text', text: 'ok' }, { type: 'text', text: 'All steps ran.' }]
+    : [block]
+  return { id, blocks, stop: block.type === 'tool_use' ? 'tool_use' : 'end_turn', usage }
 }
 
 function sse(res, req) {
-  const { id, block, stop, usage } = modelReply(req)
+  const { id, blocks, stop, usage } = modelReply(req)
   res.writeHead(200, { 'content-type': 'text/event-stream', 'request-id': `req_e2e_${messageId}` })
   const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify({ type: event, ...data })}\n\n`)
   send('message_start', { message: { id, type: 'message', role: 'assistant', model: req.model, content: [], stop_reason: null, stop_sequence: null, usage: { ...usage, output_tokens: 1 } } })
-  if (block.type === 'text') {
-    send('content_block_start', { index: 0, content_block: { type: 'text', text: '' } })
-    send('content_block_delta', { index: 0, delta: { type: 'text_delta', text: block.text } })
-  } else {
-    send('content_block_start', { index: 0, content_block: { ...block, input: {} } })
-    send('content_block_delta', { index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input) } })
+  for (const [index, block] of blocks.entries()) {
+    if (block.type === 'text') {
+      send('content_block_start', { index, content_block: { type: 'text', text: '' } })
+      send('content_block_delta', { index, delta: { type: 'text_delta', text: block.text } })
+    } else {
+      send('content_block_start', { index, content_block: { ...block, input: {} } })
+      send('content_block_delta', { index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input) } })
+    }
+    send('content_block_stop', { index })
   }
-  send('content_block_stop', { index: 0 })
   send('message_delta', { delta: { stop_reason: stop, stop_sequence: null }, usage: { output_tokens: usage.output_tokens } })
   send('message_stop', {})
   res.end()
@@ -273,9 +281,9 @@ const server = createServer(async (req, res) => {
     }
     await new Promise(r => setTimeout(r, 300 + ((messageId + 1) * 397) % 600))
     if (parsed.stream) return sse(res, parsed)
-    const { id, block, stop, usage } = modelReply(parsed)
+    const { id, blocks, stop, usage } = modelReply(parsed)
     res.writeHead(200, { 'content-type': 'application/json', 'request-id': `req_e2e_${messageId}` })
-    return res.end(JSON.stringify({ id, type: 'message', role: 'assistant', model: parsed.model, content: [block], stop_reason: stop, stop_sequence: null, usage }))
+    return res.end(JSON.stringify({ id, type: 'message', role: 'assistant', model: parsed.model, content: blocks, stop_reason: stop, stop_sequence: null, usage }))
   }
   // The settings API is asked beside the collector the copy goes to: production's without the env block, which answers the settings
   // the keyless pass checks; the receiver the person's settings name with it, which answers as the route off, so the explicit settings
@@ -1072,6 +1080,9 @@ function checkRowless(pass, { captured, run }, reference) {
   }
   for (const r of ofEvent(rows, 'tool_result')) if (typeof r.attributes.tool_input?.v !== 'string') problems.push(`content: the built tool_result row of ${r.attributes.tool_name?.v} carries no tool input`)
   if (!ofEvent(rows, 'tool_result').some(r => String(r.attributes.tool_input?.v).includes('echo e2e'))) problems.push('content: no built tool_result row carries the Bash call\'s command')
+  // A call's output goes on its tool span, as with rows: the Bash call's, which printed `e2e`.
+  const outputs = spansOf(captured.plugin.traces).filter(s => s.name === 'claude_code.tool' && (s.events ?? []).some(e => e.name === 'tool.output'))
+  if (!outputs.some(s => s.attrs.tool_name?.v === 'Bash')) problems.push('content: no Bash tool span carries its tool.output event')
   console.log(`  content built: ${ofEvent(rows, 'user_prompt').length} prompts, ${responses.length} responses, ${ofEvent(rows, 'tool_result').filter(r => r.attributes.tool_input !== undefined).length} tool inputs`)
 
   const spans = spansOf(captured.plugin.traces)
@@ -1113,6 +1124,7 @@ const KEYS_ADD = {
     tool_decision: ['permission_mode', 'request_id'],
     tool_result: ['error_type', 'request_id'],
     'claude_code.llm_request': ['gen_ai.response.id', 'request_id'],
+    // The error's text goes where the call's output does (`tool.result`, on in the rowless pass); its class never.
     'claude_code.tool.execution': ['error', 'error_class'],
   },
 }

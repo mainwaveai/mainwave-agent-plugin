@@ -255,6 +255,17 @@ export function responseRow(state: Rowless, head: Attrs, r: { length: number; mo
   ])
 }
 
+/**
+ * The text a request answered with, for its response row: the step's own visible answer, where it gave one. Where the stream's
+ * pieces, joined as Claude Code joins a response's blocks, read the same with whitespace aside, the stream's (Claude Code's own
+ * spelling of the blocks' join). None where the answer is empty or blank.
+ */
+export function responseTextOf(answer: unknown, streamed: string | undefined): string | undefined {
+  if (typeof answer !== 'string' || answer.trim() === '') return undefined
+  if (streamed !== undefined && streamed.replace(/\s+/g, '') === answer.replace(/\s+/g, '')) return streamed
+  return answer
+}
+
 /** A request's `query_source` as Claude Code names it: the main loop's by how the session runs, a subagent's by its type. */
 function querySourceOf(agentId: string | undefined, agent: { type: string; builtIn: boolean } | undefined, sdk: boolean): string {
   if (agentId === undefined) return sdk ? 'sdk' : 'repl_main_thread'

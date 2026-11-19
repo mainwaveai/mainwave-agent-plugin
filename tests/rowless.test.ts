@@ -5,7 +5,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { accountDeviceOf, costOf, decisionSource, hostIdentityOf, isRefusal, seedCost, newRowless, promptRow, providerOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
+import { accountDeviceOf, costOf, decisionSource, hostIdentityOf, isRefusal, responseTextOf, seedCost, newRowless, promptRow, providerOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
 import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, PROD, records, type Post } from './rig.ts'
 
 const keyless = { options: {} }
@@ -402,6 +402,15 @@ describe('the rows built from events', () => {
 })
 
 describe('rowless.ts', () => {
+  test("a response row's text is the step's own answer: a retry's doubled pieces never; the stream's join where it reads the same", () => {
+    expect(responseTextOf('ok', 'okok')).toBe('ok')
+    expect(responseTextOf('Let me check.\nok', 'Let me check.\nok')).toBe('Let me check.\nok')
+    expect(responseTextOf('Let me check.ok', 'Let me check.\nok')).toBe('Let me check.\nok')
+    expect(responseTextOf('', 'ok')).toBeUndefined()
+    expect(responseTextOf('  \n', undefined)).toBeUndefined()
+    expect(responseTextOf('ok', undefined)).toBe('ok')
+  })
+
   test("Claude Code's texts of a refusal: the person's, one no one could be asked about, the ask's own reason; not a tool's own failure", () => {
     expect(isRefusal("The user doesn't want to proceed with this tool use. The tool use was rejected.", undefined)).toBe(true)
     expect(isRefusal('Error: Permission to use Bash has been denied. IMPORTANT: ...', undefined)).toBe(true)

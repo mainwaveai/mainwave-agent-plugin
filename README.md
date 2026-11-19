@@ -97,7 +97,7 @@ The plugin builds rows when no row of Claude Code's has reached it by the time t
 | --- | --- | --- |
 | `user_prompt` | A main-loop turn begins with a prompt (not a continuation) | The prompt's length, and its text where `prompt.text` is on; Claude Code's `prompt.id` for it, which the turn's other rows carry too |
 | `api_request` | A model request answers | From `turn.step`: the model, the four token counts and the cache writes by lifetime, and the effort. A subagent's `query_source` and `agent.name`, from its spawn. Its duration and time to first token, on the plugin's clock. Its cost: what the session's cost (`$.session.usage()`) grew by since the request before |
-| `assistant_response` | A model request answers with text, after its request row | The response's length, its text where `response.text` is on, and its model and `query_source` |
+| `assistant_response` | A model request answers with text, after its request row | The response's length and its text (where `response.text` is on), from the step's own answer; its model and `query_source`, and a subagent's `agent_id` |
 | `tool_decision` | A tool call settles, timed at its start | `reject` where the call was refused: its permission check (`tool.check`) refused it, or asked, and the call then ended in Claude Code's text of a refusal (the person's, the one for an ask no one could answer, or the ask's own reason). Else `accept`. Its `source` where the check names a rule or a setting (`config`) or a hook (`hook`), and its `tool_source` |
 | `tool_result` | A tool call that was not refused ends | Its outcome and duration, its input's and result's sizes in bytes, and its parameters and input where their data points are on |
 
@@ -112,7 +112,7 @@ Every row starts as Claude Code's do: the organization's resource attributes, th
 | The other rows: `api_error`, `subagent_completed`, `plugin_loaded`, `mcp_server_connection`, `permission_mode_changed`, `retention_sweep` and the rest | No event a plugin may hook carries them |
 | A request's `request_id` (on its row and span, and as the span's `gen_ai.response.id`), on its response, decisions and results too, and its `speed` | `turn.step` does not report them |
 | A decision's `permission_mode`, and its `source` where the person, the mode or the classifier settled an ask | No event a plugin may hook says it |
-| A failed call's `error_type`, and so its run span's `error` and `error_class` | Claude Code names the error's class, which the call's result does not |
+| A failed call's `error_type`, and so its run span's `error_class`, and its `error` unless the call's output goes (`tool.result`) | Claude Code names the error's class, which the call's result does not |
 | A prompt or response row's `message.uuid` | No event a plugin may hook says it |
 | The tokens of model requests outside a turn: memory extraction, prompt suggestions, compaction, summaries, a web page's reading, session titles, classifiers | They are not steps of a turn, and no event a plugin may hook shows them. Their cost is counted (above), not their tokens or model. In two weeks of sessions Mainwave received in November 2026, these requests were about 9% of requests and 4% of the cost. They were 5% of the tokens (5% of output and cache reads, 2% of cache writes), and nearly all of the uncached input, which a turn's requests mostly read from the cache. Per session, the median share of the cost was under 0.1%, and one in ten sessions was above 10% |
 | A request that brought no response | Claude Code's `api_error` row says what failed; no event does |

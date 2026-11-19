@@ -154,6 +154,13 @@ export function streamedText(c: Capture, agentId: unknown): string | undefined {
   return text === '' ? undefined : text
 }
 
+/** The text a loop's request answered with, in place of its streamed pieces: what a response row of its length is filled with. */
+export function setStreamedText(c: Capture, agentId: unknown, text: string): void {
+  const s = c.streams.get(loopKey(agentId)) ?? { text: [], thinking: [] }
+  s.text = [text]
+  c.streams.set(loopKey(agentId), s)
+}
+
 /** The text a loop's request streamed is let go, once a row has carried it: a row that comes later fills nothing from it. */
 export function dropStreamedText(c: Capture, agentId: unknown): void {
   const s = c.streams.get(loopKey(agentId))
