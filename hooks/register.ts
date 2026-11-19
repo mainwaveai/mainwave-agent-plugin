@@ -1,6 +1,6 @@
 // The plugin's hooks module. It stamps the telemetry rows Claude Code exports to the organization's collector (where the organization
-// configured one), keeps the identity those rows carry for the session, and sends its own copy of each row to Mainwave's dev collector
-// (sender.ts), keyless or with the person's dev ingest key, with the spans and metrics it rebuilds beside them (rebuild.ts, meter.ts).
+// configured one), keeps the identity those rows carry for the session, and sends its own copy of each row to Mainwave's production
+// collector (sender.ts), keyless, with the spans and metrics it rebuilds beside them (rebuild.ts, meter.ts).
 // It draws nothing and registers no command or tool.
 //
 // The exporter's row always goes on: the copy is queued beside it, never in its place. Fail open: a hook that throws never holds up a
@@ -30,7 +30,7 @@ import {
 } from './rebuild.ts'
 import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsSummary } from './orgsettings.ts'
 import { contentLimit } from './protect.ts'
-import { adopt, configure, DEV_COLLECTOR, enqueue, ensureTimer, finish, isCopying, keyMalformed, readOptions, snapshot } from './sender.ts'
+import { adopt, collectorMalformed, collectorOf, configure, enqueue, ensureTimer, finish, isCopying, readOptions, snapshot } from './sender.ts'
 import {
   approvalsOf, approved, permitted, DESKTOP_UNDER_APPDATA, DESKTOP_UNDER_HOME, distinct, enabledPlugins, fileServers, foldersUp, globalServers, join, managedDirs, manifestServerFiles, MAX_PLUGINS, parse,
   pluginServers, projectEntry, serverAttributes, toolSpelling, type Approvals, type McpServer,
@@ -128,7 +128,7 @@ async function noteIdentity($: EngineInterface, attributes: Readonly<Record<stri
   const seen = identityOf(attributes)
   // The organization's settings follow who the session is: those kept for it apply, and the plugin asks Mainwave for them.
   try {
-    await noteSessionIdentity($, DEV_COLLECTOR, mergeIdentity(held, seen), isCopying)
+    await noteSessionIdentity($, mergeIdentity(held, seen), isCopying)
   } catch {
     // The settings in force stand.
   }
@@ -612,7 +612,7 @@ export async function sessionStart($: SessionStartParams[0], e: SessionStartPara
       if (first && r !== null) await emit($, sessionStarted(r, await $.clock.now()))
       await adopt($)
       // The organization's settings: asked for again as a session starts, where its rows have named who it is.
-      ensureFetching($, DEV_COLLECTOR)
+      ensureFetching($)
       // A new session: its servers and skill texts are sent again (after a /clear, `session.end` starts them over). Claude's settings
       // are read beside the session's start, never holding it.
       textIds = new Map()
@@ -879,15 +879,15 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
     }
     await finish($, next.budget)
     // Never the value: only that it does not fit.
-    if (keyMalformed()) $.ui.log('mainwave: copy off: the devIngestKey option holds a key of the wrong shape', { to: 'debug' })
+    if (collectorMalformed()) $.ui.log('mainwave: copy off: the collectorUrl option is not an https URL (or http on loopback)', { to: 'debug' })
     // Never the value: only why.
     const redaction = currentGate().redaction
     if (isCopying() && 'held' in redaction) $.ui.log(`mainwave: identifier and content values held back: the redaction packs chosen ${redaction.held === 'unreadable' ? "can't be read" : 'name a pack this plugin does not have'}`, { to: 'debug' })
     if (isCopying()) {
       const s = snapshot()
-      const withheld = s.keyless ? `, ${s.withheld} held back (no organization and email)` : ''
       const refusals = s.refusedIdentities > 0 ? `, ${s.refusedIdentities} organization and email refused` : ''
-      $.ui.log(`mainwave: copy to dev${s.keyless ? ' (keyless)' : ''}: ${s.sent} sent, ${s.dropped} dropped, ${s.queued} kept for a later session${withheld}${refusals}; data collection settings: ${settingsSummary()}`, { to: 'debug' })
+      const stopped = s.stopped ? ', refused: nothing more sent or queued this session' : ''
+      $.ui.log(`mainwave: copy to ${collectorOf()} (keyless): ${s.sent} sent, ${s.dropped} dropped, ${s.queued} kept for a later session, ${s.withheld} held back (no organization and email)${refusals}${stopped}; data collection settings: ${settingsSummary()}`, { to: 'debug' })
     }
   } catch {
     // What could not be kept is lost to the copy alone: the exporter's rows went on.
@@ -898,7 +898,7 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
   return next(e)
 }
 
-export const register: Register = (on, options) => {
+export const register: Register = on => {
   entrypoint = null
   held = {}
   rebuild = null
@@ -925,7 +925,7 @@ export const register: Register = (on, options) => {
   argsInFlight = 0
   pendingArgs = new Map()
   recentArgs = []
-  configure(options)
+  configure()
 
   on('session.start', sessionStart)
 

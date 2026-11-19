@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // End to end: one real `claude -p` session with the plugin loaded, its model answered by a local mock of the Anthropic API, and both
-// paths of its telemetry received locally: Claude Code's own OTLP exporter (logs, traces and metrics), and the plugin's copy (sent to
-// Mainwave's dev collector, which the test-only hooks in tests/e2e/redirect.ts send here instead). Nothing leaves the machine.
+// paths of its telemetry received locally: Claude Code's own OTLP exporter (logs, traces and metrics), and the plugin's copy. With the
+// env block, the person's own settings name this receiver as the plugin's collector (`collectorUrl`); without it, the copy goes to
+// Mainwave's production collector, its default, which the test-only hooks in tests/e2e/redirect.ts send here instead, on a path of
+// its own, so the pass proves where the copy was meant to go. Nothing leaves the machine.
 //
 //   logs     every record is paired with its twin by session, event name and sequence, and compared field by field.
 //   traces   every span is paired with its twin by what identifies it (an interaction or permission span by its id, a request by
@@ -13,20 +15,22 @@
 // difference fails.
 //
 // A third pass runs the same session without Mainwave's env block: no telemetry settings at all, so Claude Code's exporter sends
-// nothing and no row names a span, and the plugin sends keyless (no key set, its default). There is nothing to compare with, so the
-// receiver plays keyless ingest instead: it refuses a request with an Authorization header (401), or one whose records, spans or data
-// points do not each carry one `organization.id` and one `user.email`, the same pair across the request (400). The pass fails on any
-// refusal, and checks that the spans make one trace per interaction: the interaction a root, the main loop's requests and calls its
+// nothing and no row names a span, and the plugin sends to production's collector, keyless (no settings, its default). There is
+// nothing to compare with. In every pass the receiver plays keyless ingest for the plugin's requests: it refuses a request with an
+// Authorization header (401), or one whose records, spans or data points do not each carry one `organization.id` and one
+// `user.email`, the same pair across the request (400). Each pass fails on any refusal, and on a request that went anywhere but where
+// it was meant to: the receiver the settings name with the env block, production's collector without it. This pass also checks that the spans make one trace per interaction: the interaction a root, the main loop's requests and calls its
 // children, each call's decision and run the call's, and a subagent's requests and calls under its Agent call's run. The session runs
 // on an API key, so its rows name an organization and an email only through OTEL_RESOURCE_ATTRIBUTES, which stands in for what an
 // account's login puts on them. It also checks the plugin's defaults: with no settings at all, the copy carries required and metadata
 // data points (a command's class, a subagent's type, a failed call's error class) and no identifier or content: no command, file
 // path, tool input or output, repository, prompt or response.
 //
-// The plugin asks Mainwave for its organization's data collection settings once the rows name the organization and email; the
-// test-only hooks send that request to the receiver too, which answers as Mainwave's settings API would. Only the keyless pass's rows
-// name an email, so only it asks: the receiver answers with settings that turn a metadata data point off (`file.kind`) and add a
-// redaction pack, and the pass checks the request carried the organization and email alone, that the answer was kept in the store with
+// The plugin asks Mainwave for its organization's data collection settings once the rows name the organization and email, on the API
+// beside the collector the copy goes to. In the keyless pass that is production's API, which the test-only hooks send here too, and
+// the receiver answers as Mainwave's settings API would, with settings that turn a metadata data point off (`file.kind`) and add a
+// redaction pack; with the env block it is the receiver the person's settings name, which answers as the route off, so the explicit
+// settings below stand. The keyless pass checks the request carried the organization and email alone, that the answer was kept in the store with
 // its organization, and that the copy went without the data point turned off. (The pass sends no content, so the pack is checked as
 // kept, not as run: the unit tests run it.)
 //
@@ -60,7 +64,6 @@ const root = resolve(here, '..', '..')
 const keep = process.argv.includes('--keep')
 
 const EXPORTER_KEY = 'exporter_e2e_key_0001'
-const PLUGIN_KEY = 'mw_dev_e2e_key_0001'
 /** Resource keys only the OpenTelemetry SDK's host detectors add; a plugin has nothing to read them from. */
 const HOST_ONLY = new Set(['os.type', 'os.version', 'host.arch'])
 /** Attribute keys that differ by design between the two paths. */
@@ -96,10 +99,10 @@ const CAPTURED_DATA_POINTS = ['repo', 'file.path', 'web.url', 'bash.command', 't
 const storeFile = (config, id = 'mainwave@inline') => join(config, 'plugins', 'store', `${id.replace('@', '_')}-${createHash('sha256').update(id).digest('hex').slice(0, 12)}.json`)
 /** An example organization, put on every record through the resource so the plugin's stamping path runs as in a real organization. */
 const ORG = '7c9e6679-7425-40de-944b-e07fc1f90ae7'
-/** An example person in it, put on every record in the keyless pass, as a login would. */
+/** An example person in it, put on every record, as a login would: keyless ingest routes by the pair. */
 const EMAIL = 'e2e@example.com'
-/** Where the plugin asks for its organization's settings, as the receiver sees it: the API's path after the receiver's own. */
-const SETTINGS_PATH = '/plugin/api/plugin/data-collection-settings'
+/** Where the plugin asks for its organization's settings, on Mainwave's API or the receiver the person's settings name. */
+const SETTINGS_PATH = '/api/plugin/data-collection-settings'
 /** What the receiver answers the keyless pass's request for settings with, as Mainwave's settings API would. */
 const SETTINGS = { revision: 5, catalog_version: 1, data_points: { 'file.kind': 'off' }, in_force: { 'file.kind': 'off' }, redaction_packs: ['secrets', 'pii.contact'], default_data_points: [], redaction_packs_default: false }
 /**
@@ -229,11 +232,10 @@ function keylessAnswer(headers, body) {
   return { status: 200 }
 }
 
-let keylessRules = false
 let overloaded = false
 /**
- * The test-only plugin that sends the plugin's dev-collector requests to the receiver, built in a temporary folder: its manifest lives
- * only there, as this repository holds one plugin (scripts/check-layout.sh).
+ * The test-only plugin that sends the plugin's requests to production's collector to the receiver (under `/prod`), built in a
+ * temporary folder: its manifest lives only there, as this repository holds one plugin (scripts/check-layout.sh).
  */
 function redirectPlugin() {
   const dir = mkdtempSync(join(tmpdir(), 'mainwave-e2e-redirect-'))
@@ -242,7 +244,7 @@ function redirectPlugin() {
   writeFileSync(join(dir, '.claude-plugin', 'plugin.json'), JSON.stringify({
     name: 'mainwave-e2e-redirect',
     version: '0.0.0',
-    description: "Test only: sends the mainwave plugin's dev-collector requests to the local receiver the end-to-end comparison runs.",
+    description: "Test only: sends the mainwave plugin's requests to Mainwave's production collector to the local receiver the end-to-end comparison runs.",
   }))
   writeFileSync(join(dir, 'hooks', 'hooks.json'), JSON.stringify({ modules: ['./register.ts'] }))
   copyFileSync(join(here, 'redirect.ts'), join(dir, 'hooks', 'register.ts'))
@@ -271,17 +273,25 @@ const server = createServer(async (req, res) => {
     res.writeHead(200, { 'content-type': 'application/json', 'request-id': `req_e2e_${messageId}` })
     return res.end(JSON.stringify({ id, type: 'message', role: 'assistant', model: parsed.model, content: [block], stop_reason: stop, stop_sequence: null, usage }))
   }
-  if (req.method === 'POST' && path === SETTINGS_PATH) {
+  // The settings API is asked beside the collector the copy goes to: production's without the env block, which answers the settings
+  // the keyless pass checks; the receiver the person's settings name with it, which answers as the route off, so the explicit settings
+  // in the store stand and the copy is compared with the exporter's as they say.
+  if (req.method === 'POST' && path === `/prod${SETTINGS_PATH}`) {
     captured.settings.push({ headers: req.headers, body })
-    // Only the keyless pass's rows name an email to ask with; a request from any other is a problem, and answered as the route off.
-    res.writeHead(keylessRules ? 200 : 404, { 'content-type': 'application/json' })
-    return res.end(keylessRules ? JSON.stringify(SETTINGS) : '{"detail":"Not Found"}')
+    res.writeHead(200, { 'content-type': 'application/json' })
+    return res.end(JSON.stringify(SETTINGS))
   }
-  const signal = SIGNALS.find(s => path === `/v1/${s}` || path === `/plugin/v1/${s}`)
+  if (req.method === 'POST' && path === `/plugin${SETTINGS_PATH}`) {
+    res.writeHead(404, { 'content-type': 'application/json' })
+    return res.end('{"detail":"Not Found"}')
+  }
+  // The plugin's requests come under `/plugin` (the collector its settings name) or `/prod` (production's, through redirect.ts).
+  const signal = SIGNALS.find(s => path === `/v1/${s}` || path === `/plugin/v1/${s}` || path === `/prod/v1/${s}`)
   if (req.method === 'POST' && signal) {
-    const who = path.startsWith('/plugin/') ? 'plugin' : 'exporter'
-    const answer = who === 'plugin' && keylessRules ? keylessAnswer(req.headers, body) : { status: 200 }
-    captured[who][signal].push({ auth: req.headers['authorization'], type: req.headers['content-type'], idempotencyKey: req.headers['idempotency-key'], body, status: answer.status, error: answer.error })
+    const via = path.split('/')[1]
+    const who = via === 'plugin' || via === 'prod' ? 'plugin' : 'exporter'
+    const answer = who === 'plugin' ? keylessAnswer(req.headers, body) : { status: 200 }
+    captured[who][signal].push({ via, auth: req.headers['authorization'], type: req.headers['content-type'], idempotencyKey: req.headers['idempotency-key'], body, status: answer.status, error: answer.error })
     if (answer.status !== 200) {
       res.writeHead(answer.status, { 'content-type': 'application/json' })
       return res.end(JSON.stringify({ error: answer.error }))
@@ -307,22 +317,24 @@ async function session(details, envBlock, auto) {
   messageId = 0
   classified = { asked: 0, refused: 0 }
   overloaded = false
-  keylessRules = !envBlock
   const config = mkdtempSync(join(tmpdir(), 'mainwave-e2e-'))
   work = mkdtempSync(join(tmpdir(), 'mainwave-e2e-work-'))
   // A repository, so the session's git commit has somewhere to go. Its config is the command's own: no user or system config is read.
   const git = (...a) => execFileSync('git', a, { cwd: work, env: { PATH: process.env.PATH, HOME: work, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' } })
   git('init', '-q', '-b', 'main')
   git('-c', 'user.name=e2e', '-c', 'user.email=e2e@example.com', 'commit', '-q', '--allow-empty', '-m', 'init')
-  // Without the env block, the plugin's defaults: no key, so keyless, and no settings.
-  const options = envBlock ? { devIngestKey: PLUGIN_KEY } : {}
+  // With the env block, the person's own settings (the config folder's settings.json) name the receiver as the plugin's collector, under
+  // both ids a folder's plugin may have. Without it, the plugin's defaults: no settings at all.
+  if (envBlock) {
+    const options = { collectorUrl: `${base}/plugin` }
+    writeFileSync(join(config, 'settings.json'), JSON.stringify({ pluginConfigs: { 'mainwave@inline': { options }, mainwave: { options } } }))
+  }
   // With it, settings that turn on the identifiers and content the captures turn on in Claude Code: on with the captures on; as Claude
   // Code sends them with each set to 0, where the exporter is the reference for what a switch at 0 leaves.
   if (envBlock) {
     mkdirSync(dirname(storeFile(config)), { recursive: true })
     writeFileSync(storeFile(config), JSON.stringify({ dataPoints: Object.fromEntries(CAPTURED_DATA_POINTS.map(id => [id, details ? 'on' : 'claude'])) }))
   }
-  const settings = JSON.stringify({ pluginConfigs: { 'mainwave@inline': { options }, mainwave: { options } } })
 
   const env = {
     PATH: process.env.PATH,
@@ -334,7 +346,7 @@ async function session(details, envBlock, auto) {
     ANTHROPIC_API_KEY: 'sk-ant-e2e-not-a-key',
     ANTHROPIC_BASE_URL: base,
     DISABLE_AUTOUPDATER: '1',
-    MW_E2E_RECEIVER: `${base}/plugin`,
+    MW_E2E_RECEIVER: `${base}/prod`,
   }
   // Without the env block: no telemetry settings at all. The organization and email reach the rows as a login would put them there.
   if (!envBlock) Object.assign(env, { OTEL_RESOURCE_ATTRIBUTES: `organization.id=${ORG},user.email=${EMAIL}` })
@@ -351,7 +363,7 @@ async function session(details, envBlock, auto) {
     OTEL_LOGS_EXPORT_INTERVAL: '500',
     OTEL_TRACES_EXPORT_INTERVAL: '500',
     // The metric interval stays at its default (a minute), so each path collects once, as the session ends: one point per series.
-    OTEL_RESOURCE_ATTRIBUTES: `mainwave.source=coding_agent.claude_code,service.name=claude-code,deployment.environment=e2e,organization.id=${ORG}`,
+    OTEL_RESOURCE_ATTRIBUTES: `mainwave.source=coding_agent.claude_code,service.name=claude-code,deployment.environment=e2e,organization.id=${ORG},user.email=${EMAIL}`,
     // Mainwave's org-wide setup's captures, all on (its default), or all turned off: it writes `0` for a capture an admin turns off.
     ...Object.fromEntries(CAPTURES.map(k => [k, details ? '1' : '0'])),
   })
@@ -360,7 +372,6 @@ async function session(details, envBlock, auto) {
     '-p', 'E2E_MAINTASK: run the steps, then say ok.',
     '--plugin-dir', root,
     '--plugin-dir', redirect,
-    '--settings', settings,
     '--allowedTools', 'Bash(echo e2e),Bash(echo sub),Bash(git -c user.name=e2e -c user.email=e2e@example.com commit:*),Bash(ls e2e-missing-file),Write,Edit,Agent',
     '--model', 'claude-haiku-5-5',
     ...(auto ? ['--permission-mode', 'auto'] : []),
@@ -471,9 +482,9 @@ function compare(pass, details, auto, { captured, run }) {
   for (const s of SIGNALS) {
     for (const p of captured.exporter[s]) if (p.auth !== `Bearer ${EXPORTER_KEY}`) problems.push(`an exporter ${s} request without the exporter key`)
     for (const p of captured.plugin[s]) {
-      if (p.auth !== `Bearer ${PLUGIN_KEY}`) problems.push(`a plugin ${s} request without the person's dev key`)
-      if (!IDEMPOTENCY_KEY.test(p.idempotencyKey ?? '')) problems.push(`a plugin ${s} request without an idempotency key of the collector's shape`)
-      if (p.body.includes(PLUGIN_KEY) || p.body.includes(EXPORTER_KEY)) problems.push(`a key inside a plugin ${s} request body`)
+      if (p.via !== 'plugin') problems.push(`a plugin ${s} request to ${p.via === 'prod' ? "production's collector" : p.via}, not the collector the person's settings name`)
+      if (p.status !== 200) problems.push(`keyless ingest refused a plugin ${s} request (${p.status}): ${p.error}`)
+      if (p.body.includes(EXPORTER_KEY)) problems.push(`the exporter's key inside a plugin ${s} request body`)
     }
     if (captured.exporter[s].length === 0) problems.push(`the exporter sent no ${s}`)
     if (captured.plugin[s].length === 0) problems.push(`the plugin sent no ${s}`)
@@ -768,6 +779,7 @@ function checkKeyless(pass, { captured, run, config }, reference) {
     if (captured.exporter[s].length > 0) problems.push(`with no env block the exporter sent ${s}`)
     if (captured.plugin[s].length === 0) problems.push(`the plugin sent no ${s}`)
     for (const p of captured.plugin[s]) if (p.status !== 200) problems.push(`keyless ingest refused a ${s} request (${p.status}): ${p.error}`)
+    for (const p of captured.plugin[s]) if (p.via !== 'prod') problems.push(`with no settings, a plugin ${s} request went to ${p.via}, not production's collector`)
   }
   const rows = logRecordsOf(captured.plugin.logs)
   if (!rows.some(r => r.attributes['event.name']?.v === 'api_request')) problems.push('no api_request row was sent')
@@ -788,7 +800,11 @@ function checkKeyless(pass, { captured, run, config }, reference) {
     return out
   }
   const wantRows = pointed(logRecordsOf(reference.exporter.logs).filter(r => !STARTUP.has(r.attributes['event.name']?.v)), spansOf(reference.exporter.traces))
-  const gotRows = pointed(rows, spans)
+  // A startup row reaches the plugin or not as the race with its loading goes: where one does, it names no span, as no interaction ran yet.
+  const gotRows = pointed(rows.filter(r => !STARTUP.has(r.attributes['event.name']?.v)), spans)
+  for (const [ev, k] of pointed(rows.filter(r => STARTUP.has(r.attributes['event.name']?.v)), spans)) {
+    if ([...k].some(kind => kind !== 'none')) problems.push(`logs: a ${ev} row, raised as the session starts, names ${[...k].join(' and ')}`)
+  }
   const kinds = m => [...m].map(([ev, k]) => `${ev}: ${[...k].sort().join(' and ')}`).sort()
   for (const ev of new Set([...wantRows.keys(), ...gotRows.keys()])) {
     const [w, g] = [[...(wantRows.get(ev) ?? [])].sort().join(' and '), [...(gotRows.get(ev) ?? [])].sort().join(' and ')]

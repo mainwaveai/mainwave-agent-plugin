@@ -1,11 +1,11 @@
-// Where the dev ingest key may come from and the shape it must have, called directly.
+// Where the person's collector override may come from and the shape it must have, called directly.
 
 import { describe, expect, test } from 'claude-code/testing'
 
-import { ingestKeyOf, namesOption, optionValues, type Layer } from '../hooks/settings.ts'
+import { collectorIn, collectorUrlOf, namesOption, optionValues, PROD_COLLECTOR, type Layer } from '../hooks/settings.ts'
 
 const cfg = (entries: Record<string, unknown>): Layer => ({ pluginConfigs: entries })
-const opt = (value: unknown) => ({ options: { devIngestKey: value } })
+const opt = (value: unknown) => ({ options: { collectorUrl: value } })
 
 describe('namesOption', () => {
   const cases: [string, Layer, boolean][] = [
@@ -14,7 +14,7 @@ describe('namesOption', () => {
     ['another plugin only', cfg({ other: opt('x') }), false],
     ['our entry without options', cfg({ mainwave: {} }), false],
     ['our options without the field', cfg({ mainwave: { options: { x: 1 } } }), false],
-    ['bare id', cfg({ mainwave: opt('mw_dev_example_key_0001') }), true],
+    ['bare id', cfg({ mainwave: opt('https://collector.example.com') }), true],
     ['@mainwave', cfg({ 'mainwave@mainwave': opt('x') }), true],
     ['@synced', cfg({ 'mainwave@synced': opt('x') }), true],
     ['@inline', cfg({ 'mainwave@inline': opt('x') }), true],
@@ -25,25 +25,33 @@ describe('namesOption', () => {
     ['two marketplaces', cfg({ 'mainwave@a@b': opt('x') }), false],
     ['unreadable', 'unreadable', true],
     ['an option the plugin no longer has (keyless is the default now)', cfg({ 'mainwave@synced': { options: { devKeyless: true } } }), false],
+    ['the dev ingest key the plugin no longer has', cfg({ 'mainwave@synced': { options: { devIngestKey: 'mw_dev_example_key_0001' } } }), false],
   ]
   for (const [name, layer, want] of cases) test(name, () => expect(namesOption(layer)).toBe(want))
 })
 
-describe('ingestKeyOf', () => {
+describe('collectorUrlOf', () => {
   const cases: [string, unknown, string | null][] = [
-    ['a plain key', 'mw_dev_example_key_0001', 'mw_dev_example_key_0001'],
-    ['spaces around it', '  mw_dev_example_key_0001\n', 'mw_dev_example_key_0001'],
-    ['with Bearer in front', 'Bearer mw_dev_example_key_0001', 'mw_dev_example_key_0001'],
-    ['with bearer in front, lowercase', 'bearer mw_dev_example_key_0001', 'mw_dev_example_key_0001'],
-    ['unset', '', null],
+    ['an https origin', 'https://collector.example.com', 'https://collector.example.com'],
+    ['a trailing slash', 'https://collector.example.com/', 'https://collector.example.com'],
+    ['spaces around it', '  https://collector.example.com\n', 'https://collector.example.com'],
+    ['a port', 'https://collector.example.com:4318', 'https://collector.example.com:4318'],
+    ['a path, kept before the signal path', 'https://example.com/otlp/', 'https://example.com/otlp'],
+    ['the host lowercased', 'https://Collector.Example.COM', 'https://collector.example.com'],
+    ['http on 127.0.0.1', 'http://127.0.0.1:4318', 'http://127.0.0.1:4318'],
+    ['http on localhost', 'http://localhost:4318/', 'http://localhost:4318'],
+    ['http on ::1', 'http://[::1]:4318', 'http://[::1]:4318'],
+    ['http elsewhere', 'http://collector.example.com', null],
+    ['another scheme', 'ftp://collector.example.com', null],
+    ['a user and password', 'https://u:p@collector.example.com', null],
+    ['a query', 'https://collector.example.com/?x=1', null],
+    ['a fragment', 'https://collector.example.com/#x', null],
+    ['a bare host', 'collector.example.com', null],
+    ['empty', '', null],
     ['not a string', 42, null],
-    ['too short', 'abc', null],
-    ['a space inside', 'mw_dev example', null],
-    ['a line break inside (no header injection)', 'mw_dev_key\r\nx-evil: 1', null],
-    ['too long', 'k'.repeat(513), null],
-    ['non-ASCII', 'mw_dev_ключ_0001', null],
+    ['too long', `https://example.com/${'p'.repeat(2100)}`, null],
   ]
-  for (const [name, raw, want] of cases) test(name, () => expect(ingestKeyOf(raw)).toBe(want))
+  for (const [name, raw, want] of cases) test(name, () => expect(collectorUrlOf(raw)).toBe(want))
 })
 
 describe('optionValues', () => {
@@ -59,4 +67,20 @@ describe('optionValues', () => {
     ['a value of any type, as it is', cfg({ 'mainwave@synced': ids(42) }), [42]],
   ]
   for (const [name, layer, want] of cases) test(name, () => expect(optionValues(layer, 'extraDataPoints')).toEqual(want))
+})
+
+describe('collectorIn', () => {
+  const url = (v: unknown, id = 'mainwave@synced') => ({ [id]: { options: { collectorUrl: v } } })
+  const cases: [string, Layer, string][] = [
+    ['nothing set: production', {}, PROD_COLLECTOR],
+    ['an empty value: production', cfg(url('  ')), PROD_COLLECTOR],
+    ['a null value: production', cfg(url(null)), PROD_COLLECTOR],
+    ['a collector of the right shape', cfg(url('https://collector.example.com/')), 'https://collector.example.com'],
+    ['the same collector under two ids, written two ways', cfg({ ...url('https://collector.example.com'), ...url('https://COLLECTOR.example.com/', 'mainwave') }), 'https://collector.example.com'],
+    ['two ids naming different collectors', cfg({ ...url('https://a.example.com'), ...url('https://b.example.com', 'mainwave') }), 'malformed'],
+    ['a value of the wrong shape', cfg(url('http://collector.example.com')), 'malformed'],
+    ['a value of the wrong type', cfg(url(42)), 'malformed'],
+    ['a layer that cannot be read', 'unreadable', 'unreadable'],
+  ]
+  for (const [name, layer, want] of cases) test(name, () => expect(collectorIn(layer)).toBe(want))
 })

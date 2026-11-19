@@ -4,19 +4,21 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { boot, CAPTURES_ON, IDEMPOTENCY_KEY, KEY, LOGGED_AT, memoryStore, network, ORG, type Post, type Reply } from './rig.ts'
+import { boot, CAPTURES_ON, EMAIL, IDEMPOTENCY_KEY, LOGGED_AT, memoryStore, network, ORG, PROD, type Post, type Reply } from './rig.ts'
 
-const withKey = { options: { devIngestKey: KEY } }
-const TRACES_URL = 'https://collector.dev.mainwave.com/v1/traces'
-const METRICS_URL = 'https://collector.dev.mainwave.com/v1/metrics'
+const TRACES_URL = `${PROD}/v1/traces`
+const METRICS_URL = `${PROD}/v1/metrics`
 const TRACE = '7d2fa3029813d71c9ad4ef05815fa7d5'
 const INTERACTION = 'e4a76fb0fca33a96'
 const BLOCKED = '1111111111111111'
 const START = 1_800_000_000_000
 const COMMON = { 'organization.id': ORG, 'user.id': 'device-1', 'session.id': 's-1', 'anthropic.provider': 'firstParty' }
+/** Who the rows name: the email keyless ingest routes by, unless the test's world says the session names none. */
+let who: Record<string, unknown> = { 'user.email': EMAIL }
 const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
 
-function world(on: On, opts: { reply?: (n: number, post: Post) => Reply; store?: Record<string, unknown> } = {}) {
+function world(on: On, opts: { reply?: (n: number, post: Post) => Reply; store?: Record<string, unknown>; noEmail?: true } = {}) {
+  who = opts.noEmail ? {} : { 'user.email': EMAIL }
   const clock = mock.clock(on, { now: START })
   // The organization's settings turn on what the org-wide setup captures.
   const store = memoryStore(on, { dataPoints: CAPTURES_ON, ...opts.store })
@@ -45,7 +47,7 @@ function world(on: On, opts: { reply?: (n: number, post: Post) => Reply; store?:
 async function row($: Engine, event: string, attributes: Record<string, unknown>, spanId?: string, loggedAt = LOGGED_AT) {
   await $.telemetry.log({
     to: 'collector', event, loggedAt, ...(spanId ? { span: { traceId: TRACE, spanId, traceFlags: 1 } } : {}),
-    attributes: { ...COMMON, 'event.name': event, 'event.sequence': 1, ...attributes },
+    attributes: { ...COMMON, ...who, 'event.name': event, 'event.sequence': 1, ...attributes },
   } as never)
 }
 
@@ -88,8 +90,8 @@ function spans(posts: readonly Post[]) {
   return out
 }
 
-describe('with a key', () => {
-  test('a turn becomes its interaction, request, tool call, decision and run, each on the traces path with route plugin', withKey, async ($, on) => {
+describe('keyless', () => {
+  test('a turn becomes its interaction, request, tool call, decision and run, each on the traces path with route plugin', async ($, on) => {
     const { clock, posts } = world(on)
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
     await turn($)
@@ -114,7 +116,7 @@ describe('with a key', () => {
     expect(by('tool.execution').parentSpanId).toBe(by('tool').spanId)
   })
 
-  test('the hooks only watch: the stream, the step result and the tool result come back as they were', withKey, async ($, on) => {
+  test('the hooks only watch: the stream, the step result and the tool result come back as they were', async ($, on) => {
     world(on)
     const { chunks, step, tool } = await turn($)
     expect(chunks).toEqual([{ kind: 'stop', stopReason: 'tool_use', usage: { ...USAGE, model: 'claude-haiku-5-5' } }])
@@ -122,7 +124,7 @@ describe('with a key', () => {
     expect((tool as { result: { stdout: string } }).result.stdout).toBe('hi')
   })
 
-  test('the session end sends the metrics: delta sums of doubles, with route plugin', withKey, async ($, on) => {
+  test('the session end sends the metrics: delta sums of doubles, with route plugin', async ($, on) => {
     const { posts } = world(on)
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
     await turn($)
@@ -144,7 +146,7 @@ describe('with a key', () => {
     expect(posts.map(p => p.url.split('/').at(-1)).sort()).toEqual(['logs', 'metrics', 'traces'])
   })
 
-  test('a /clear sends what has ended but keeps the metrics counting, as the process goes on', withKey, async ($, on) => {
+  test('a /clear sends what has ended but keeps the metrics counting, as the process goes on', async ($, on) => {
     const { posts } = world(on)
     await turn($)
     await $.session.end({ reason: 'clear', sessionId: 's-1', resume: { id: 's-1' } } as never)
@@ -154,7 +156,7 @@ describe('with a key', () => {
 })
 
 describe('a model stream closed early', () => {
-  test("moves no later request's start", withKey, async ($, on) => {
+  test("moves no later request's start", async ($, on) => {
     const { clock, posts } = world(on)
     await $.turn.start({ turnId: 't1', text: 'go' } as never)
     await row($, 'user_prompt', { prompt: 'go', prompt_length: '2' }, INTERACTION)
@@ -179,7 +181,7 @@ describe('a model stream closed early', () => {
 })
 
 describe('a slash command', () => {
-  test('that asks no model goes on untouched, and is sent as an interaction with its prompt row\'s ids', withKey, async ($, on) => {
+  test('that asks no model goes on untouched, and is sent as an interaction with its prompt row\'s ids', async ($, on) => {
     const { clock, posts } = world(on)
     const result = await $.command.run({ command: 'usage', args: '' } as never)
     expect(result).toEqual({ text: 'Total cost: $0.00' })
@@ -192,7 +194,7 @@ describe('a slash command', () => {
 })
 
 describe('a slash command that fails', () => {
-  test('fails as it would without the plugin, and is not taken by the next turn', withKey, async ($, on) => {
+  test('fails as it would without the plugin, and is not taken by the next turn', async ($, on) => {
     const { clock, posts } = world(on)
     await expect($.command.run({ command: 'broken', args: '' } as never)).rejects.toThrow()
     await row($, 'user_prompt', { prompt: '/broken', prompt_length: '7' }, 'f00df00df00df00d')
@@ -203,9 +205,9 @@ describe('a slash command that fails', () => {
   })
 })
 
-describe('without a key, from a session whose rows name no email', () => {
+describe('from a session whose rows name no email', () => {
   test('nothing is sent or kept, and every event goes on as it was', async ($, on) => {
-    const { clock, posts, rig, store } = world(on)
+    const { clock, posts, rig, store } = world(on, { noEmail: true })
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
     const { step, tool } = await turn($)
     await clock.advance(70_000)
@@ -219,11 +221,11 @@ describe('without a key, from a session whose rows name no email', () => {
 })
 
 describe('each signal on its own path', () => {
-  const LOGS_URL = 'https://collector.dev.mainwave.com/v1/logs'
+  const LOGS_URL = `${PROD}/v1/logs`
   const count = (posts: readonly Post[], url: string) => posts.filter(p => p.url === url).length
 
   for (const [name, status] of [['has no traces path (404)', 404], ['is busy on its traces path (503)', 503]] as const) {
-    test(`a collector that ${name} holds back neither the log rows nor the metrics`, withKey, async ($, on) => {
+    test(`a collector that ${name} holds back neither the log rows nor the metrics`, async ($, on) => {
       const { clock, posts } = world(on, { reply: (_n, p) => (p.url === TRACES_URL ? { status } : { status: 200 }) })
       await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
       await turn($)
@@ -241,7 +243,7 @@ describe('each signal on its own path', () => {
     })
   }
 
-  test('a metric batch whose request may have landed (it timed out) is sent again, the same points under the same key', withKey, async ($, on) => {
+  test('a metric batch whose request may have landed (it timed out) is sent again, the same points under the same key', async ($, on) => {
     const { clock, posts } = world(on, { reply: (_n, p) => (p.url === METRICS_URL && posts.filter(x => x.url === METRICS_URL).length === 1 ? 'hang' : { status: 200 }) })
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
     await turn($)
@@ -255,7 +257,7 @@ describe('each signal on its own path', () => {
     expect(metrics[0]!.headers['idempotency-key']).toMatch(IDEMPOTENCY_KEY)
   })
 
-  test('a metric batch cut off by the session end is kept with its key, and sent again under that key', withKey, async ($, on) => {
+  test('a metric batch cut off by the session end is kept with its key, and sent again under that key', async ($, on) => {
     const { clock, posts, store } = world(on, { reply: (_n, p) => (p.url === METRICS_URL && posts.filter(x => x.url === METRICS_URL).length === 1 ? 'hang' : { status: 200 }) })
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
     await turn($)
@@ -273,7 +275,7 @@ describe('each signal on its own path', () => {
     expect(metrics[1]!.headers['idempotency-key']).toBe(sentKey)
   })
 
-  test('a metric batch whose request the session end cut off (stopped, not timed out) is put back and sent again under its key', withKey, async ($, on) => {
+  test('a metric batch whose request the session end cut off (stopped, not timed out) is put back and sent again under its key', async ($, on) => {
     const { clock, posts } = world(on, { reply: (_n, p) => (p.url === METRICS_URL && posts.filter(x => x.url === METRICS_URL).length === 1 ? 'hang' : { status: 200 }) })
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
     await turn($)
@@ -288,10 +290,11 @@ describe('each signal on its own path', () => {
     expect(metrics[1]!.headers['idempotency-key']).toBe(metrics[0]!.headers['idempotency-key'])
   })
 
-  test('a stored record that cannot be written as a request is dropped, and the rest go on', withKey, async ($, on) => {
+  test('a stored record that cannot be written as a request is dropped, and the rest go on', async ($, on) => {
     const resources = [JSON.stringify({ 'service.name': 'claude-code' })]
-    const bad = { traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), name: 'claude_code.tool', startMs: 1, endMs: 2, attributes: {}, events: [null] }
-    const box = { v: 2, updatedAt: START - 120_000, resources, items: [{ s: 'traces', r: 0, d: bad }, { s: 'logs', r: 0, d: { event: 'api_request', loggedAt: LOGGED_AT, attributes: { 'event.sequence': 1 } } }] }
+    const named = { 'organization.id': ORG, 'user.email': EMAIL }
+    const bad = { traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), name: 'claude_code.tool', startMs: 1, endMs: 2, attributes: named, events: [null] }
+    const box = { v: 2, updatedAt: START - 120_000, resources, items: [{ s: 'traces', r: 0, d: bad }, { s: 'logs', r: 0, d: { event: 'api_request', loggedAt: LOGGED_AT, attributes: { ...named, 'event.sequence': 1 } } }] }
     const { clock, posts } = world(on, { store: { 'outbox:gone': box } })
     await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
     await clock.advance(5_000)

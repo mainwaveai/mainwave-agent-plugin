@@ -6,7 +6,7 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
 import { nextWait, REFRESH_MS, RETRY_MS, settingsOf, settingsUrlOf } from '../hooks/orgsettings.ts'
-import { boot, EMAIL, keyOption, keylessAnswer, LOGGED_AT, memoryStore, network, optInOption, ORG, packsOption, SETTINGS_URL, type Layers, type Post, type Reply } from './rig.ts'
+import { boot, collectorOption, EMAIL, keylessAnswer, LOGGED_AT, memoryStore, network, optInOption, ORG, packsOption, SETTINGS_URL, type Layers, type Post, type Reply } from './rig.ts'
 
 const keyless = { options: {} }
 const START = 1_800_000_000_000
@@ -94,12 +94,42 @@ describe('asking Mainwave', () => {
     expect(logs.join('')).not.toContain(EMAIL)
   })
 
-  test('no more once a repository stops the copy', keyless, async ($, on) => {
-    const { clock, posts } = world(on, { settings: () => answer({}), layers: { project: keyOption('mw_dev_example_key_0001') } })
+  test('nothing asked where a repository names the collector option, as the copy goes nowhere', keyless, async ($, on) => {
+    const { clock, posts } = world(on, { settings: () => answer({}), layers: { project: collectorOption('https://collector.example.com') } })
     await row($, 'api_request', { cost_usd: 0.1 })
     await clock.advance(TICK)
     await clock.advance(2 * REFRESH_MS)
-    expect(posts.settings.length).toBeLessThanOrEqual(1)
+    expect(posts.settings).toEqual([])
+  })
+
+  test("the person's collectorUrl names where to ask: Mainwave's dev API beside its dev collector, read before the first request", keyless, async ($, on) => {
+    const { clock, posts } = world(on, { layers: { user: collectorOption('https://collector.dev.mainwave.com') } })
+    await row($, 'api_request', { cost_usd: 0.1 })
+    await clock.advance(1)
+    expect(posts.settings).toEqual([])
+    const asked = posts.filter(p => p.url.endsWith('/api/plugin/data-collection-settings'))
+    expect(asked.map(p => p.url)).toEqual(['https://api.dev.mainwave.com/api/plugin/data-collection-settings'])
+    expect(JSON.parse(asked[0]!.body)).toEqual({ claude_org_id: ORG, email: EMAIL })
+  })
+
+  test("user settings that can't be read ask nothing (they may name another Mainwave), and the plugin asks once they can be", keyless, async ($, on) => {
+    const layers: Layers = { user: 'reject' }
+    const { clock, posts } = world(on, { settings: () => answer({}), layers })
+    await row($, 'api_request', { cost_usd: 0.1 })
+    await clock.advance(RETRY_MS + TICK)
+    expect(posts.settings).toEqual([])
+    expect(posts.filter(p => p.url.includes('/api/plugin/'))).toEqual([])
+    layers.user = {}
+    await clock.advance(RETRY_MS + TICK)
+    expect(posts.settings.length).toBe(1)
+  })
+
+  test("a malformed collectorUrl asks nothing, as it sends nothing", keyless, async ($, on) => {
+    const { clock, posts } = world(on, { settings: () => answer({}), layers: { user: collectorOption('http://collector.example.com') } })
+    await row($, 'api_request', { cost_usd: 0.1 })
+    await clock.advance(2 * REFRESH_MS)
+    expect(posts.settings).toEqual([])
+    expect(posts).toEqual([])
   })
 
   test('a session whose rows name no email asks nothing', keyless, async ($, on) => {

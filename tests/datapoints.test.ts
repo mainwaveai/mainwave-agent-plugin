@@ -460,8 +460,16 @@ describe("the person's opt-in, in their own user settings", () => {
     })
   }
 
-  test("user settings that can't be read opt in to nothing, and hold content back, as the packs they may add are unknown; the records go", keyless, async ($, on) => {
-    const posts = await session($, on, { overrides: CAPTURES_ON, layers: { user: 'reject' } })
+  test("user settings that can't be read hold the copy back (they may name another collector), and content captured meanwhile is held back, as the packs they may add are unknown", keyless, async ($, on) => {
+    const layers: Layers = { user: 'reject' }
+    const { clock, posts } = world(on, {}, CAPTURES_ON, undefined, layers)
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    await turn($)
+    await clock.advance(15_000)
+    expect(posts).toEqual([])
+    layers.user = {}
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    await clock.advance(15_000)
     const prompt = rowsOf(posts).find(r => r['event.name'] === 'user_prompt')!
     expect(prompt['prompt']).toBeUndefined()
     expect(prompt['prompt_length']).toBe('7')
