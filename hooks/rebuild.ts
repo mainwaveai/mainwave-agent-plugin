@@ -217,6 +217,22 @@ const respan = (r: Rebuild, spanId: string): string => r.spanAlias.get(spanId) ?
 const openCtx = (r: Rebuild): Ctx | undefined => r.interaction?.ctx ?? r.command?.ctx
 
 /**
+ * The span work runs in now, as the plugin's spans name it, for a marker to point at (markers.ts): on the main loop the open
+ * interaction; in a subagent the run of the Agent call that started it. Undefined where none is known.
+ */
+export function callerCtx(r: Rebuild, agentId: string | undefined): Ctx | undefined {
+  if (agentId !== undefined) {
+    const agent = r.agentCtx.get(agentId)
+    if (agent) return agent
+    const exec = r.execOfAgent.get(agentId)
+    const open = openCtx(r)
+    return exec !== undefined && open !== undefined ? { traceId: retrace(r, open.traceId), spanId: exec } : undefined
+  }
+  const open = openCtx(r)
+  return open === undefined ? undefined : { traceId: retrace(r, open.traceId), spanId: respan(r, open.spanId) }
+}
+
+/**
  * Where a loop no Agent call is known to have started sits: under the interaction open when it was first seen, or, with none open, a
  * trace of its own. Settled once per loop.
  */

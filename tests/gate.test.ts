@@ -3,7 +3,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { CATALOG, DEFAULTS, ownerOf } from '../hooks/catalog.ts'
-import { allows, combinePacks, gateAttributes, gateEvent, gatePoint, gateRow, gateSpan, optInOf, packsOf, resolveGate, resolveRedaction } from '../hooks/gate.ts'
+import { allows, combinePacks, gateAttributes, gateEvent, gateMarker, gatePoint, gateRow, gateSpan, optInOf, packsOf, resolveGate, resolveRedaction } from '../hooks/gate.ts'
 import type { BuiltSpan } from '../hooks/otlp.ts'
 import { contentLimit, CONTENT_MAX_LENGTH, cut, redact } from '../hooks/protect.ts'
 import { CAPTURES_ON } from './rig.ts'
@@ -11,19 +11,20 @@ import { CAPTURES_ON } from './rig.ts'
 const SWITCHED_OFF = { OTEL_LOG_TOOL_DETAILS: '0', OTEL_LOG_TOOL_CONTENT: '0', OTEL_LOG_USER_PROMPTS: '0', OTEL_METRICS_INCLUDE_REPOSITORY: '0' }
 
 describe('the catalog', () => {
-  test('twenty-four data points: four required, nine metadata, four identifiers and seven content, each ID once', () => {
-    expect(CATALOG.length).toBe(24)
-    expect(new Set(CATALOG.map(d => d.id)).size).toBe(24)
+  test('twenty-seven data points: four required, ten metadata, five identifiers and eight content, each ID once', () => {
+    expect(CATALOG.length).toBe(27)
+    expect(new Set(CATALOG.map(d => d.id)).size).toBe(27)
     expect(CATALOG.filter(d => d.required).map(d => d.id)).toEqual(['session.identity', 'session.links', 'session.client', 'usage'])
     const switchable = CATALOG.filter(d => !d.required)
-    expect(switchable.filter(d => d.class === 'metadata').length).toBe(9)
-    expect(switchable.filter(d => d.class === 'identifiers').length).toBe(4)
-    expect(switchable.filter(d => d.class === 'content').length).toBe(7)
+    expect(switchable.filter(d => d.class === 'metadata').length).toBe(10)
+    expect(switchable.filter(d => d.class === 'identifiers').length).toBe(5)
+    expect(switchable.filter(d => d.class === 'content').length).toBe(8)
   })
 
-  test('MCP server addresses add detail to MCP names, and skill text to skill names', () => {
+  test('MCP server addresses add detail to MCP names, skill text to skill names, and pull request titles to the repository', () => {
     expect(CATALOG.find(d => d.id === 'mcp.url')?.needs).toBe('tool.mcp')
     expect(CATALOG.find(d => d.id === 'skill.text')?.needs).toBe('skill.name')
+    expect(CATALOG.find(d => d.id === 'change.title')?.needs).toBe('repo')
   })
 
   test('every switchable data point has a default, and only it', () => {
@@ -105,7 +106,7 @@ describe("the person's opt-in", () => {
     expect(g.optedIn).toEqual([])
     const all = resolveGate({}, {}, undefined, everything)
     for (const d of CATALOG) expect([d.id, all.settings.get(d.id)]).toEqual([d.id, d.required ? 'required' : 'on'])
-    expect(all.optedIn).toEqual(['repo', 'file.path', 'web.url', 'mcp.url', 'bash.command', 'tool.input', 'tool.result', 'skill.text', 'prompt.text', 'response.text', 'response.thinking'])
+    expect(all.optedIn).toEqual(['repo', 'file.path', 'web.url', 'work.item', 'mcp.url', 'bash.command', 'change.title', 'tool.input', 'tool.result', 'skill.text', 'prompt.text', 'response.text', 'response.thinking'])
   })
 
   test('an explicit setting wins: off stays off, claude stays claude, and an explicit on is not an opt-in', () => {
@@ -556,5 +557,38 @@ describe('redaction packs', () => {
     expect(held.attributes).toEqual({ success: false, error_class: 'ShellError' })
     expect(held.status).toEqual({ code: 2 })
     expect(held.events).toEqual([{ name: 'tool.output', timeMs: 1, attributes: { output_truncated: false } }])
+  })
+})
+
+describe('a marker through the gate', () => {
+  const commit = {
+    traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), name: 'vcs.commit.created', startMs: 0, endMs: 0,
+    attributes: { 'vcs.commit.sha': 'c'.repeat(40), 'vcs.commit.lines_added': 3, 'vcs.commit.file.paths': ['src/secret-plan.ts'], 'vcs.commit.file.lines_added': [3] as unknown as string[] },
+  }
+  const pr = {
+    traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), name: 'vcs.change.opened', startMs: 0, endMs: 0,
+    attributes: { 'vcs.repository.url.full': 'https://github.com/acme/api/pull/1', 'vcs.change.id': '1', 'vcs.change.title': 'Secret title' },
+  }
+
+  test('goes only while the data point of its key is on: not where it is as Claude Code sends it', () => {
+    expect(gateMarker(resolveGate({}), commit)).toBeNull()
+    expect(gateMarker(resolveGate({}, { repo: 'claude' }), commit)).toBeNull()
+    expect(gateMarker(resolveGate({}, { repo: 'on' }), commit)!.attributes['vcs.commit.sha']).toBe('c'.repeat(40))
+  })
+
+  test('as Claude Code sends it sends none of its values: Claude Code sends no marker', () => {
+    const g = resolveGate({}, { repo: 'on', 'file.path': 'claude', 'change.title': 'claude' })
+    const c = gateMarker(g, commit)!
+    expect(c.attributes['vcs.commit.file.paths']).toBeUndefined()
+    expect(c.attributes['vcs.commit.lines_added']).toBe(3)
+    expect(gateMarker(g, pr)!.attributes['vcs.change.title']).toBeUndefined()
+    expect(gateMarker(resolveGate({}, { repo: 'on', 'file.path': 'on' }), commit)!.attributes['vcs.commit.file.paths']).toEqual(['src/secret-plan.ts'])
+  })
+
+  test('with the redaction held, its paths are held back and the marker still goes on its key', () => {
+    const g = { ...resolveGate({}, { repo: 'on', 'file.path': 'on' }), redaction: { held: 'unreadable' as const } }
+    const c = gateMarker(g, commit)!
+    expect(c.attributes['vcs.commit.sha']).toBe('c'.repeat(40))
+    expect(c.attributes['vcs.commit.file.paths']).toBeUndefined()
   })
 })

@@ -7,13 +7,18 @@
 // The default each data point takes with no organization settings is in one table, `DEFAULTS`, below. The gate (gate.ts) reads it.
 
 import { COMMAND_COUNTS, COMMAND_REFS } from './derive.ts'
+import { CHANGE_OPENED, COMMIT_CREATED, WORK_ITEM_CREATED, WORK_ITEM_UPDATED } from './markers.ts'
+
+/** A commit's size on its marker, and a pull request's: what a command did. */
+const COMMIT_COUNTS = ['vcs.commit.parent_count', 'vcs.commit.files_changed', 'vcs.commit.lines_added', 'vcs.commit.lines_removed', 'vcs.commit.file.lines_added', 'vcs.commit.file.lines_removed', 'vcs.commit.file.is_binary']
+const CHANGE_COUNTS = ['vcs.change.files_changed', 'vcs.change.lines_added', 'vcs.change.lines_removed']
 
 /** A data point's ID: the contract the gate, Mainwave's settings and its readers share. */
 export type DataPointId =
   | 'session.identity' | 'session.links' | 'session.client' | 'usage'
-  | 'tool.call' | 'tool.mcp' | 'skill.name' | 'agent.type' | 'command.name' | 'bash.class' | 'bash.outcome' | 'file.kind' | 'web.domain'
-  | 'repo' | 'file.path' | 'web.url' | 'mcp.url'
-  | 'bash.command' | 'tool.input' | 'tool.result' | 'skill.text' | 'prompt.text' | 'response.text' | 'response.thinking'
+  | 'tool.call' | 'tool.mcp' | 'skill.name' | 'agent.type' | 'command.name' | 'bash.class' | 'bash.outcome' | 'file.kind' | 'web.domain' | 'account.plan'
+  | 'repo' | 'file.path' | 'web.url' | 'work.item' | 'mcp.url'
+  | 'bash.command' | 'change.title' | 'tool.input' | 'tool.result' | 'skill.text' | 'prompt.text' | 'response.text' | 'response.thinking'
 
 /**
  * Metadata: names, counts, times, sizes and categories that Claude Code, a plugin or Mainwave defines. Identifiers: values that name a
@@ -49,26 +54,37 @@ export type DataPoint = {
 export const CATALOG: readonly DataPoint[] = [
   { id: 'session.identity', name: 'Who sent it', class: 'identifiers', required: true, description: 'Who sent the record: Claude organization, account, email, and the ID Claude Code keeps per installation', example: 'ana@example.com' },
   { id: 'session.links', name: 'Record links', class: 'metadata', required: true, description: 'IDs that tie records together: session, prompt, request, tool call, trace and span', example: 'prompt.id 4f1c…' },
-  { id: 'session.client', name: 'Client and version', class: 'metadata', required: true, description: "What ran the session (Claude Code version, entry point, Cowork surface, terminal, plan, provider, the plugin's version), and Claude Code's own event rows", example: 'remote_cowork, 2.1.322' },
-  { id: 'usage', name: 'Usage and cost', class: 'metadata', required: true, description: 'Model, tokens, cost, request time, time to first token, effort, stop reason, query source; prompt, response, tool input and result sizes', example: 'claude-opus-5-5, 2,914 output tokens, $0.04' },
+  { id: 'session.client', name: 'Client and version', class: 'metadata', required: true, description: "What ran the session (Claude Code version, entry point, Cowork surface, terminal, plan, provider, the plugin's version), the plugin's own status and the issues it hit, and Claude Code's own event rows", example: 'remote_cowork, 2.1.322' },
+  { id: 'usage', name: 'Usage and cost', class: 'metadata', required: true, description: 'Model, tokens, cost, request time, time to first token, effort, stop reason, query source, the API error that ended a turn; prompt, response, tool input and result sizes', example: 'claude-opus-5-5, 2,914 output tokens, $0.04' },
   { id: 'tool.call', name: 'Tool calls', class: 'metadata', description: 'Each tool call: its name, duration, success and error class, and the permission decision and what made it', example: 'Edit, 412 ms, accepted by rule' },
   { id: 'tool.mcp', name: 'MCP server and tool', class: 'metadata', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The MCP server and tool of each MCP call, and where the server was set up: user, project, managed, a plugin, or a claude.ai connector', example: 'remote-devices / device_bash' },
   { id: 'skill.name', name: 'Skill', class: 'metadata', switch: 'OTEL_LOG_TOOL_DETAILS', description: "The skill used, third-party plugins' skills included", example: 'pdf' },
   { id: 'agent.type', name: 'Subagent type', class: 'metadata', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The type of each subagent started, custom ones included', example: 'Explore' },
   { id: 'command.name', name: 'Slash command', class: 'metadata', description: 'The slash command run, not its arguments', example: 'compact' },
   { id: 'bash.class', name: 'Kind of shell command', class: 'metadata', description: 'The kind and program of each shell command, in Bash or an MCP shell tool such as Cowork\'s device_bash', example: 'vcs / git' },
-  { id: 'bash.outcome', name: 'What a command did', class: 'metadata', description: 'Commits, reverts, pushes, branches opened, merges, tags, workflow runs and pull requests opened, merged or updated by shell commands that succeeded, as counts', example: '1 commit, 1 push' },
+  { id: 'bash.outcome', name: 'What a command did', class: 'metadata', description: 'Commits, reverts, pushes, branches opened, merges, tags, workflow runs and pull requests opened, merged or updated by shell commands that succeeded, as counts; and the size of each commit and pull request the plugin reports: files changed, lines added and removed, per file too, and whether a file is binary', example: '1 commit, 1 push; 3 files, 41 lines added' },
   { id: 'file.kind', name: 'File language', class: 'metadata', description: 'The language of each file edited or written, from its extension', example: 'TypeScript' },
   { id: 'web.domain', name: 'Website', class: 'metadata', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The site of each page fetched', example: 'docs.python.org' },
-  { id: 'repo', name: 'Repository and branch', class: 'identifiers', switch: 'OTEL_METRICS_INCLUDE_REPOSITORY', description: "The Git remote's address, owner and name, the branch and the commit, and the branch, ref or tag a shell command opened, pushed, merged or tagged", example: 'github.com/acme/api' },
-  { id: 'file.path', name: 'File paths', class: 'identifiers', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The path of each file read, edited or written', example: '/Users/ana/acme/api/src/login.ts' },
+  {
+    id: 'account.plan', name: 'Plan and usage limits', class: 'metadata',
+    description: 'The Claude plan, seat tier and roles, each rate limit with its usage and reset time, extra usage and trial status, as Claude reports them for the signed-in account',
+    example: 'Team, premium seat, 62% of the 5-hour limit',
+  },
+  { id: 'repo', name: 'Repository and branch', class: 'identifiers', switch: 'OTEL_METRICS_INCLUDE_REPOSITORY', description: "The Git remote's address, owner and name, the repository's ID and host, the branch and the commit and its parent, the number of a pull request or merge request, and the branch, ref or tag a shell command opened, pushed, merged or tagged. With it off, the plugin sends no commit or pull request records from sessions", example: 'github.com/acme/api' },
+  { id: 'file.path', name: 'File paths', class: 'identifiers', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The path of each file read, edited or written, and of each file a commit changed', example: '/Users/ana/acme/api/src/login.ts' },
   { id: 'web.url', name: 'Web addresses', class: 'identifiers', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The full address of each page fetched', example: 'https://docs.python.org/3/library/re.html' },
+  {
+    id: 'work.item', name: 'Tickets', class: 'identifiers',
+    description: 'The ID and address of each Linear or Jira ticket the session created or updated, and the workspace or site it belongs to. With it off, the plugin sends no ticket records from sessions',
+    example: 'ENG-42, linear.app/acme/issue/ENG-42',
+  },
   {
     id: 'mcp.url', name: 'MCP server addresses', class: 'identifiers', needs: 'tool.mcp',
     description: "The MCP servers set up for the session, called or not: each one's name, where it was set up and its address, read from Claude's MCP settings. A remote server's address keeps scheme, host, port and path; a local server's is its command. Headers and environment variables are never read",
     example: 'https://mcp.example.com/mcp',
   },
   { id: 'bash.command', name: 'Shell commands', class: 'content', switch: 'OTEL_LOG_TOOL_DETAILS', description: 'The full text of each shell command, in Bash or an MCP shell tool', example: 'git commit -m "fix login redirect"' },
+  { id: 'change.title', name: 'Pull request titles', class: 'content', needs: 'repo', description: 'The title of each pull request or merge request a session opened', example: 'Fix the login redirect on Safari' },
   { id: 'tool.input', name: 'Tool input', class: 'content', switch: 'OTEL_LOG_TOOL_DETAILS', holds: ['bash.command', 'file.path', 'web.url'], description: "Each tool call's input: what an edit writes, search patterns, MCP arguments, subagent task prompts", example: '{"pattern":"login"}' },
   { id: 'tool.result', name: 'Tool results', class: 'content', switch: 'OTEL_LOG_TOOL_CONTENT', description: 'What each tool returned: command output, file contents read, MCP results, a failed call\'s error', example: '3 files changed, 41 insertions(+)' },
   {
@@ -101,13 +117,16 @@ export const DEFAULTS: Readonly<Record<Exclude<DataPointId, 'session.identity' |
   'bash.outcome': 'on',
   'file.kind': 'on',
   'web.domain': 'on',
+  'account.plan': 'on',
   // Identifiers.
   repo: 'off',
   'file.path': 'off',
   'web.url': 'off',
   'mcp.url': 'off',
+  'work.item': 'off',
   // Content.
   'bash.command': 'off',
+  'change.title': 'off',
   'tool.input': 'off',
   'tool.result': 'off',
   'skill.text': 'off',
@@ -166,13 +185,23 @@ export const ATTRIBUTE_OWNERS: readonly Owned[] = [
   // The plugin's own rows: one per MCP server set up, one per skill run.
   ...['server_name', 'server_scope', 'transport_type', 'server_url'].map(key => ({ key, id: 'mcp.url' as const, in: [MCP_SERVER_ROW] })),
   ...['skill.text', 'skill.text_id'].map(key => ({ key, id: 'skill.text' as const, in: [SKILL_PROMPT_ROW] })),
+  // The markers (markers.ts): a commit's and a pull request's size are what a command did; a commit's files, their paths; a ticket, its
+  // own data point; a pull request's title, its own. Their names, addresses and IDs are the repository's (`vcs.`, below).
+  ...COMMIT_COUNTS.map(key => ({ key, id: 'bash.outcome' as const, in: [COMMIT_CREATED] })),
+  ...CHANGE_COUNTS.map(key => ({ key, id: 'bash.outcome' as const, in: [CHANGE_OPENED] })),
+  { key: 'vcs.commit.file.paths', id: 'file.path', in: [COMMIT_CREATED] },
+  { key: 'vcs.change.title', id: 'change.title', in: [CHANGE_OPENED] },
+  ...['work.item.id', 'work.item.op', 'work.item.url', 'work.vendor', 'work.instance'].map(key => ({ key, id: 'work.item' as const, in: [WORK_ITEM_CREATED, WORK_ITEM_UPDATED] })),
 ]
 
 /** The rows the plugin makes itself, each the data point it carries: none is sent while that data point is off. */
 export const OWN_ROWS: Readonly<Record<string, DataPointId>> = { [MCP_SERVER_ROW]: 'mcp.url', [SKILL_PROMPT_ROW]: 'skill.text' }
 
-/** Keys owned by their prefix: every key under `vcs.` is a repository's, as Claude Code names the Git remote, branch and commit. */
-export const KEY_PREFIXES: Readonly<Record<string, DataPointId>> = { 'vcs.': 'repo' }
+/**
+ * Keys owned by their prefix, where no key above names them: every other key under `vcs.` is a repository's, as Claude Code names the
+ * Git remote, branch and commit; every key under `mainwave.subscription.` is the plan snapshot's.
+ */
+export const KEY_PREFIXES: Readonly<Record<string, DataPointId>> = { 'vcs.': 'repo', 'mainwave.subscription.': 'account.plan' }
 
 /** Metrics a data point counts: none of their points is sent while it is off. */
 export const METRIC_OWNERS: Readonly<Record<string, DataPointId>> = { 'claude_code.commit.count': 'bash.outcome', 'claude_code.pull_request.count': 'bash.outcome' }
@@ -201,8 +230,8 @@ for (const o of ATTRIBUTE_OWNERS) byKey.set(o.key, [...(byKey.get(o.key) ?? []),
 
 /** The data point an attribute belongs to on a record (a row's event, a span's or a metric's name); undefined for a required one. */
 export function ownerOf(record: string, key: string): { id: DataPointId; redact?: true } | undefined {
-  for (const [prefix, id] of Object.entries(KEY_PREFIXES)) if (key.startsWith(prefix)) return { id }
   for (const o of byKey.get(key) ?? []) if (o.in === undefined || o.in.includes(record)) return o.redact ? { id: o.id, redact: true } : { id: o.id }
+  for (const [prefix, id] of Object.entries(KEY_PREFIXES)) if (key.startsWith(prefix)) return { id }
   return undefined
 }
 

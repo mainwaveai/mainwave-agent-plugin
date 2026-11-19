@@ -85,6 +85,8 @@ const atLeast = (version, floor) => {
 const STARTUP = new Set(['managed_settings_resolved', ...(atLeast(CLAUDE_VERSION, '2.1.326') ? [] : ['plugin_loaded'])])
 /** The classifiers whose model requests Claude Code logs no row for, which the README lists as a gap. */
 const CLASSIFIERS = new Set(['auto_mode', 'agent_classifier'])
+/** The plugin's markers (hooks/markers.ts): spans of its own, of which Claude Code sends none. */
+const MARKER_SPANS = new Set(['vcs.commit.created', 'vcs.change.opened', 'work.item.created', 'work.item.updated', 'mainwave.subscription.snapshot', 'mainwave.claude_code.stop_failure'])
 /** The captures Mainwave's org-wide setup sets in the env block. */
 const CAPTURES = ['OTEL_LOG_TOOL_DETAILS', 'OTEL_LOG_TOOL_CONTENT', 'OTEL_LOG_USER_PROMPTS', 'OTEL_METRICS_INCLUDE_REPOSITORY']
 /**
@@ -159,7 +161,8 @@ function modelReply(req) {
       call('Bash', { command: 'echo e2e', description: 'Print e2e' }),
       call('Write', { file_path: join(work, 'a.txt'), content: 'one\ntwo\n' }),
       call('Edit', { file_path: join(work, 'a.txt'), old_string: 'two', new_string: 'three' }),
-      call('Bash', { command: 'git -c user.name=e2e -c user.email=e2e@example.com commit -q --allow-empty -m e2e', description: 'Commit' }),
+      // Not quiet: git prints the commit's line, which the plugin's commit marker reads (markers.ts).
+      call('Bash', { command: 'git -c user.name=e2e -c user.email=e2e@example.com commit --allow-empty -m e2e', description: 'Commit' }),
       // Allowed, and fails: a run that ends in an error.
       call('Bash', { command: 'ls e2e-missing-file', description: 'Fails' }),
       // No rule allows it, and unlike a file command in the working folder, auto mode doesn't let it through without asking: its
@@ -470,7 +473,7 @@ function pointsOf(posts) {
 const problems = []
 
 /** Compares one session's two paths, adding what differs to `problems`, and prints what it found. */
-function compare(pass, details, auto, { captured, run }) {
+function compare(pass, details, auto, { captured, run, work }) {
   const before = problems.length
   /** Known differences: what the plugin cannot reproduce, by what it is, with how often it was seen. */
   const known = new Map()
@@ -538,7 +541,9 @@ function compare(pass, details, auto, { captured, run }) {
 
   // Traces.
   const exporterSpans = spansOf(captured.exporter.traces)
-  const pluginSpans = spansOf(captured.plugin.traces)
+  // The plugin's markers have no counterpart: they are checked apart, below.
+  const pluginSpans = spansOf(captured.plugin.traces).filter(s => !MARKER_SPANS.has(s.name))
+  const markerSpans = spansOf(captured.plugin.traces).filter(s => MARKER_SPANS.has(s.name))
   /** What identifies a span across the two paths: the span id where the rows name it, else what the span is about. */
   function spanKey(s) {
     const a = s.attrs
@@ -598,6 +603,26 @@ function compare(pass, details, auto, { captured, run }) {
   const prompts = exporterSpans.filter(s => s.name === 'claude_code.interaction').map(s => s.attrs.user_prompt?.v)
   if (details && !commands.some(s => s.attrs.full_command)) problems.push('with tool details logged, no exporter Bash span carries its command')
   if (!details && commands.some(s => s.attrs.full_command)) problems.push('with tool details not logged, an exporter Bash span carries its command')
+  // The markers. The session made one commit and nothing else a marker is about (its account is an API key's: no plan). With the
+  // repository on (captures on), that commit goes as one marker, named as the repository's HEAD names it, under hook.git, naming the
+  // call that made it; with the repository as Claude Code sends it (it sends none on a marker), none goes.
+  const head = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: work, env: { PATH: process.env.PATH, HOME: work, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_SYSTEM: '/dev/null' } }).toString().trim()
+  const commitMarkers = markerSpans.filter(s => s.name === 'vcs.commit.created')
+  const otherMarkers = markerSpans.filter(s => s.name !== 'vcs.commit.created')
+  if (otherMarkers.length > 0) problems.push(`markers for work the session did not do: ${otherMarkers.map(s => s.name).join(', ')}`)
+  if (details) {
+    const commitCall = exporterSpans.find(s => s.name === 'claude_code.tool' && /\bcommit\b/.test(String(s.attrs.full_command?.v ?? '')))?.attrs.tool_use_id?.v
+    if (commitMarkers.length !== 1) problems.push(`with the repository on, ${commitMarkers.length} commit markers for the session's one commit`)
+    for (const c of commitMarkers) {
+      if (c.attrs['vcs.commit.sha']?.v !== head) problems.push(`the commit marker names ${c.attrs['vcs.commit.sha']?.v}, not the repository's HEAD`)
+      if (c.attrs['vcs.commit.parent_count']?.v !== 1) problems.push('the commit marker does not count its one parent')
+      if (c.resource['mainwave.source']?.v !== 'hook.git' || c.resource['service.name']?.v !== 'mainwave.git-hook') problems.push("the commit marker's resource is not hook.git's")
+      if (c.attrs['gen_ai.tool.call.id']?.v !== commitCall) problems.push('the commit marker does not name the call that made it')
+      if (c.attrs[ROUTE]?.v !== 'plugin') problems.push('the commit marker has no plugin route')
+      if (exporterSpans.some(s => s.traceId === c.traceId)) problems.push("the commit marker shares a trace with the session's spans")
+    }
+    noteKnown("traces: the plugin's commit marker (vcs.commit.created), which Claude Code sends none of", commitMarkers.length)
+  } else if (commitMarkers.length > 0) problems.push('with the repository as Claude Code sends it, a commit marker went')
   if (!details && prompts.some(p => p !== '<REDACTED>')) problems.push('with prompts not logged, an exporter interaction carries its prompt')
   // The failed run is in the session: the exporter's span says so.
   if (!exporterSpans.some(s => s.name === 'claude_code.tool.execution' && s.attrs.success?.v === false)) problems.push('no failed tool run in the session')
@@ -785,6 +810,8 @@ function checkKeyless(pass, { captured, run, config }, reference) {
   if (!rows.some(r => r.attributes['event.name']?.v === 'api_request')) problems.push('no api_request row was sent')
 
   const spans = spansOf(captured.plugin.traces)
+  // With no settings the repository is off, so no commit marker goes; and the session's account is an API key's, so no plan.
+  for (const s of spans) if (MARKER_SPANS.has(s.name)) problems.push(`with no settings, a ${s.name} marker went`)
   // Each row carries the ids of the span it ran in, as the exporter's rows do: by event, the kinds of span its rows name are the
   // ones the exporter's rows named in the same session with the env block, and a row's trace is that span's.
   const pointed = (list, spanList) => {
