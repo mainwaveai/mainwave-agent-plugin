@@ -94,6 +94,10 @@ const CAPTURES = ['OTEL_LOG_TOOL_DETAILS', 'OTEL_LOG_TOOL_CONTENT', 'OTEL_LOG_US
  * with explicit settings that turn them on, as an organization's settings would, so the copy carries what the exporter does.
  */
 const CAPTURED_DATA_POINTS = ['repo', 'file.path', 'web.url', 'bash.command', 'tool.input', 'tool.result', 'prompt.text', 'response.text']
+/** The content the rowless pass turns on, as an organization's settings would: the prompt, the response, and the tool input with what it holds. */
+const ROWLESS_CONTENT = ['prompt.text', 'response.text', 'tool.input', 'bash.command', 'file.path', 'web.url']
+/** The keys that content goes under: compared apart, as the reference pass sends it as Claude Code does, with its switches at 0. */
+const CONTENT_KEYS = new Set(['prompt', 'prompt_text', 'response', 'tool_input', 'tool_parameters', 'full_command', 'bash_command', 'file_path', 'user_prompt', 'url.full', 'url.domain'])
 /**
  * Where Claude Code keeps a plugin's store in a config folder: `plugins/store/<name>_<marketplace>-<first 12 hex of the plugin id's
  * SHA-256>.json`, one JSON object of its keys. The plugin, loaded from a folder, is `mainwave@inline`.
@@ -334,7 +338,9 @@ async function session(details, envBlock, auto, rowless = false) {
   // Code sends them with each set to 0, where the exporter is the reference for what a switch at 0 leaves.
   if (envBlock) {
     mkdirSync(dirname(storeFile(config)), { recursive: true })
-    writeFileSync(storeFile(config), JSON.stringify({ dataPoints: Object.fromEntries(CAPTURED_DATA_POINTS.map(id => [id, details ? 'on' : 'claude'])) }))
+    // In the rowless pass, the content Cowork's export never carries, on: the prompt, the response, the tool input and what it holds.
+    const content = rowless ? Object.fromEntries(ROWLESS_CONTENT.map(id => [id, 'on'])) : {}
+    writeFileSync(storeFile(config), JSON.stringify({ dataPoints: { ...Object.fromEntries(CAPTURED_DATA_POINTS.map(id => [id, details ? 'on' : 'claude'])), ...content } }))
   }
 
   const env = {
@@ -996,7 +1002,7 @@ const stepSource = qs => typeof qs === 'string' && (qs.startsWith('repl_main_thr
 /** The plugin's own rows, which no row of Claude Code's is a copy of. */
 const OWN_ROWS = new Set([STATUS, 'mcp_server_configured', 'skill_prompt'])
 /** The rows the plugin builds from Claude Code's events where none reaches it (hooks/rowless.ts). */
-const BUILT_ROWS = ['user_prompt', 'api_request', 'tool_decision', 'tool_result']
+const BUILT_ROWS = ['user_prompt', 'api_request', 'assistant_response', 'tool_decision', 'tool_result']
 
 /**
  * The rowless pass: skip.ts keeps every row of Claude Code's from the plugin, as the security default does (and from the exporter
@@ -1049,6 +1055,24 @@ function checkRowless(pass, { captured, run }, reference) {
   for (const id of ranWant) if (!ranGot.has(id)) problems.push(`logs: no tool_result built for ${id}, which ran`)
   for (const id of ranGot) if (!ranWant.has(id)) problems.push(`logs: a tool_result built for ${id}, which the exporter has none of`)
   console.log(`  rows built: ${BUILT_ROWS.map(n => `${n} ${ofEvent(rows, n).length}`).join(', ')}; cost ${cost.toFixed(6)} (exporter ${costWant.toFixed(6)})`)
+  // The content the settings turn on goes on the built rows, from the plugin's own hooks: each prompt's text, each response's text
+  // (its length the row's), and each call's input. As many responses as Claude Code logs.
+  const responses = ofEvent(rows, 'assistant_response')
+  if (responses.length !== ofEvent(theirs, 'assistant_response').length) problems.push(`logs: ${responses.length} assistant_response rows built, where the exporter sent ${ofEvent(theirs, 'assistant_response').length}`)
+  // The first turn's prompt is the script's; a later turn's may be one Claude Code began itself (a background agent's notification).
+  const prompts = ofEvent(rows, 'user_prompt')
+  if (prompts[0]?.attributes.prompt?.v !== 'E2E_MAINTASK: run the steps, then say ok.') problems.push(`content: the first built prompt row carries ${JSON.stringify(prompts[0]?.attributes.prompt?.v)}, not the prompt`)
+  for (const r of prompts) {
+    const text = r.attributes.prompt?.v
+    if (typeof text !== 'string' || text === '<REDACTED>' || String(text.length) !== String(r.attributes.prompt_length?.v)) problems.push(`content: a built prompt row carries ${JSON.stringify(text)} for a prompt of ${r.attributes.prompt_length?.v} characters`)
+  }
+  for (const r of responses) {
+    const text = r.attributes.response?.v
+    if (typeof text !== 'string' || text === '<REDACTED>' || text.length !== Number(r.attributes.response_length?.v)) problems.push(`content: a built response row carries ${JSON.stringify(text)} for a response of ${r.attributes.response_length?.v} characters`)
+  }
+  for (const r of ofEvent(rows, 'tool_result')) if (typeof r.attributes.tool_input?.v !== 'string') problems.push(`content: the built tool_result row of ${r.attributes.tool_name?.v} carries no tool input`)
+  if (!ofEvent(rows, 'tool_result').some(r => String(r.attributes.tool_input?.v).includes('echo e2e'))) problems.push('content: no built tool_result row carries the Bash call\'s command')
+  console.log(`  content built: ${ofEvent(rows, 'user_prompt').length} prompts, ${responses.length} responses, ${ofEvent(rows, 'tool_result').filter(r => r.attributes.tool_input !== undefined).length} tool inputs`)
 
   const spans = spansOf(captured.plugin.traces)
   for (const p of traceShape(spans)) problems.push(p)
@@ -1081,9 +1105,10 @@ function checkRowless(pass, { captured, run }, reference) {
  * list of what the managed keys add stays true; the known ones are printed.
  */
 const KEYS_ADD = {
-  rows: ['assistant_response', 'subagent_completed', 'retention_sweep', 'plugin_loaded'],
+  rows: ['subagent_completed', 'retention_sweep', 'plugin_loaded'],
   attributes: {
     user_prompt: ['message.uuid'],
+    assistant_response: ['request_id', 'message.uuid'],
     api_request: ['request_id', 'speed'],
     tool_decision: ['permission_mode', 'request_id'],
     tool_result: ['error_type', 'request_id'],
@@ -1112,7 +1137,7 @@ function keysAdd(withRows, built) {
     const keysB = new Set(b.flatMap(r => Object.keys(r.attributes)))
     const known = KEYS_ADD.attributes[name] ?? []
     for (const k of keysA) if (!keysB.has(k)) (known.includes(k) ? found.push(`${name}.${k}`) : problems.push(`keys add: ${name} rows lack ${k}, which the known differences do not list`))
-    for (const k of keysB) if (!keysA.has(k) && k !== 'mainwave.telemetry.built_from') problems.push(`keys add: built ${name} rows carry ${k}, which Claude Code's do not`)
+    for (const k of keysB) if (!keysA.has(k) && k !== 'mainwave.telemetry.built_from' && !CONTENT_KEYS.has(k)) problems.push(`keys add: built ${name} rows carry ${k}, which Claude Code's do not`)
     const index = list => new Map(list.map((r, i) => [pairKey(name, r) ?? String(i), r]))
     const [ia, ib] = [index(a), index(b)]
     for (const [key, ra] of ia) {
@@ -1122,7 +1147,7 @@ function keysAdd(withRows, built) {
         continue
       }
       for (const [k, v] of Object.entries(ra.attributes)) {
-        if (PER_SESSION.has(k) || k.startsWith('mainwave.') || rb.attributes[k] === undefined) continue
+        if (PER_SESSION.has(k) || CONTENT_KEYS.has(k) || k.startsWith('mainwave.') || rb.attributes[k] === undefined) continue
         if (!same(v, rb.attributes[k])) problems.push(`keys add: a built ${name} row's ${k} is ${JSON.stringify(rb.attributes[k].v)}, Claude Code's ${JSON.stringify(v.v)}`)
       }
     }

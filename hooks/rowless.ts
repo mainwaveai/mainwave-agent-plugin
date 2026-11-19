@@ -13,6 +13,8 @@
 //
 //   user_prompt     a main-loop turn began: its prompt's length (the text itself is the gate's to add, as for Claude Code's row)
 //   api_request     a model request answered: its model, tokens, effort, duration, time to first token and cost
+//   assistant_response  a model request answered with text: its length (the text itself is the gate's to add, as for Claude
+//                   Code's row), after its request row
 //   tool_decision   a tool call settled: refused (its permission check refused it, or asked and the call then ended in an error) or
 //                   accepted, at the time the call began
 //   tool_result     a tool call that was not refused ended: its outcome and duration
@@ -218,7 +220,7 @@ export function requestRow(state: Rowless, head: Attrs, f: RequestFacts): RowIn 
   const effort = typeof f.effort === 'string' ? f.effort : undefined
   // Claude Code writes both lifetimes, 0 where no write named one.
   const noLifetime = u.ephemeral_5m_input_tokens === undefined && u.ephemeral_1h_input_tokens === undefined ? 0 : undefined
-  const source = f.agentId === undefined ? (f.sdk ? 'sdk' : 'repl_main_thread') : f.agent === undefined ? 'agent:custom' : `agent:${f.agent.builtIn ? 'builtin' : 'custom'}:${f.agent.type}`
+  const source = querySourceOf(f.agentId, f.agent, f.sdk)
   return row(state, head, 'api_request', f.endMs, [
     ['model', u.model ?? f.model],
     ['input_tokens', whole(u.input_tokens) ?? 0],
@@ -237,6 +239,26 @@ export function requestRow(state: Rowless, head: Attrs, f: RequestFacts): RowIn 
     ['agent_id', f.agentId],
     ['agent.name', f.agent?.type],
   ])
+}
+
+/**
+ * A model request that answered with text: its `assistant_response` row, after its request row, as Claude Code logs one. The length
+ * is the text's as the stream gave it; the text, redacted here, is the gate's to add where `response.text` is on.
+ */
+export function responseRow(state: Rowless, head: Attrs, r: { length: number; model: string; agentId?: string; agent?: { type: string; builtIn: boolean }; sdk: boolean; atMs: number }): RowIn {
+  return row(state, head, 'assistant_response', r.atMs, [
+    ['response_length', r.length],
+    ['response', '<REDACTED>'],
+    ['model', r.model],
+    ['query_source', querySourceOf(r.agentId, r.agent, r.sdk)],
+    ['agent_id', r.agentId],
+  ])
+}
+
+/** A request's `query_source` as Claude Code names it: the main loop's by how the session runs, a subagent's by its type. */
+function querySourceOf(agentId: string | undefined, agent: { type: string; builtIn: boolean } | undefined, sdk: boolean): string {
+  if (agentId === undefined) return sdk ? 'sdk' : 'repl_main_thread'
+  return agent === undefined ? 'agent:custom' : `agent:${agent.builtIn ? 'builtin' : 'custom'}:${agent.type}`
 }
 
 /**

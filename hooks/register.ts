@@ -29,7 +29,7 @@ import { atom, read, update } from 'claude-code'
 import type { CatchHandler, EngineInterface, Frozen, Hook, Next, Register, StreamHook, TelemetryAttribute, TelemetryLogResult, TelemetryRecordEntry, Timer, TurnStepResult } from 'claude-code'
 
 import type { RowIdentity } from '../types'
-import { capturePrompt, captureTool, newCapture, rowFill, streamChunk, streamedThinking, streamStart, type Capture } from './capture.ts'
+import { capturePrompt, captureTool, dropStreamedText, newCapture, rowFill, streamChunk, streamedText, streamedThinking, streamStart, type Capture } from './capture.ts'
 import { MCP_SERVER_ROW, PLUGIN_STATUS_ROW, SKILL_PROMPT_ROW, type Switch } from './catalog.ts'
 import { mcpParts } from './derive.ts'
 import { allows, configureGate, currentGate, gateAttributes, gateMarker, gateRow, gateSpan, metricAllowed, resetPacks, setOptIn, setOverrides } from './gate.ts'
@@ -46,7 +46,7 @@ import { parseResourceAttributes, type BuiltSpan, type CopiedRow } from './otlp.
 import {
   agentSpawned, callerCtx, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild, type RowIn,
 } from './rebuild.ts'
-import { accountDeviceOf, costOf, decisionRow, hostIdentityOf, isRefusal, newRowless, promptRow, providerOf, requestRow, resultRow, rowHead, seedCost, sessionIdentityOf, uuidOf, type HostFacts, type HostIdentityEnv, type Rowless, type Verdict } from './rowless.ts'
+import { accountDeviceOf, costOf, decisionRow, hostIdentityOf, isRefusal, newRowless, promptRow, providerOf, requestRow, responseRow, resultRow, rowHead, seedCost, sessionIdentityOf, uuidOf, type HostFacts, type HostIdentityEnv, type Rowless, type Verdict } from './rowless.ts'
 import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsSummary, settingsUnavailable } from './orgsettings.ts'
 import { contentLimit } from './protect.ts'
 import { adopt, collectorMalformed, collectorOf, configure, enqueue, ensureTimer, finish, isCopying, readOptions, snapshot } from './sender.ts'
@@ -1494,6 +1494,15 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
           model: e.model, usage: result.usage, ...(e.effort !== undefined ? { effort: e.effort } : {}), ...(e.agentId !== undefined ? { agentId: e.agentId } : {}), ...(agent ? { agent } : {}),
           startMs, endMs, ...(firstChunkMs !== undefined ? { firstChunkMs } : {}), ...(costUsd !== undefined ? { costUsd } : {}), sdk: ep.startsWith('sdk'),
         }))
+        // Its response row, where it answered with text: the gate adds the text where `response.text` is on. The stream's text is let
+        // go after, so a row of Claude Code's that comes later fills nothing twice.
+        const text = streamedText(capture, e.agentId)
+        if (text !== undefined) {
+          await feedRow($, responseRow(rowlessState, head, {
+            length: text.length, model: result.usage.model ?? e.model, ...(e.agentId !== undefined ? { agentId: e.agentId } : {}), ...(agent ? { agent } : {}), sdk: ep.startsWith('sdk'), atMs: endMs,
+          }))
+          dropStreamedText(capture, e.agentId)
+        }
       }
     } catch {
       // The request's span goes without its stop reason.

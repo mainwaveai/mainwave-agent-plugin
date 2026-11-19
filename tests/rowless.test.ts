@@ -19,11 +19,11 @@ const HOST_EMAIL = 'host@example.com'
 const BUILT = 'mainwave.telemetry.built_from'
 const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 300, cache_creation_input_tokens: 40, ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 40 }
 
-type World = { env?: Record<string, string>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number }
+type World = { env?: Record<string, string>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown> }
 
 function world(on: On, opts: World = {}) {
   const clock = mock.clock(on, { now: START })
-  memoryStore(on)
+  memoryStore(on, opts.store)
   // A reload: the process has seen a row of Claude Code's before.
   if (opts.rowsSeen) on('state.get', (_$, e, next) => ((e as unknown as { key?: string }).key === 'rowsSeen' ? ({ value: true } as never) : next(e)))
   const posts = network(on, (_n, post) => {
@@ -113,14 +113,14 @@ function points(posts: readonly Post[]) {
 }
 
 describe('the rows built from events', () => {
-  test('no row comes by the first turn: each turn sends a prompt, request, decision and result row, under the account file\'s identity', keyless, async ($, on) => {
+  test('no row comes by the first turn: each turn sends a prompt, request, response, decision and result row, under the account file\'s identity', keyless, async ($, on) => {
     const w = world(on, { accountFile: ACCOUNT_FILE })
     await start($)
     await turn($)
     await w.clock.advance(5_000)
     const rows = w.built()
-    expect(rows.length).toBe(4)
-    expect(new Set(rows.map(r => r.attributes['event.name']))).toEqual(new Set(['user_prompt', 'api_request', 'tool_decision', 'tool_result']))
+    expect(rows.length).toBe(5)
+    expect(new Set(rows.map(r => r.attributes['event.name']))).toEqual(new Set(['user_prompt', 'api_request', 'assistant_response', 'tool_decision', 'tool_result']))
     for (const r of rows) {
       expect(r.attributes['organization.id']).toBe(ORG)
       expect(r.attributes['user.email']).toBe(EMAIL)
@@ -201,7 +201,7 @@ describe('the rows built from events', () => {
       expect(r.attributes['user.account_uuid']).toBeUndefined()
       expect(r.attributes['user.id']).toBe(DEVICE)
     }
-    expect(w.built().length).toBe(4)
+    expect(w.built().length).toBe(5)
   })
 
   test("a session signed in another way goes under the host's identity, with the account file's device ID alone", keyless, async ($, on) => {
@@ -209,7 +209,7 @@ describe('the rows built from events', () => {
     await start($)
     await turn($)
     await w.clock.advance(5_000)
-    expect(w.built().length).toBe(4)
+    expect(w.built().length).toBe(5)
     for (const r of w.built()) {
       expect(r.attributes['organization.id']).toBe(HOST_ORG)
       expect(r.attributes['user.email']).toBe(HOST_EMAIL)
@@ -243,7 +243,7 @@ describe('the rows built from events', () => {
     await turn($, 'go', 'toolu_1')
     await w.clock.advance(5_000)
     const before = w.built().length
-    expect(before).toBe(4)
+    expect(before).toBe(5)
     await $.telemetry.log({ to: 'collector', event: 'user_prompt', loggedAt: LOGGED_AT, attributes: { 'organization.id': ORG, 'user.email': EMAIL, 'session.id': 's-1', 'event.name': 'user_prompt', prompt_length: '5' } } as never)
     await turn($, 'again', 'toolu_2')
     await w.clock.advance(5_000)
@@ -258,7 +258,7 @@ describe('the rows built from events', () => {
     expect(w.built()).toEqual([])
     await turn($, 'again', 'toolu_2')
     await w.clock.advance(5_000)
-    expect(new Set(w.built().map(r => r.attributes['event.name']))).toEqual(new Set(['user_prompt', 'api_request', 'tool_decision', 'tool_result']))
+    expect(new Set(w.built().map(r => r.attributes['event.name']))).toEqual(new Set(['user_prompt', 'api_request', 'assistant_response', 'tool_decision', 'tool_result']))
   })
 
   test("the prompt row carries Claude Code's own prompt id, where the session says it", keyless, async ($, on) => {
@@ -268,6 +268,38 @@ describe('the rows built from events', () => {
     await turn($)
     await w.clock.advance(5_000)
     expect(new Set(w.built().map(r => r.attributes['prompt.id']))).toEqual(new Set(['prompt-from-claude-1']))
+  })
+
+  test('the content the gate turns on goes on the built rows: the prompt, the response and the tool input; none of it while off', keyless, async ($, on) => {
+    const off = world(on, { accountFile: ACCOUNT_FILE })
+    await start($)
+    await turn($, 'tell me a secret')
+    await off.clock.advance(5_000)
+    const by = (event: string) => off.built().find(r => r.attributes['event.name'] === event)!.attributes
+    expect(by('user_prompt')['prompt']).toBe('<REDACTED>')
+    expect(by('assistant_response')['response']).toBe('<REDACTED>')
+    expect(by('assistant_response')['response_length']).toBe(2)
+    expect(by('tool_result')['tool_input']).toBeUndefined()
+    expect(JSON.stringify(off.posts.map(p => p.body))).not.toContain('tell me a secret')
+  })
+
+  test('with prompt.text, response.text and tool.input on (and what tool input holds), the built rows carry them, through the redaction packs, and each once', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, store: { dataPoints: { 'prompt.text': 'on', 'response.text': 'on', 'tool.input': 'on', 'bash.command': 'on', 'file.path': 'on', 'web.url': 'on' }, redactionPacks: ['pii.contact'] } })
+    await start($)
+    await turn($, 'mail jane@example.org please', 'toolu_1')
+    await w.clock.advance(5_000)
+    const of = (event: string) => w.built().filter(r => r.attributes['event.name'] === event).map(r => r.attributes)
+    expect(of('user_prompt').length).toBe(1)
+    const prompt = String(of('user_prompt')[0]!['prompt'])
+    expect(prompt).toContain('mail ')
+    expect(prompt).not.toContain('jane@example.org')
+    expect(of('assistant_response').map(a => a['response'])).toEqual(['ok'])
+    expect(of('tool_result').map(a => a['tool_input'])).toEqual([expect.stringContaining('echo hi')])
+    // A row of Claude Code's for the same response, coming late, fills nothing from the stream the built row carried.
+    await $.telemetry.log({ to: 'collector', event: 'assistant_response', loggedAt: LOGGED_AT, attributes: { 'organization.id': ORG, 'user.email': EMAIL, 'session.id': 's-1', 'event.name': 'assistant_response', response_length: 2, response: '<REDACTED>', query_source: 'repl_main_thread' } } as never)
+    await w.clock.advance(5_000)
+    const responses = w.logs().filter(r => r.attributes['event.name'] === 'assistant_response').map(r => r.attributes['response'])
+    expect(responses.filter(t => t === 'ok').length).toBe(1)
   })
 
   test('a reload after a row came: the process has seen rows, so the first turn after it builds nothing', keyless, async ($, on) => {
