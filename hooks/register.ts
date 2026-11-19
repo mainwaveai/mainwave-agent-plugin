@@ -46,7 +46,7 @@ import { parseResourceAttributes, type BuiltSpan, type CopiedRow } from './otlp.
 import {
   agentSpawned, callerCtx, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild, type RowIn,
 } from './rebuild.ts'
-import { accountDeviceOf, costOf, decisionRow, hostIdentityOf, isRefusal, newRowless, promptRow, providerOf, requestRow, responseRow, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, uuidOf, type HostFacts, type HostIdentityEnv, type Rowless, type Verdict } from './rowless.ts'
+import { accountDeviceOf, costOf, decisionRow, hostIdentityOf, isRefusal, newRowless, promptIdFrom, promptRow, providerOf, requestRow, responseRow, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, uuidOf, type HostFacts, type HostIdentityEnv, type Rowless, type Verdict } from './rowless.ts'
 import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsSummary, settingsUnavailable } from './orgsettings.ts'
 import { contentLimit } from './protect.ts'
 import { adopt, collectorMalformed, collectorOf, configure, enqueue, ensureTimer, finish, isCopying, readOptions, snapshot } from './sender.ts'
@@ -1290,8 +1290,7 @@ async function feedRow($: EngineInterface, row: RowIn): Promise<void> {
 /** Claude Code's id of the prompt the session is on, so the rows built of its turn carry the one its own records do; undefined where it can't be read. */
 async function promptIdOf($: EngineInterface): Promise<string | undefined> {
   try {
-    const id = (await $.session.info()).promptId
-    return typeof id === 'string' && /^[0-9A-Za-z._:-]{1,128}$/.test(id) ? id : undefined
+    return promptIdFrom(await $.session.info())
   } catch {
     return undefined
   }

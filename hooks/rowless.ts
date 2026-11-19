@@ -119,6 +119,15 @@ export type Rowless = { sequence: number; promptId?: string; costUsd?: number }
 
 export const newRowless = (): Rowless => ({ sequence: 0 })
 
+/**
+ * Claude Code's id of the prompt the session is on, from what `$.session.info()` answers (Claude Code 2.1.328 on has it), where it
+ * has the shape of an id; undefined otherwise, and the prompt row takes a new one.
+ */
+export function promptIdFrom(info: unknown): string | undefined {
+  const id = info !== null && typeof info === 'object' ? (info as { promptId?: unknown }).promptId : undefined
+  return typeof id === 'string' && /^[0-9A-Za-z._:-]{1,128}$/.test(id) ? id : undefined
+}
+
 /** A random version 4 UUID, from 32 random hex digits: the shape of Claude Code's `prompt.id`. */
 export function uuidOf(hex32: string): string {
   const h = hex32.padEnd(32, '0').slice(0, 32).split('')

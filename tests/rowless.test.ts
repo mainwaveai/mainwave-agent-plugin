@@ -5,7 +5,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { accountDeviceOf, costOf, decisionSource, hostIdentityOf, isRefusal, responseTextOf, seedCost, newRowless, promptRow, providerOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
+import { accountDeviceOf, costOf, decisionSource, hostIdentityOf, isRefusal, promptIdFrom, responseTextOf, seedCost, newRowless, promptRow, providerOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
 import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, PROD, records, type Post } from './rig.ts'
 
 const keyless = { options: {} }
@@ -261,15 +261,6 @@ describe('the rows built from events', () => {
     expect(new Set(w.built().map(r => r.attributes['event.name']))).toEqual(new Set(['user_prompt', 'api_request', 'assistant_response', 'tool_decision', 'tool_result']))
   })
 
-  test("the prompt row carries Claude Code's own prompt id, where the session says it", keyless, async ($, on) => {
-    const w = world(on, { accountFile: ACCOUNT_FILE })
-    on('session.info', () => ({ value: { transcriptPath: '', sysname: 'Darwin', promptId: 'prompt-from-claude-1' } }) as never)
-    await start($)
-    await turn($)
-    await w.clock.advance(5_000)
-    expect(new Set(w.built().map(r => r.attributes['prompt.id']))).toEqual(new Set(['prompt-from-claude-1']))
-  })
-
   test('the content the gate turns on goes on the built rows: the prompt, the response and the tool input; none of it while off', keyless, async ($, on) => {
     const off = world(on, { accountFile: ACCOUNT_FILE })
     await start($)
@@ -402,6 +393,13 @@ describe('the rows built from events', () => {
 })
 
 describe('rowless.ts', () => {
+  test("the prompt row's id is Claude Code's where the session says it, of an id's shape", () => {
+    expect(promptIdFrom({ transcriptPath: '', sysname: 'Darwin', promptId: 'prompt-from-claude-1' })).toBe('prompt-from-claude-1')
+    expect(promptIdFrom({ promptId: 'has space' })).toBeUndefined()
+    expect(promptIdFrom({})).toBeUndefined()
+    expect(promptIdFrom(null)).toBeUndefined()
+  })
+
   test("a response row's text is the step's own answer: a retry's doubled pieces never; the stream's join where it reads the same", () => {
     expect(responseTextOf('ok', 'okok')).toBe('ok')
     expect(responseTextOf('Let me check.\nok', 'Let me check.\nok')).toBe('Let me check.\nok')
