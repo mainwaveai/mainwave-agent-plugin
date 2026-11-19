@@ -68,12 +68,12 @@ const WRAPPERS: Readonly<Record<string, ReadonlySet<string>>> = {
   if: new Set(), then: new Set(), else: new Set(), elif: new Set(), do: new Set(), while: new Set(), until: new Set(),
 }
 
-/** The words after glab in a simple command, past leading assignments and wrappers; undefined when the command is not glab. */
-function glabWords(segment: readonly string[]): string[] | undefined {
+/** A simple command's words from its program on, past leading assignments and wrapper words (`env`, `sudo`, `then`, `do`, `!` ...). */
+export function commandWords(segment: readonly string[]): string[] {
   let i = 0
   for (;;) {
     const w = segment[i]
-    if (w === undefined) return undefined
+    if (w === undefined) return []
     if (ASSIGNMENT.test(w)) {
       i++
       continue
@@ -83,9 +83,13 @@ function glabWords(segment: readonly string[]): string[] | undefined {
     i++
     while (segment[i]?.startsWith('-')) i += valueFlags.has(segment[i]!) ? 2 : 1
   }
-  const bin = segment[i]
-  if (!bin || !/(^|\/)glab(\.exe)?$/.test(bin)) return undefined
-  return segment.slice(i + 1)
+  return segment.slice(i)
+}
+
+/** The words after glab in a simple command, past leading assignments and wrappers; undefined when the command is not glab. */
+function glabWords(segment: readonly string[]): string[] | undefined {
+  const words = commandWords(segment)
+  return words[0] !== undefined && /(^|\/)glab(\.exe)?$/.test(words[0]) ? words.slice(1) : undefined
 }
 
 const API_VALUE_FLAGS = new Set(['-X', '--method', '-f', '--raw-field', '-F', '--field', '--form', '--input', '-H', '--header', '--hostname', '--output'])

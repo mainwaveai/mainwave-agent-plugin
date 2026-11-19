@@ -17,7 +17,7 @@
 
 import type { TelemetryAttribute } from 'claude-code'
 
-import { shellSegments } from './glab.ts'
+import { commandWords, shellSegments } from './glab.ts'
 
 // ── Names ─────────────────────────────────────────────────────────────────────
 
@@ -280,17 +280,13 @@ export function commitAttributes(c: Commit): Record<string, TelemetryAttribute> 
 
 // ── GitHub pull requests ──────────────────────────────────────────────────────
 
-const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=/
-
 /**
- * `gh pr create` in a shell command, as a command of its own (not inside a message or an `echo`), with the title it gives (`--title`,
+ * `gh pr create` in a shell command, as a command of its own (not inside a message or an `echo`; after assignments and wrapper words such as `env` or `then`), with the title it gives (`--title`,
  * `-t`), where that is written out: a title the shell would expand (`"$TITLE"`, `"$(git log ...)"`) is not the title, and goes as none.
  */
 export function prCreateOf(command: unknown): { title?: string } | undefined {
   for (const segment of shellSegments(command)) {
-    let i = 0
-    while (segment[i] !== undefined && ASSIGNMENT.test(segment[i]!)) i++
-    const words = segment.slice(i)
+    const words = commandWords(segment)
     if (!/(^|\/)gh(\.exe)?$/.test(words[0] ?? '') || words[1] !== 'pr' || words[2] !== 'create') continue
     let title: string | undefined
     for (let j = 3; j < words.length; j++) {
@@ -312,7 +308,8 @@ export const isPrCreate = (command: unknown): boolean => prCreateOf(command) !==
  * says the request already exists: then it opened nothing, whatever the command's exit.
  */
 export function prUrlOf(texts: readonly string[]): string | undefined {
-  if (texts.some(t => /already exists/i.test(t))) return undefined
+  // gh's own words for it; another command of the chain may say something else already exists.
+  if (texts.some(t => /a pull request for branch .* already exists/i.test(t))) return undefined
   for (const text of texts) {
     const m = text.match(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/)
     if (m) return m[0]

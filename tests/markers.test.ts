@@ -79,10 +79,15 @@ describe('GitHub pull requests', () => {
     expect(prCreateOf('gh pr create --title "$TITLE"')).toEqual({})
     expect(prCreateOf('gh pr create --title "$(git log -1 --format=%s)"')).toEqual({})
     expect(prCreateOf('echo "gh pr create"')).toBeUndefined()
+    // Behind a wrapper word, as in an if or a loop.
+    expect(prCreateOf('if git push; then gh pr create --title x --fill; fi')).toEqual({ title: 'x' })
+    expect(prCreateOf('env GH_TOKEN=t gh pr create -t y')).toEqual({ title: 'y' })
     // Its size is looked up by its address, so in its own repository wherever the command ran.
     expect(prLookup(url)).toEqual(['gh', 'pr', 'view', url, '--json', 'changedFiles,additions,deletions'])
     // One that already exists was not opened, whatever the command's exit.
     expect(prUrlOf(['a pull request for branch "feat" into branch "main" already exists:\nhttps://github.com/acme/api/pull/12\n'])).toBeUndefined()
+    // Another command of the chain saying something else exists is not gh's.
+    expect(prUrlOf(["fatal: a branch named 'feat' already exists\nhttps://github.com/acme/api/pull/13\n"])).toBe('https://github.com/acme/api/pull/13')
     expect(parsePrStats('{"changedFiles":3,"additions":10,"deletions":2}')).toEqual({ changedFiles: 3, additions: 10, deletions: 2 })
     expect(parsePrStats('not json')).toEqual({})
     expect(prAttributes(url, '42', 'Fix login', { changedFiles: 3 })).toEqual({

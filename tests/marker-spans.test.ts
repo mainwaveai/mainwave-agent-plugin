@@ -71,22 +71,22 @@ async function row($: Engine, event = 'api_request') {
   await $.telemetry.log({ to: 'collector', event, loggedAt: LOGGED_AT, attributes: { ...COMMON, 'event.name': event, 'event.sequence': 1 } } as never)
 }
 
-async function bash($: Engine, command: string, stdout: string) {
-  await $.classic.PostToolUse({ tool_name: 'Bash', tool_input: { command }, tool_response: { stdout, stderr: '' }, tool_use_id: 'toolu_1', cwd: '/repo' } as never)
+async function bash($: Engine, command: string, stdout: string, session = 's-1') {
+  await $.classic.PostToolUse({ tool_name: 'Bash', tool_input: { command }, tool_response: { stdout, stderr: '' }, tool_use_id: 'toolu_1', cwd: '/repo', session_id: session } as never)
 }
 
 /** A session that commits, opens a pull request, saves a Linear ticket, submits a prompt and ends a turn on a rate limit. */
 async function session($: Engine, w: World) {
   await $.session.start({ cwd: '/repo', surface: null, isInteractive: false } as never)
   await row($)
-  await $.classic.UserPromptSubmit({ prompt: 'ship it', prompt_id: 'prompt-1' } as never)
+  await $.classic.UserPromptSubmit({ prompt: 'ship it', prompt_id: 'prompt-1', session_id: 's-1' } as never)
   await bash($, 'git commit -m "fix login"', `[main ${SHA.slice(0, 7)}] fix login\n 1 file changed`)
   await bash($, 'gh pr create --title "Fix login" --body x', 'https://github.com/acme/api/pull/42\n')
   await $.classic.PostToolUse({
-    tool_name: 'mcp__claude_ai_Linear__save_issue', tool_input: { title: 'Fix login' }, tool_use_id: 'toolu_2',
+    tool_name: 'mcp__claude_ai_Linear__save_issue', tool_input: { title: 'Fix login' }, tool_use_id: 'toolu_2', session_id: 's-1',
     tool_response: [{ type: 'text', text: JSON.stringify({ id: 'ENG-12', url: 'https://linear.app/acme/issue/ENG-12/fix-login', teamId: 'team-1', description: 'Also ENG-9' }) }],
   } as never)
-  await $.classic.StopFailure({ error: 'rate_limit', error_details: 'Rate limited, retry in 30s', prompt_id: 'prompt-1' } as never)
+  await $.classic.StopFailure({ error: 'rate_limit', error_details: 'Rate limited, retry in 30s', prompt_id: 'prompt-1', session_id: 's-1' } as never)
   await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
   return w.posts
 }
@@ -200,10 +200,10 @@ describe('what proves nothing sends nothing', () => {
     const w = world(on, { overrides: KEYS_ON, files: { [`${HOME}/.claude.json`]: other } })
     await $.session.start({ cwd: '/repo', surface: null, isInteractive: false } as never)
     await row($)
-    await $.classic.UserPromptSubmit({ prompt: 'x', prompt_id: 'p' } as never)
+    await $.classic.UserPromptSubmit({ prompt: 'x', prompt_id: 'p', session_id: 's-1' } as never)
     await bash($, 'git commit -m x', 'nothing to commit, working tree clean')
     await bash($, 'gh pr create --web', 'Opening github.com/acme/api/compare in your browser.')
-    await $.classic.PostToolUse({ tool_name: 'mcp__linear__save_issue', tool_input: {}, tool_response: 'Error: invalid input', tool_use_id: 'toolu_3' } as never)
+    await $.classic.PostToolUse({ tool_name: 'mcp__linear__save_issue', tool_input: {}, tool_response: 'Error: invalid input', tool_use_id: 'toolu_3', session_id: 's-1' } as never)
     await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
     expect(markersOf(w.posts)).toEqual([])
     expect(w.runs).toEqual([])
@@ -225,6 +225,19 @@ describe('what proves nothing sends nothing', () => {
     await $.telemetry.log({ to: 'collector', event: 'api_request', loggedAt: LOGGED_AT, attributes: { ...COMMON, 'session.id': 's-2', 'event.name': 'api_request', 'event.sequence': 1 } } as never)
     await $.session.end({ reason: 'other', sessionId: 's-2', resume: { id: 's-2' } } as never)
     expect(one(w.posts, 'vcs.commit.created')!.attrs['session.id']).toBe('s-1')
+  })
+
+  test('just after a /clear, before a row of the new session: the plan snapshot and a failure go under the session their event names', keyless, async ($, on) => {
+    const w = world(on, { overrides: KEYS_ON })
+    await $.session.start({ cwd: '/repo', surface: null, isInteractive: false } as never)
+    await row($)
+    await $.session.end({ reason: 'clear', sessionId: 's-1', resume: { id: 's-2' } } as never)
+    await $.classic.UserPromptSubmit({ prompt: 'next', prompt_id: 'prompt-2', session_id: 's-2' } as never)
+    await $.classic.StopFailure({ error: 'overloaded', prompt_id: 'prompt-2', session_id: 's-2' } as never)
+    await $.telemetry.log({ to: 'collector', event: 'api_request', loggedAt: LOGGED_AT, attributes: { ...COMMON, 'session.id': 's-2', 'event.name': 'api_request', 'event.sequence': 1 } } as never)
+    await $.session.end({ reason: 'other', sessionId: 's-2', resume: { id: 's-2' } } as never)
+    expect(one(w.posts, 'mainwave.subscription.snapshot')!.attrs['session.id']).toBe('s-2')
+    expect(one(w.posts, 'mainwave.claude_code.stop_failure')!.attrs['session.id']).toBe('s-2')
   })
 
   test('a marker made before any row names the session waits for one, then goes under its identity', keyless, async ($, on) => {

@@ -28,7 +28,7 @@ import { add, collect, newMeter, type Meter } from './meter.ts'
 import {
   against, CHANGE_OPENED, cliCanSend, cliHookKinds, COMMIT_CREATED, commitAttributes, commitLookup, commitsInOutput, errorTypeOf, gitCommits, JIRA_TOOL, jiraTicket, KIND_SPAN, LINEAR_TOOL,
   linearTicket, MARKER_IDENTITY, MARKER_KEYS, markerResource, outputTexts, parseNumstat, parsePrStats, placeAttributes, prAttributes, prCreateOf, prLookup, prNumberOf, prUrlOf, STOP_FAILURE,
-  STOP_FAILURE_ERROR, SUBSCRIPTION_SNAPSHOT, ticketSpan, type MarkerKind,
+  opaqueId, STOP_FAILURE_ERROR, SUBSCRIPTION_SNAPSHOT, ticketSpan, type MarkerKind,
 } from './markers.ts'
 import type { BuiltSpan, CopiedRow } from './otlp.ts'
 import {
@@ -668,8 +668,13 @@ async function prMarker($: EngineInterface, title: string | undefined, texts: re
   return [{ kind: 'gh', name: CHANGE_OPENED, atMs, attributes: { ...prAttributes(url, number, title, stats), ...place } }]
 }
 
-/** The session the plugin's rows say it is in now, if any has said. */
-async function sessionNow($: EngineInterface): Promise<TelemetryAttribute | undefined> {
+/**
+ * The session a marker was made in: the one its hook event names (every classic event carries it), else the one the plugin's rows
+ * last named. The event's is right even just after a /clear, before any row of the new session has come.
+ */
+async function sessionOf($: EngineInterface, eventSession: unknown): Promise<TelemetryAttribute | undefined> {
+  const named = opaqueId(eventSession)
+  if (named !== undefined) return named
   const r = await rebuildOf($)
   return r?.common['session.id']
 }
@@ -721,7 +726,7 @@ async function mrMarker($: EngineInterface, call: { kind: 'create' | 'api'; titl
 
 /** The markers of one tool call that ended: a shell command's commits, pull request and merge request; an MCP save's ticket. */
 async function toolMarkers($: EngineInterface, e: PostToolParams[1]): Promise<void> {
-  const session = await sessionNow($)
+  const session = await sessionOf($, e.session_id)
   const tool = e.tool_name
   const input = isRecord(e.tool_input) ? e.tool_input : {}
   const agentId = typeof e.agent_id === 'string' && e.agent_id !== '' ? e.agent_id : undefined
@@ -765,9 +770,9 @@ export function postToolCatch($: PostToolCatchParams[0], e: PostToolCatchParams[
 }
 
 /** The plan snapshot for a prompt, from Claude Code's account record, when its data point is on and the CLI's hook does not send it. */
-async function snapshotMarker($: EngineInterface, promptId: unknown): Promise<void> {
+async function snapshotMarker($: EngineInterface, promptId: unknown, eventSession: unknown): Promise<void> {
   if (!(await markerWanted($, 'snapshot'))) return
-  const session = await sessionNow($)
+  const session = await sessionOf($, eventSession)
   const [home, profile, configDir] = await Promise.all([settle($.env.get('HOME')), settle($.env.get('USERPROFILE')), settle($.env.get('CLAUDE_CONFIG_DIR'))])
   const base = configDir || home || profile || undefined
   if (base === undefined) return
@@ -783,7 +788,7 @@ async function snapshotMarker($: EngineInterface, promptId: unknown): Promise<vo
 export async function promptSubmitHook($: PromptSubmitParams[0], e: PromptSubmitParams[1], next: PromptSubmitParams[2]) {
   const result = await next(e)
   try {
-    if (isCopying()) beside(() => snapshotMarker($, e.prompt_id))
+    if (isCopying()) beside(() => snapshotMarker($, e.prompt_id, e.session_id))
   } catch {
     // No snapshot for that prompt.
   }
@@ -805,7 +810,7 @@ export async function stopFailureHook($: StopFailureParams[0], e: StopFailurePar
         if (!(await markerWanted($, 'stop'))) return
         const atMs = await $.clock.now()
         const place = await placeOf($, undefined)
-        await queueMarkers($, [{ kind: 'stop', name: STOP_FAILURE, atMs, attributes: { [STOP_FAILURE_ERROR]: error, ...placeAttributes({ promptId: e.prompt_id }), ...place } }], await sessionNow($))
+        await queueMarkers($, [{ kind: 'stop', name: STOP_FAILURE, atMs, attributes: { [STOP_FAILURE_ERROR]: error, ...placeAttributes({ promptId: e.prompt_id }), ...place } }], await sessionOf($, e.session_id))
       })
     }
   } catch {

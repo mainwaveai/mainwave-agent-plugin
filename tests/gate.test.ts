@@ -570,8 +570,9 @@ describe('a marker through the gate', () => {
     attributes: { 'vcs.repository.url.full': 'https://github.com/acme/api/pull/1', 'vcs.change.id': '1', 'vcs.change.title': 'Secret title' },
   }
 
-  test('goes only while the data point of its key is on', () => {
+  test('goes only while the data point of its key is on: not where it is as Claude Code sends it', () => {
     expect(gateMarker(resolveGate({}), commit)).toBeNull()
+    expect(gateMarker(resolveGate({}, { repo: 'claude' }), commit)).toBeNull()
     expect(gateMarker(resolveGate({}, { repo: 'on' }), commit)!.attributes['vcs.commit.sha']).toBe('c'.repeat(40))
   })
 
