@@ -122,19 +122,28 @@ export type SignInEnv = {
   ANTHROPIC_API_KEY?: string | undefined
   ANTHROPIC_AUTH_TOKEN?: string | undefined
   CLAUDE_CODE_OAUTH_TOKEN?: string | undefined
+  CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR?: string | undefined
+  CLAUDE_CODE_OAUTH_REFRESH_TOKEN?: string | undefined
+  CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR?: string | undefined
+  CLAUDE_CODE_GATEWAY_TOKEN?: string | undefined
+  CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR?: string | undefined
   CLAUDE_CODE_USE_BEDROCK?: string | undefined
   CLAUDE_CODE_USE_VERTEX?: string | undefined
   CLAUDE_CODE_USE_FOUNDRY?: string | undefined
 }
 
 /**
- * Whether the session may be signed in some way other than the account file's login: an API key or token in the environment, a
- * token a host hands in, a cloud provider, or an API key helper in the settings. The account file's login may then be someone else's,
+ * Whether the session may be signed in some way other than the account file's login: an API key or token in the environment or
+ * handed in on a file descriptor, an OAuth or refresh token a host hands in, a gateway's token, a cloud provider, or an API key helper
+ * in the settings. The account file's login may then be someone else's,
  * or an old one, so it says nothing about who the session is.
  */
 export function signedInElsewhere(env: SignInEnv, settings: Readonly<Record<string, unknown>>): boolean {
   const helper = settings['apiKeyHelper']
-  return set(env.ANTHROPIC_API_KEY) || set(env.ANTHROPIC_AUTH_TOKEN) || set(env.CLAUDE_CODE_OAUTH_TOKEN)
+  return [
+    env.ANTHROPIC_API_KEY, env.ANTHROPIC_AUTH_TOKEN, env.CLAUDE_CODE_OAUTH_TOKEN, env.CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR, env.CLAUDE_CODE_OAUTH_REFRESH_TOKEN,
+    env.CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR, env.CLAUDE_CODE_GATEWAY_TOKEN, env.CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR,
+  ].some(set)
     || truthy(env.CLAUDE_CODE_USE_BEDROCK) || truthy(env.CLAUDE_CODE_USE_VERTEX) || truthy(env.CLAUDE_CODE_USE_FOUNDRY)
     || (typeof helper === 'string' && helper.trim() !== '')
 }

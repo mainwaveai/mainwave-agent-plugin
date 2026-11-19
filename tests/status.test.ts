@@ -53,6 +53,11 @@ function world(on: On, opts: World = {}) {
   })
   on('turn.start', (_$, e) => ({ turnId: (e as { turnId: string }).turnId }) as never)
   on('turn.complete', () => ({ text: 'ok' }) as never)
+  on('turn.step', async function* (_$, e) {
+    yield { kind: 'stop', stopReason: 'end_turn', usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'claude-haiku-5-5' } } as never
+    return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'claude-haiku-5-5' } } as never
+  })
+  on('classic.StopFailure', () => ({}) as never)
   /** The status rows sent, in order. */
   const statusRows = () => seen.filter(p => new URL(p.url).pathname === '/v1/logs').flatMap(records).filter(r => r.attributes['event.name'] === 'plugin_status')
   return { clock, store, posts, seen, reads, logs, statusRows, setSession: (id: string) => (sessionId = id) }
@@ -62,10 +67,16 @@ async function row($: Engine, event: string, common: Record<string, unknown> = C
   await $.telemetry.log({ to: 'collector', event, loggedAt: LOGGED_AT, attributes: { ...common, 'event.name': event, 'event.sequence': 1 } } as never)
 }
 
-/** One main-loop turn, its rows raised by Claude Code (`rows`) or never reaching the plugin. */
-async function turn($: Engine, rows: boolean, common: Record<string, unknown> = COMMON) {
+/** One main-loop turn, its rows raised by Claude Code (`rows`) or never reaching the plugin; `model`, it asks the model once. */
+async function turn($: Engine, rows: boolean, common: Record<string, unknown> = COMMON, model = true) {
   if (rows) await row($, 'user_prompt', common)
   await $.turn.start({ turnId: 't1', text: 'go' } as never)
+  if (model) {
+    const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-haiku-5-5', messageCount: 1 } as never)
+    while (!(await stream.next()).done) {
+      // Read to its end, as the engine does.
+    }
+  }
   if (rows) await row($, 'api_request', common)
   return $.turn.complete({ turnId: 't1', answer: 'ok', durationMs: 40, isAborted: false, reason: 'answer' } as never)
 }
@@ -314,5 +325,32 @@ describe('the status row, more', () => {
       [other['organization.id'], other['user.email'], undefined],
     ])
     expect(w.posts.settings.map(p => JSON.parse(p.body))).toContainEqual({ claude_org_id: other['organization.id'], email: other['user.email'] })
+  })
+
+  test('a turn that asks no model says nothing of rows: no rows_skipped, and the account file is not read', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE })
+    await turn($, false, COMMON, false)
+    await w.clock.advance(2 * TICK)
+    expect(w.reads).not.toContain(`${HOME}/.claude.json`)
+    // The next turn asks the model, and its rows never come.
+    await turn($, false)
+    await w.clock.advance(2 * TICK)
+    await end($)
+    expect(w.statusRows().map(r => r.attributes[ISSUES])).toEqual([['rows_skipped']])
+  })
+
+  test("a marker goes under the account file's identity where no row reaches the plugin, in the session its event names", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE })
+    await turn($, false)
+    await $.classic.StopFailure({ error: 'rate_limit', prompt_id: 'prompt-1', session_id: 'sess-1' } as never)
+    await w.clock.advance(2 * TICK)
+    await end($)
+    await w.clock.advance(TICK)
+    const spans = w.seen.filter(p => new URL(p.url).pathname === '/v1/traces').flatMap(p => (JSON.parse(p.body) as { resourceSpans: { scopeSpans: { spans: { name: string; attributes: { key: string; value: { stringValue?: string } }[] }[] }[] }[] }).resourceSpans)
+      .flatMap(rs => rs.scopeSpans.flatMap(ss => ss.spans))
+    const stop = spans.find(x => x.name === 'mainwave.claude_code.stop_failure')
+    expect(stop).toBeDefined()
+    const attr = (k: string) => stop!.attributes.find(a => a.key === k)?.value.stringValue
+    expect([attr('organization.id'), attr('user.email'), attr('user.account_uuid'), attr('session.id')]).toEqual([ORG, EMAIL, ACCOUNT, 'sess-1'])
   })
 })

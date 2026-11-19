@@ -15,7 +15,8 @@
 //
 // A third says what the plugin found wrong with the session's telemetry setup (`plugin_status`, setup.ts): one per session as its first
 // turn ends, and again when that changes. When no row of Claude Code's reaches the plugin by then (a built-in plugin that runs first can
-// send them on past it), the plugin's own rows go under the identity in Claude's account file instead, until a row names one.
+// send them on past it), the plugin's own rows and its markers go under the identity in Claude's account file instead, until a row
+// names one.
 
 import { atom, update } from 'claude-code'
 import type { CatchHandler, EngineInterface, Frozen, Hook, Next, Register, StreamHook, TelemetryAttribute, TelemetryLogResult, TelemetryRecordEntry, Timer } from 'claude-code'
@@ -127,6 +128,10 @@ let firstTurnAtMs: number | undefined
 let lastIssues: string | undefined
 let statusRows = 0
 let statusTimer: Timer | null = null
+/** When this load's first model request ended: each one raises a row, so none seen past the grace means rows don't reach the plugin. */
+let firstStepAtMs: number | undefined
+/** Counts the status's resets: a check that began before a /clear queues nothing for the session after it. */
+let statusEpoch = 0
 
 /**
  * One of the plugin's own rows; `text`, for a skill's row, the text it carries, marked sent once the row is queued; `issues`, for the
@@ -436,17 +441,23 @@ async function adoptAccount($: EngineInterface): Promise<void> {
 
 /** The variables that sign a session in another way than the account file's login, each spelled out. */
 async function readSignInEnv($: EngineInterface): Promise<SignInEnv> {
-  const [apiKey, authToken, oauthToken, bedrock, vertex, foundry] = await Promise.all([
+  const [apiKey, authToken, oauthToken, oauthFd, refresh, apiKeyFd, gateway, gatewayFd, bedrock, vertex, foundry] = await Promise.all([
     settle($.env.get('ANTHROPIC_API_KEY')),
     settle($.env.get('ANTHROPIC_AUTH_TOKEN')),
     settle($.env.get('CLAUDE_CODE_OAUTH_TOKEN')),
+    settle($.env.get('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR')),
+    settle($.env.get('CLAUDE_CODE_OAUTH_REFRESH_TOKEN')),
+    settle($.env.get('CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR')),
+    settle($.env.get('CLAUDE_CODE_GATEWAY_TOKEN')),
+    settle($.env.get('CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR')),
     settle($.env.get('CLAUDE_CODE_USE_BEDROCK')),
     settle($.env.get('CLAUDE_CODE_USE_VERTEX')),
     settle($.env.get('CLAUDE_CODE_USE_FOUNDRY')),
   ])
   return {
-    ANTHROPIC_API_KEY: apiKey, ANTHROPIC_AUTH_TOKEN: authToken, CLAUDE_CODE_OAUTH_TOKEN: oauthToken,
-    CLAUDE_CODE_USE_BEDROCK: bedrock, CLAUDE_CODE_USE_VERTEX: vertex, CLAUDE_CODE_USE_FOUNDRY: foundry,
+    ANTHROPIC_API_KEY: apiKey, ANTHROPIC_AUTH_TOKEN: authToken, CLAUDE_CODE_OAUTH_TOKEN: oauthToken, CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: oauthFd,
+    CLAUDE_CODE_OAUTH_REFRESH_TOKEN: refresh, CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR: apiKeyFd, CLAUDE_CODE_GATEWAY_TOKEN: gateway,
+    CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR: gatewayFd, CLAUDE_CODE_USE_BEDROCK: bedrock, CLAUDE_CODE_USE_VERTEX: vertex, CLAUDE_CODE_USE_FOUNDRY: foundry,
   }
 }
 
@@ -477,7 +488,8 @@ async function readExporterEnv($: EngineInterface): Promise<ExporterEnv> {
 async function setupIssues($: EngineInterface, graceElapsed: boolean): Promise<IssueCode[]> {
   const gate = await gateOf($)
   const [settings, env, now, cli] = await Promise.all([mergedSettings($), readExporterEnv($), $.clock.now(), cliHooksOf($)])
-  const rowsSkipped = !rowSeen && firstTurnAtMs !== undefined && (graceElapsed || now - firstTurnAtMs >= STATUS_GRACE_MS)
+  // Only once a model request has ended: a turn that asks no model (a local command) raises no row.
+  const rowsSkipped = !rowSeen && firstStepAtMs !== undefined && (graceElapsed || now - firstStepAtMs >= STATUS_GRACE_MS)
   return issuesOf({
     rowsSkipped,
     cliHooks: cli.size > 0,
@@ -495,8 +507,13 @@ async function setupIssues($: EngineInterface, graceElapsed: boolean): Promise<I
  */
 async function checkStatus($: EngineInterface, graceElapsed = false): Promise<void> {
   if (!isCopying() || firstTurnAtMs === undefined) return
+  // Neither a row nor a model request yet: nothing is known of whether rows reach the plugin, and nothing names the session.
+  if (!rowSeen && firstStepAtMs === undefined) return
+  const epoch = statusEpoch
   const issues = await setupIssues($, graceElapsed)
   if (issues.includes('rows_skipped') && accountCommon === undefined) await adoptAccount($)
+  // A /clear or a resume while this ran: what it found is the ended session's, and the next one checks for itself.
+  if (epoch !== statusEpoch) return
   const key = issues.join(',')
   if (key === lastIssues || statusRows >= MAX_STATUS_ROWS) return
   lastIssues = key
@@ -505,16 +522,16 @@ async function checkStatus($: EngineInterface, graceElapsed = false): Promise<vo
 }
 
 /**
- * A main-loop turn ended: the status is checked. After the first, with no row seen yet, it waits `STATUS_GRACE_MS` from that end, as
- * a row can trail its turn.
+ * A main-loop turn ended: the status is checked. While no row has been seen and the first model request ended less than
+ * `STATUS_GRACE_MS` ago, the first check waits for the grace to pass, as a row can trail its request.
  */
 async function statusAtTurnEnd($: EngineInterface): Promise<void> {
   if (!isCopying()) return
   const now = await $.clock.now()
   firstTurnAtMs ??= now
-  if (!rowSeen && lastIssues === undefined && now - firstTurnAtMs < STATUS_GRACE_MS) {
+  if (!rowSeen && lastIssues === undefined && firstStepAtMs !== undefined && now - firstStepAtMs < STATUS_GRACE_MS) {
     // The grace has passed when this runs, whatever the clock reads: a timer can fire a millisecond early.
-    statusTimer ??= $.clock.after(firstTurnAtMs + STATUS_GRACE_MS - now, () => {
+    statusTimer ??= $.clock.after(firstStepAtMs + STATUS_GRACE_MS - now, () => {
       statusTimer = null
       void checkStatus($, true).catch(() => undefined)
     })
@@ -525,6 +542,7 @@ async function statusAtTurnEnd($: EngineInterface): Promise<void> {
 
 /** The status starts over, for a new session or a new load. */
 function resetStatus(): void {
+  statusEpoch += 1
   statusTimer?.cancel()
   statusTimer = null
   firstTurnAtMs = undefined
@@ -1210,6 +1228,11 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
   // A stream closed early (interrupted, or no longer read) leaves here and sends nothing: its row, if one comes, goes alone.
   const stream = r === null ? next(e) : watched(next(e), chunk => streamChunk(capture, e.agentId, chunk))
   const result = yield* stream
+  try {
+    firstStepAtMs ??= await $.clock.now()
+  } catch {
+    // The next request's end counts instead.
+  }
   if (r !== null) {
     try {
       await emit($, stepEnd(r, e.agentId, startMs, result, await $.clock.now(), streamedThinking(capture, e.agentId)))
@@ -1446,6 +1469,7 @@ export const register: Register = on => {
   cliHooks = null
   making = new Set()
   rowSeen = false
+  firstStepAtMs = undefined
   account = null
   accountCommon = undefined
   resetStatus()
