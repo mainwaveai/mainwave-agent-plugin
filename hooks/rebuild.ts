@@ -135,6 +135,8 @@ export type Rebuild = {
   ready: Emit
   /** Whether a prompt row has named its interaction's span: once one has, the host carries the trace onto its rows. */
   sawPromptSpan: boolean
+  /** No row of Claude Code's reaches the plugin: it builds them from Claude Code's events (rowless.ts), and builds the trace itself. */
+  rowless?: boolean
   /** Whether any row has named a span: once one has, coherent mode is over. */
   sawSpan: boolean
   /** A `user_prompt` row seen before its turn began. */
@@ -200,8 +202,11 @@ export function newRebuild(settings: Settings, mint: Rebuild['mint'] = randomHex
   }
 }
 
-/** Whether the rebuild makes the trace itself: Claude Code does not trace, and no row has named a span. */
-export const isCoherent = (r: Rebuild): boolean => !r.settings.claudeTraces && !r.sawSpan
+/**
+ * Whether the rebuild makes the trace itself: Claude Code does not trace, or no row of its reaches the plugin (the plugin builds the
+ * rows from Claude Code's events, rowless.ts, and none names a span); and no row has named a span.
+ */
+export const isCoherent = (r: Rebuild): boolean => (!r.settings.claudeTraces || r.rowless === true) && !r.sawSpan
 
 const mintCtx = (r: Rebuild): Ctx => ({ traceId: r.mint(32), spanId: r.mint(16) })
 

@@ -94,6 +94,10 @@ const CAPTURES = ['OTEL_LOG_TOOL_DETAILS', 'OTEL_LOG_TOOL_CONTENT', 'OTEL_LOG_US
  * with explicit settings that turn them on, as an organization's settings would, so the copy carries what the exporter does.
  */
 const CAPTURED_DATA_POINTS = ['repo', 'file.path', 'web.url', 'bash.command', 'tool.input', 'tool.result', 'prompt.text', 'response.text']
+/** The content the rowless pass turns on, as an organization's settings would: the prompt, the response, and the tool input with what it holds. */
+const ROWLESS_CONTENT = ['prompt.text', 'response.text', 'tool.input', 'tool.result', 'bash.command', 'file.path', 'web.url']
+/** The keys that content goes under: compared apart, as the reference pass sends it as Claude Code does, with its switches at 0. */
+const CONTENT_KEYS = new Set(['prompt', 'prompt_text', 'response', 'tool_input', 'tool_parameters', 'full_command', 'bash_command', 'file_path', 'user_prompt', 'url.full', 'url.domain'])
 /**
  * Where Claude Code keeps a plugin's store in a config folder: `plugins/store/<name>_<marketplace>-<first 12 hex of the plugin id's
  * SHA-256>.json`, one JSON object of its keys. The plugin, loaded from a folder, is `mainwave@inline`.
@@ -148,7 +152,7 @@ function modelReply(req) {
     const refuse = classifiedAction(req).includes(REFUSED)
     if (refuse) classified.refused++
     const text = textOf(req.system).includes('<severity>') ? `<severity>${refuse ? 100 : 0}</severity>` : `<block>${refuse ? 'yes' : 'no'}</block>`
-    return { id, block: { type: 'text', text }, stop: 'end_turn', usage }
+    return { id, blocks: [{ type: 'text', text }], stop: 'end_turn', usage }
   }
   const first = textOf(req.messages?.[0]?.content)
   const tools = (req.tools ?? []).map(t => t?.name)
@@ -172,22 +176,30 @@ function modelReply(req) {
     ]
   }
   const block = results.length < script.length ? script[results.length] : { type: 'text', text: 'ok' }
-  return { id, block, stop: block.type === 'tool_use' ? 'tool_use' : 'end_turn', usage }
+  // The main task's first reply says something before its call, and its last answers in two blocks: Claude Code logs a response for
+  // each reply with text, its blocks joined, which the rows built without Claude Code's must match.
+  const main = first.includes('E2E_MAINTASK') && script.length > 0
+  const blocks = main && results.length === 0 ? [{ type: 'text', text: 'Let me check.' }, block]
+    : main && results.length >= script.length ? [{ type: 'text', text: 'ok' }, { type: 'text', text: 'All steps ran.' }]
+    : [block]
+  return { id, blocks, stop: block.type === 'tool_use' ? 'tool_use' : 'end_turn', usage }
 }
 
 function sse(res, req) {
-  const { id, block, stop, usage } = modelReply(req)
+  const { id, blocks, stop, usage } = modelReply(req)
   res.writeHead(200, { 'content-type': 'text/event-stream', 'request-id': `req_e2e_${messageId}` })
   const send = (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify({ type: event, ...data })}\n\n`)
   send('message_start', { message: { id, type: 'message', role: 'assistant', model: req.model, content: [], stop_reason: null, stop_sequence: null, usage: { ...usage, output_tokens: 1 } } })
-  if (block.type === 'text') {
-    send('content_block_start', { index: 0, content_block: { type: 'text', text: '' } })
-    send('content_block_delta', { index: 0, delta: { type: 'text_delta', text: block.text } })
-  } else {
-    send('content_block_start', { index: 0, content_block: { ...block, input: {} } })
-    send('content_block_delta', { index: 0, delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input) } })
+  for (const [index, block] of blocks.entries()) {
+    if (block.type === 'text') {
+      send('content_block_start', { index, content_block: { type: 'text', text: '' } })
+      send('content_block_delta', { index, delta: { type: 'text_delta', text: block.text } })
+    } else {
+      send('content_block_start', { index, content_block: { ...block, input: {} } })
+      send('content_block_delta', { index, delta: { type: 'input_json_delta', partial_json: JSON.stringify(block.input) } })
+    }
+    send('content_block_stop', { index })
   }
-  send('content_block_stop', { index: 0 })
   send('message_delta', { delta: { stop_reason: stop, stop_sequence: null }, usage: { output_tokens: usage.output_tokens } })
   send('message_stop', {})
   res.end()
@@ -240,22 +252,19 @@ let overloaded = false
  * The test-only plugin that sends the plugin's requests to production's collector to the receiver (under `/prod`), built in a
  * temporary folder: its manifest lives only there, as this repository holds one plugin (scripts/check-layout.sh).
  */
-function redirectPlugin() {
-  const dir = mkdtempSync(join(tmpdir(), 'mainwave-e2e-redirect-'))
+function testPlugin(name, source, description) {
+  const dir = mkdtempSync(join(tmpdir(), `mainwave-e2e-${name}-`))
   mkdirSync(join(dir, '.claude-plugin'))
   mkdirSync(join(dir, 'hooks'))
-  writeFileSync(join(dir, '.claude-plugin', 'plugin.json'), JSON.stringify({
-    name: 'mainwave-e2e-redirect',
-    version: '0.0.0',
-    description: "Test only: sends the mainwave plugin's requests to Mainwave's production collector to the local receiver the end-to-end comparison runs.",
-  }))
+  writeFileSync(join(dir, '.claude-plugin', 'plugin.json'), JSON.stringify({ name: `mainwave-e2e-${name}`, version: '0.0.0', description }))
   writeFileSync(join(dir, 'hooks', 'hooks.json'), JSON.stringify({ modules: ['./register.ts'] }))
-  copyFileSync(join(here, 'redirect.ts'), join(dir, 'hooks', 'register.ts'))
+  copyFileSync(join(here, source), join(dir, 'hooks', 'register.ts'))
   return dir
 }
-const redirect = redirectPlugin()
+const redirect = testPlugin('redirect', 'redirect.ts', "Test only: sends the mainwave plugin's requests to Mainwave's production collector to the local receiver the end-to-end comparison runs.")
+const skip = testPlugin('skip', 'skip.ts', "Test only: keeps Claude Code's collector rows from the mainwave plugin, as Claude Code's security default does.")
 // Removed however the run ends: a session that throws, or an interrupt, leaves nothing behind.
-process.on('exit', () => rmSync(redirect, { recursive: true, force: true }))
+process.on('exit', () => [redirect, skip].forEach(d => rmSync(d, { recursive: true, force: true })))
 process.on('SIGINT', () => process.exit(130))
 
 const server = createServer(async (req, res) => {
@@ -272,9 +281,9 @@ const server = createServer(async (req, res) => {
     }
     await new Promise(r => setTimeout(r, 300 + ((messageId + 1) * 397) % 600))
     if (parsed.stream) return sse(res, parsed)
-    const { id, block, stop, usage } = modelReply(parsed)
+    const { id, blocks, stop, usage } = modelReply(parsed)
     res.writeHead(200, { 'content-type': 'application/json', 'request-id': `req_e2e_${messageId}` })
-    return res.end(JSON.stringify({ id, type: 'message', role: 'assistant', model: parsed.model, content: [block], stop_reason: stop, stop_sequence: null, usage }))
+    return res.end(JSON.stringify({ id, type: 'message', role: 'assistant', model: parsed.model, content: blocks, stop_reason: stop, stop_sequence: null, usage }))
   }
   // The settings API is asked beside the collector the copy goes to: production's without the env block, which answers the settings
   // the keyless pass checks; the receiver the person's settings name with it, which answers as the route off, so the explicit settings
@@ -313,9 +322,10 @@ const base = `http://127.0.0.1:${server.address().port}`
 
 /**
  * One session, its telemetry captured. `details` turns prompt and tool-detail logging on; `envBlock` false runs it without Mainwave's
- * env block, the plugin sending keyless; `auto` runs it in auto mode.
+ * env block, the plugin sending keyless; `auto` runs it in auto mode; `rowless` loads skip.ts ahead of the plugin, so no row of Claude
+ * Code's reaches it.
  */
-async function session(details, envBlock, auto) {
+async function session(details, envBlock, auto, rowless = false) {
   captured = { exporter: { logs: [], traces: [], metrics: [] }, plugin: { logs: [], traces: [], metrics: [] }, settings: [], other: [] }
   messageId = 0
   classified = { asked: 0, refused: 0 }
@@ -336,7 +346,9 @@ async function session(details, envBlock, auto) {
   // Code sends them with each set to 0, where the exporter is the reference for what a switch at 0 leaves.
   if (envBlock) {
     mkdirSync(dirname(storeFile(config)), { recursive: true })
-    writeFileSync(storeFile(config), JSON.stringify({ dataPoints: Object.fromEntries(CAPTURED_DATA_POINTS.map(id => [id, details ? 'on' : 'claude'])) }))
+    // In the rowless pass, the content Cowork's export never carries, on: the prompt, the response, the tool input and what it holds.
+    const content = rowless ? Object.fromEntries(ROWLESS_CONTENT.map(id => [id, 'on'])) : {}
+    writeFileSync(storeFile(config), JSON.stringify({ dataPoints: { ...Object.fromEntries(CAPTURED_DATA_POINTS.map(id => [id, details ? 'on' : 'claude'])), ...content } }))
   }
 
   const env = {
@@ -373,6 +385,8 @@ async function session(details, envBlock, auto) {
 
   const args = [
     '-p', 'E2E_MAINTASK: run the steps, then say ok.',
+    // Ahead of the plugin, so its hooks run first, as the security default's do.
+    ...(rowless ? ['--plugin-dir', skip] : []),
     '--plugin-dir', root,
     '--plugin-dir', redirect,
     '--allowedTools', 'Bash(echo e2e),Bash(echo sub),Bash(git -c user.name=e2e -c user.email=e2e@example.com commit:*),Bash(ls e2e-missing-file),Write,Edit,Agent',
@@ -819,6 +833,56 @@ function compare(pass, details, auto, { captured, run, work }) {
 }
 
 /**
+ * What is out of place in a set of spans the plugin built the trace of: each interaction a root of a trace of its own, the main loop's
+ * requests and calls its children, each call's decision and run the call's, and a subagent's requests and calls under its Agent call's
+ * run. Answers the problems found.
+ */
+function traceShape(spans) {
+  const out = []
+  const byId = new Map(spans.map(s => [s.spanId, s]))
+  const name = s => s.name.replace('claude_code.', '')
+  const parentOf = s => (s.parentSpanId ? byId.get(s.parentSpanId) : undefined)
+  const bad = new Map()
+  const note = (what, s) => bad.set(what, [...(bad.get(what) ?? []), `${name(s)} ${s.attrs.request_id?.v ?? s.attrs.tool_use_id?.v ?? s.spanId}`])
+  const callOf = new Map(spans.filter(s => s.name === 'claude_code.tool').map(s => [s.attrs.tool_use_id?.v, s]))
+  for (const s of spans) {
+    const parent = parentOf(s)
+    if (s.parentSpanId && !parent) note('a parent that was never sent', s)
+    if (parent && parent.traceId !== s.traceId) note("a trace other than its parent's", s)
+    switch (s.name) {
+      case 'claude_code.interaction':
+        if (s.parentSpanId) note('an interaction that is not a root', s)
+        break
+      case 'claude_code.llm_request': {
+        const agent = s.attrs.agent_id?.v
+        if (s.attrs['llm_request.context']?.v === 'standalone') {
+          if (s.parentSpanId) note('a standalone request with a parent', s)
+        } else if (agent === undefined ? parent?.name !== 'claude_code.interaction' : parent?.name !== 'claude_code.tool.execution' || callOf.get(parent.attrs.tool_use_id?.v)?.attrs.tool_name?.v !== 'Agent') {
+          note(agent === undefined ? 'a main-loop request not under an interaction' : "a subagent's request not under an Agent call's run", s)
+        }
+        break
+      }
+      case 'claude_code.tool': {
+        const agent = s.attrs.agent_id?.v
+        const ok = agent === undefined ? parent?.name === 'claude_code.interaction' : parent?.name === 'claude_code.tool.execution' && callOf.get(parent.attrs.tool_use_id?.v)?.attrs.tool_name?.v === 'Agent'
+        if (!ok) note(agent === undefined ? 'a main-loop call not under an interaction' : "a subagent's call not under an Agent call's run", s)
+        break
+      }
+      case 'claude_code.tool.blocked_on_user':
+      case 'claude_code.tool.execution':
+        if (parent?.name !== 'claude_code.tool') note('a decision or run not under its call', s)
+        break
+    }
+  }
+  for (const [what, list] of bad) out.push(`traces: ${what} (${list.length}, e.g. ${list[0]})`)
+  if (!spans.some(s => s.name === 'claude_code.llm_request' && s.attrs.agent_id !== undefined)) out.push("no subagent's request was sent")
+  if (!spans.some(s => s.name === 'claude_code.tool' && s.attrs.agent_id !== undefined)) out.push("no subagent's call was sent")
+  const interactions = spans.filter(s => s.name === 'claude_code.interaction')
+  if (new Set(interactions.map(s => s.traceId)).size !== interactions.length) out.push('two interactions share a trace')
+  return out
+}
+
+/**
  * The keyless pass: the exporter sent nothing, keyless ingest refused nothing, every signal arrived, and the spans make one coherent
  * trace per interaction, with as many spans of each kind as the exporter sent of the same session.
  */
@@ -864,47 +928,9 @@ function checkKeyless(pass, { captured, run, config }, reference) {
     if (w !== g) problems.push(`logs: ${ev} rows name ${g || 'nothing'}, where the exporter's named ${w || 'nothing'}`)
   }
   console.log(`  rows name: ${kinds(gotRows).join('; ')}`)
-  const byId = new Map(spans.map(s => [s.spanId, s]))
+  for (const p of traceShape(spans)) problems.push(p)
   const name = s => s.name.replace('claude_code.', '')
-  const parentOf = s => (s.parentSpanId ? byId.get(s.parentSpanId) : undefined)
-  const bad = new Map()
-  const note = (what, s) => bad.set(what, [...(bad.get(what) ?? []), `${name(s)} ${s.attrs.request_id?.v ?? s.attrs.tool_use_id?.v ?? s.spanId}`])
-  const callOf = new Map(spans.filter(s => s.name === 'claude_code.tool').map(s => [s.attrs.tool_use_id?.v, s]))
-  // The Agent call that started each subagent: the call whose run its first request names, if anything names it.
-  for (const s of spans) {
-    const parent = parentOf(s)
-    if (s.parentSpanId && !parent) note('a parent that was never sent', s)
-    if (parent && parent.traceId !== s.traceId) note("a trace other than its parent's", s)
-    switch (s.name) {
-      case 'claude_code.interaction':
-        if (s.parentSpanId) note('an interaction that is not a root', s)
-        break
-      case 'claude_code.llm_request': {
-        const agent = s.attrs.agent_id?.v
-        if (s.attrs['llm_request.context']?.v === 'standalone') {
-          if (s.parentSpanId) note('a standalone request with a parent', s)
-        } else if (agent === undefined ? parent?.name !== 'claude_code.interaction' : parent?.name !== 'claude_code.tool.execution' || callOf.get(parent.attrs.tool_use_id?.v)?.attrs.tool_name?.v !== 'Agent') {
-          note(agent === undefined ? 'a main-loop request not under an interaction' : "a subagent's request not under an Agent call's run", s)
-        }
-        break
-      }
-      case 'claude_code.tool': {
-        const agent = s.attrs.agent_id?.v
-        const ok = agent === undefined ? parent?.name === 'claude_code.interaction' : parent?.name === 'claude_code.tool.execution' && callOf.get(parent.attrs.tool_use_id?.v)?.attrs.tool_name?.v === 'Agent'
-        if (!ok) note(agent === undefined ? 'a main-loop call not under an interaction' : "a subagent's call not under an Agent call's run", s)
-        break
-      }
-      case 'claude_code.tool.blocked_on_user':
-      case 'claude_code.tool.execution':
-        if (parent?.name !== 'claude_code.tool') note('a decision or run not under its call', s)
-        break
-    }
-  }
-  for (const [what, list] of bad) problems.push(`traces: ${what} (${list.length}, e.g. ${list[0]})`)
-  if (!spans.some(s => s.name === 'claude_code.llm_request' && s.attrs.agent_id !== undefined)) problems.push("no subagent's request was sent")
-  if (!spans.some(s => s.name === 'claude_code.tool' && s.attrs.agent_id !== undefined)) problems.push("no subagent's call was sent")
   const interactions = spans.filter(s => s.name === 'claude_code.interaction')
-  if (new Set(interactions.map(s => s.traceId)).size !== interactions.length) problems.push('two interactions share a trace')
   const count = list => list.reduce((m, s) => m.set(name(s), (m.get(name(s)) ?? 0) + 1), new Map())
   const want = count(spansOf(reference.exporter.traces))
   const got = count(spans)
@@ -979,14 +1005,200 @@ function checkKeyless(pass, { captured, run, config }, reference) {
   for (let i = before; i < problems.length; i++) problems[i] = `${pass}: ${problems[i]}`
 }
 
-// The keyless pass is held to the second, which runs as it does: not in auto mode.
-const passes = [['captures on, auto mode', true, true, true], ['captures set to 0', false, true, false], ['no env block, sent keyless', false, false, false]]
+/** Claude Code's query sources of the main loop and of subagents: the requests a `turn.step` shows a plugin. */
+const stepSource = qs => typeof qs === 'string' && (qs.startsWith('repl_main_thread') || qs === 'sdk' || qs.startsWith('agent:') || qs === 'hook_agent')
+/** The plugin's own rows, which no row of Claude Code's is a copy of. */
+const OWN_ROWS = new Set([STATUS, 'mcp_server_configured', 'skill_prompt'])
+/** The rows the plugin builds from Claude Code's events where none reaches it (hooks/rowless.ts). */
+const BUILT_ROWS = ['user_prompt', 'api_request', 'assistant_response', 'tool_decision', 'tool_result']
+
+/**
+ * The rowless pass: skip.ts keeps every row of Claude Code's from the plugin, as the security default does (and from the exporter
+ * beneath it too, which the security default does not: the rows are counted against the reference pass's, the same scripted session).
+ * The plugin builds its rows from Claude Code's events: each says so, none is a copy of one of Claude Code's, keyless ingest refuses
+ * none, and they count what the exporter's count. As many prompts and requests, the requests' tokens to the token, their cost within a
+ * thousandth, and the calls that ran; the token and cost metrics as this session's exporter counts them; the spans in one coherent
+ * trace per interaction.
+ */
+function checkRowless(pass, { captured, run }, reference) {
+  const before = problems.length
+  if (run.code !== 0) problems.push(`claude exited ${run.code}:\n${run.out.slice(-2000)}`)
+  // A startup row comes before any plugin loads, skip.ts too.
+  for (const r of logRecordsOf(captured.exporter.logs)) if (!STARTUP.has(r.attributes['event.name']?.v)) problems.push(`a ${r.attributes['event.name']?.v} row went past skip.ts`)
+  for (const s of SIGNALS) {
+    if (s !== 'logs' && captured.exporter[s].length === 0) problems.push(`the exporter sent no ${s}`)
+    if (captured.plugin[s].length === 0) problems.push(`the plugin sent no ${s}`)
+    for (const p of captured.plugin[s]) if (p.status !== 200) problems.push(`keyless ingest refused a ${s} request (${p.status}): ${p.error}`)
+  }
+  const rows = checkStatus(logRecordsOf(captured.plugin.logs), ['rows_skipped', 'exporter_elsewhere'])
+  const theirs = logRecordsOf(reference.exporter.logs)
+  const ev = r => r.attributes['event.name']?.v
+  for (const r of rows) {
+    if (OWN_ROWS.has(ev(r))) continue
+    if (r.attributes['mainwave.telemetry.built_from']?.v !== 'events') problems.push(`logs: a ${ev(r)} row the plugin did not build: a row of Claude Code's reached it`)
+    if (!BUILT_ROWS.includes(ev(r))) problems.push(`logs: a ${ev(r)} row, which the plugin never builds`)
+    if (r.attributes['organization.id']?.v !== ORG || r.attributes['user.email']?.v !== EMAIL) problems.push(`logs: a ${ev(r)} row not under the session's organization and email`)
+  }
+  const ofEvent = (list, name) => list.filter(r => ev(r) === name)
+  const requests = { plugin: ofEvent(rows, 'api_request'), exporter: ofEvent(theirs, 'api_request').filter(r => stepSource(r.attributes.query_source?.v)) }
+  const sum = (list, key) => list.reduce((n, r) => n + Number(r.attributes[key]?.v ?? 0), 0)
+  for (const [what, n] of [['user_prompt', 'user_prompt'], ['api_request', 'api_request']]) {
+    const [got, want] = [ofEvent(rows, n).length, n === 'api_request' ? requests.exporter.length : ofEvent(theirs, n).length]
+    if (got !== want) problems.push(`logs: ${got} ${what} rows built, where the exporter sent ${want}`)
+  }
+  for (const key of ['input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_creation_tokens']) {
+    const [got, want] = [sum(requests.plugin, key), sum(requests.exporter, key)]
+    if (got !== want) problems.push(`logs: the built requests' ${key} sum to ${got}, the exporter's to ${want}`)
+  }
+  const [cost, costWant] = [sum(requests.plugin, 'cost_usd'), sum(requests.exporter, 'cost_usd')]
+  if (Math.abs(cost - costWant) > 0.001 * Math.max(costWant, 1e-6)) problems.push(`logs: the built requests cost ${cost}, the exporter's ${costWant}`)
+  // The calls that ran: Claude Code logs a result for each, and a refused call has its decision alone.
+  const decided = (list, d) => new Set(ofEvent(list, 'tool_decision').filter(r => r.attributes.decision?.v === d).map(r => r.attributes.tool_use_id?.v))
+  for (const d of ['accept', 'reject']) {
+    const [got, want] = [decided(rows, d), decided(theirs, d)]
+    if ([...want].some(id => !got.has(id)) || [...got].some(id => !want.has(id))) problems.push(`logs: the calls built as ${d}ed are ${[...got].sort().join(', ')}, the exporter's ${[...want].sort().join(', ')}`)
+  }
+  const ran = list => new Set(ofEvent(list, 'tool_result').map(r => r.attributes.tool_use_id?.v))
+  const [ranGot, ranWant] = [ran(rows), ran(theirs)]
+  for (const id of ranWant) if (!ranGot.has(id)) problems.push(`logs: no tool_result built for ${id}, which ran`)
+  for (const id of ranGot) if (!ranWant.has(id)) problems.push(`logs: a tool_result built for ${id}, which the exporter has none of`)
+  console.log(`  rows built: ${BUILT_ROWS.map(n => `${n} ${ofEvent(rows, n).length}`).join(', ')}; cost ${cost.toFixed(6)} (exporter ${costWant.toFixed(6)})`)
+  // The content the settings turn on goes on the built rows, from the plugin's own hooks: each prompt's text, each response's text
+  // (its length the row's), and each call's input. As many responses as Claude Code logs.
+  const responses = ofEvent(rows, 'assistant_response')
+  if (responses.length !== ofEvent(theirs, 'assistant_response').length) problems.push(`logs: ${responses.length} assistant_response rows built, where the exporter sent ${ofEvent(theirs, 'assistant_response').length}`)
+  // The first turn's prompt is the script's; a later turn's may be one Claude Code began itself (a background agent's notification).
+  const prompts = ofEvent(rows, 'user_prompt')
+  if (prompts[0]?.attributes.prompt?.v !== 'E2E_MAINTASK: run the steps, then say ok.') problems.push(`content: the first built prompt row carries ${JSON.stringify(prompts[0]?.attributes.prompt?.v)}, not the prompt`)
+  for (const r of prompts) {
+    const text = r.attributes.prompt?.v
+    if (typeof text !== 'string' || text === '<REDACTED>' || String(text.length) !== String(r.attributes.prompt_length?.v)) problems.push(`content: a built prompt row carries ${JSON.stringify(text)} for a prompt of ${r.attributes.prompt_length?.v} characters`)
+  }
+  for (const r of responses) {
+    const text = r.attributes.response?.v
+    if (typeof text !== 'string' || text === '<REDACTED>' || text.length !== Number(r.attributes.response_length?.v)) problems.push(`content: a built response row carries ${JSON.stringify(text)} for a response of ${r.attributes.response_length?.v} characters`)
+  }
+  for (const r of ofEvent(rows, 'tool_result')) if (typeof r.attributes.tool_input?.v !== 'string') problems.push(`content: the built tool_result row of ${r.attributes.tool_name?.v} carries no tool input`)
+  if (!ofEvent(rows, 'tool_result').some(r => String(r.attributes.tool_input?.v).includes('echo e2e'))) problems.push('content: no built tool_result row carries the Bash call\'s command')
+  // A call's output goes on its tool span, as with rows: the Bash call's, which printed `e2e`.
+  const outputs = spansOf(captured.plugin.traces).filter(s => s.name === 'claude_code.tool' && (s.events ?? []).some(e => e.name === 'tool.output'))
+  if (!outputs.some(s => s.attrs.tool_name?.v === 'Bash')) problems.push('content: no Bash tool span carries its tool.output event')
+  console.log(`  content built: ${ofEvent(rows, 'user_prompt').length} prompts, ${responses.length} responses, ${ofEvent(rows, 'tool_result').filter(r => r.attributes.tool_input !== undefined).length} tool inputs`)
+
+  const spans = spansOf(captured.plugin.traces)
+  for (const p of traceShape(spans)) problems.push(p)
+  for (const s of spans) if (!MARKER_SPANS.has(s.name) && s.attrs['mainwave.telemetry.built_from']?.v !== 'events') problems.push(`traces: a ${s.name} span that does not say it was built from events`)
+  const interactions = spans.filter(s => s.name === 'claude_code.interaction').length
+  const theirInteractions = spansOf(captured.exporter.traces).filter(s => s.name === 'claude_code.interaction').length
+  if (interactions !== theirInteractions) problems.push(`traces: ${interactions} interactions, where the exporter sent ${theirInteractions}`)
+  const llm = spans.filter(s => s.name === 'claude_code.llm_request').length
+  if (llm !== requests.exporter.length) problems.push(`traces: ${llm} llm_request spans, where the exporter logged ${requests.exporter.length} requests of the main loop and subagents`)
+
+  const points = pointsOf(captured.plugin.metrics)
+  const theirPoints = pointsOf(captured.exporter.metrics).filter(p => p.attrs.query_source?.v !== 'auxiliary')
+  const total = (list, name, type) => list.filter(p => p.name === name && (type === undefined || p.attrs.type?.v === type)).reduce((n, p) => n + p.value, 0)
+  for (const type of ['input', 'output', 'cacheRead', 'cacheCreation']) {
+    const [got, want] = [total(points, 'claude_code.token.usage', type), total(theirPoints, 'claude_code.token.usage', type)]
+    if (got !== want) problems.push(`metrics: token.usage ${type} sums to ${got}, the exporter's to ${want}`)
+  }
+  const [metricCost, metricCostWant] = [total(points, 'claude_code.cost.usage'), total(theirPoints, 'claude_code.cost.usage')]
+  if (Math.abs(metricCost - metricCostWant) > 0.001 * Math.max(metricCostWant, 1e-6)) problems.push(`metrics: cost.usage sums to ${metricCost}, the exporter's to ${metricCostWant}`)
+  for (const p of points) if (p.attrs['mainwave.telemetry.built_from']?.v !== 'events') problems.push(`metrics: a ${p.name} point that does not say it was built from events`)
+  console.log(`rowless: ${rows.length} rows, ${spans.length} spans in ${new Set(spans.map(s => s.traceId)).size} traces (${interactions} interactions), ${points.length} metric points`)
+  keysAdd(reference.plugin, { rows, spans, points })
+  for (let i = before; i < problems.length; i++) problems[i] = `${pass}: ${problems[i]}`
+}
+
+/**
+ * What the copy with Claude Code's rows has that the copy built without them lacks: the plugin's own output in the reference pass (the
+ * same scripted session, with rows) against the rowless pass's, field by field. Each event the plugin builds, paired call by call and
+ * request by request; each span by its kind; each metric series by its sum. A difference that is not a known one fails, so the README's
+ * list of what Claude Code's rows add stays true; the known ones are printed.
+ */
+const KEYS_ADD = {
+  rows: ['subagent_completed', 'retention_sweep', 'plugin_loaded'],
+  attributes: {
+    user_prompt: ['message.uuid'],
+    assistant_response: ['request_id', 'message.uuid'],
+    api_request: ['request_id', 'speed'],
+    tool_decision: ['permission_mode', 'request_id'],
+    tool_result: ['error_type', 'request_id'],
+    'claude_code.llm_request': ['gen_ai.response.id', 'request_id'],
+    // The error's text goes where the call's output does (`tool.result`, on in the rowless pass); its class never.
+    'claude_code.tool.execution': ['error', 'error_class'],
+  },
+}
+/** Values that differ between any two sessions (ids, times, sequences), or by a session's own paths; never compared. */
+const PER_SESSION = new Set(['session.id', 'prompt.id', 'user.id', 'agent_id', 'message.uuid', 'event.timestamp', 'event.sequence', 'duration_ms', 'ttft_ms', 'tool_result_size_bytes', 'tool_parameters', 'tool_input', 'cost_usd', 'mainwave.telemetry.built_from'])
+function keysAdd(withRows, built) {
+  const found = []
+  const rowsWith = checkStatusQuiet(logRecordsOf(withRows.logs))
+  const ev = r => r.attributes['event.name']?.v
+  for (const name of new Set(rowsWith.map(ev))) {
+    if (!BUILT_ROWS.includes(name) && !OWN_ROWS.has(name) && !STARTUP.has(name)) {
+      if (KEYS_ADD.rows.includes(name)) found.push(`the ${name} rows`)
+      else problems.push(`keys add: ${name} rows, which the known differences do not list`)
+    }
+  }
+  const pairKey = (name, r) => (name === 'tool_decision' || name === 'tool_result') ? r.attributes.tool_use_id?.v
+    : name === 'api_request' ? ['input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_creation_tokens'].map(k => r.attributes[k]?.v).join('/') : undefined
+  for (const name of BUILT_ROWS) {
+    const a = rowsWith.filter(r => ev(r) === name)
+    const b = built.rows.filter(r => ev(r) === name)
+    const keysA = new Set(a.flatMap(r => Object.keys(r.attributes)))
+    const keysB = new Set(b.flatMap(r => Object.keys(r.attributes)))
+    const known = KEYS_ADD.attributes[name] ?? []
+    for (const k of keysA) if (!keysB.has(k)) (known.includes(k) ? found.push(`${name}.${k}`) : problems.push(`keys add: ${name} rows lack ${k}, which the known differences do not list`))
+    for (const k of keysB) if (!keysA.has(k) && k !== 'mainwave.telemetry.built_from' && !CONTENT_KEYS.has(k)) problems.push(`keys add: built ${name} rows carry ${k}, which Claude Code's do not`)
+    const index = list => new Map(list.map((r, i) => [pairKey(name, r) ?? String(i), r]))
+    const [ia, ib] = [index(a), index(b)]
+    for (const [key, ra] of ia) {
+      const rb = ib.get(key)
+      if (!rb) {
+        problems.push(`keys add: no built ${name} row pairs with ${key}`)
+        continue
+      }
+      for (const [k, v] of Object.entries(ra.attributes)) {
+        if (PER_SESSION.has(k) || CONTENT_KEYS.has(k) || k.startsWith('mainwave.') || rb.attributes[k] === undefined) continue
+        if (!same(v, rb.attributes[k])) problems.push(`keys add: a built ${name} row's ${k} is ${JSON.stringify(rb.attributes[k].v)}, Claude Code's ${JSON.stringify(v.v)}`)
+      }
+    }
+  }
+  const spansWith = spansOf(withRows.traces)
+  for (const name of new Set(spansWith.map(s => s.name))) {
+    if (MARKER_SPANS.has(name)) continue
+    const keysA = new Set(spansWith.filter(s => s.name === name).flatMap(s => Object.keys(s.attrs)))
+    const keysB = new Set(built.spans.filter(s => s.name === name).flatMap(s => Object.keys(s.attrs)))
+    const known = KEYS_ADD.attributes[name] ?? []
+    for (const k of keysA) if (!keysB.has(k)) (known.includes(k) ? found.push(`${name.replace('claude_code.', '')} span ${k}`) : problems.push(`keys add: built ${name} spans lack ${k}, which the known differences do not list`))
+  }
+  const sums = list => list.reduce((m, p) => m.set(`${p.name} ${p.attrs.type?.v ?? ''}`, (m.get(`${p.name} ${p.attrs.type?.v ?? ''}`) ?? 0) + p.value), new Map())
+  const [sa, sb] = [sums(pointsOf(withRows.metrics)), sums(built.points)]
+  for (const key of new Set([...sa.keys(), ...sb.keys()])) {
+    // A turn's time is the plugin's clock in both, a few milliseconds apart; a cost, to the thousandth.
+    const tolerance = key.startsWith('claude_code.active_time') ? 0.25 : key.startsWith('claude_code.cost') ? 0.001 * (sa.get(key) ?? 0) : 0
+    if (Math.abs((sa.get(key) ?? 0) - (sb.get(key) ?? 0)) > tolerance + 1e-12) problems.push(`keys add: ${key} sums to ${sb.get(key) ?? 0} built, ${sa.get(key) ?? 0} with rows`)
+  }
+  console.log(`  what Claude Code's rows add over the rows built from events: ${found.join(', ') || 'nothing'}`)
+}
+
+/** The rows of a copy, less the plugin's status rows, without checking them. */
+const checkStatusQuiet = rows => rows.filter(r => r.attributes['event.name']?.v !== STATUS)
+
+// The keyless pass is held to the second, which runs as it does: not in auto mode. So is the rowless pass, with the env block so the
+// exporter's spans and metrics are there to count against; it runs from 2.1.328, where the security default first keeps rows from a
+// plugin.
+const passes = [
+  ['captures on, auto mode', true, true, true, false], ['captures set to 0', false, true, false, false], ['no env block, sent keyless', false, false, false, false],
+  ...(atLeast(CLAUDE_VERSION, '2.1.328') ? [['no row reaches the plugin, built from events', false, true, false, true]] : []),
+]
 const results = []
-for (const [pass, details, envBlock, auto] of passes) {
+for (const [pass, details, envBlock, auto, rowless] of passes) {
   console.log(`\n${pass}:`)
-  const result = await session(details, envBlock, auto)
+  const result = await session(details, envBlock, auto, rowless)
   results.push(result)
-  if (envBlock) compare(pass, details, auto, result)
+  if (rowless) checkRowless(pass, result, results[1].captured)
+  else if (envBlock) compare(pass, details, auto, result)
   else checkKeyless(pass, result, results[1].captured)
   // With the env block the rows name no email (only the organization, through OTEL_RESOURCE_ATTRIBUTES), so the plugin asks nothing
   // and the settings written in its store stand.
@@ -1020,4 +1232,4 @@ for (const { captured, run, config, work } of results) {
 }
 
 if (problems.length) process.exit(1)
-console.log('the copy matches the exporter, and without the env block it goes keyless in coherent traces')
+console.log('the copy matches the exporter, without the env block it goes keyless in coherent traces, and with no row it builds the rows from events')

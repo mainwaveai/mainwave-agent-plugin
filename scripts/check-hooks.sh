@@ -1,7 +1,8 @@
 #!/bin/sh
 # What the engine will load, as `claude plugin validate --json` reports it: the collector row hook, and the tool call, command, prompt
 # and spawn hooks, and the PostToolUse, UserPromptSubmit and StopFailure hooks the markers come from, each with its fail-open `.catch`;
-# the turn hooks the rebuilt spans need; the skill prompt hook; and session.end. A
+# the turn hooks the rebuilt spans need; the permission check the rows built without Claude Code's say a call was refused by, and the
+# session's measures their cost outside a request goes with; the skill prompt hook; and session.end. A
 # hook dropped, or a `.catch` removed, fails here: the unit tests call the hook bodies, not the registrations.
 set -eu
 cd "$(dirname "$0")/.."
@@ -14,7 +15,7 @@ process.stdin.on("data", d => (s += d)).on("end", () => {
   const gating = hooks.flatMap(c => c.gatingHooks ?? [])
   const fail = []
   if (!notes.some(n => /hooks: .*\btelemetry\.log\{to=collector\}/.test(n))) fail.push("no telemetry.log hook on the collector stream")
-  for (const h of ["session.end", "turn.start", "turn.step", "turn.complete", "skill.prompt"]) {
+  for (const h of ["session.end", "turn.start", "turn.step", "turn.complete", "tool.check", "session.measure", "skill.prompt"]) {
     if (!notes.some(n => new RegExp(`hooks: .*\\b${h.replace(".", "\\.")}\\b`).test(n))) fail.push(`no ${h} hook`)
   }
   for (const h of ["telemetry.log{to=collector}", "tool.call", "command.run", "prompt.submit", "agent.spawn", "classic.PostToolUse", "classic.UserPromptSubmit", "classic.StopFailure"]) {
@@ -22,5 +23,5 @@ process.stdin.on("data", d => (s += d)).on("end", () => {
     if (g === undefined || g.hasCatch !== true) fail.push(`the ${h} hook has no .catch`)
   }
   if (fail.length) { console.error("check-hooks: " + fail.join("; ")); process.exit(1) }
-  console.log("hooks: telemetry.log{to=collector}, tool.call, command.run, prompt.submit, agent.spawn, classic.PostToolUse, classic.UserPromptSubmit and classic.StopFailure with .catch; turn.start, turn.step, turn.complete, skill.prompt, session.end")
+  console.log("hooks: telemetry.log{to=collector}, tool.call, command.run, prompt.submit, agent.spawn, classic.PostToolUse, classic.UserPromptSubmit and classic.StopFailure with .catch; turn.start, turn.step, turn.complete, tool.check, session.measure, skill.prompt, session.end")
 })'

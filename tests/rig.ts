@@ -18,6 +18,8 @@ export const CONTRACT: Record<string, (v: unknown) => boolean> = {
   'mainwave.plugin.version': v => typeof v === 'string' && /^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$/.test(v),
   'mainwave.plugin.entrypoint': v => typeof v === 'string' && /^[a-z0-9_-]+$/.test(v),
   'mainwave.telemetry.route': v => v === 'exporter' || v === 'plugin',
+  // On the plugin's own copy only, where no row of Claude Code's reached the plugin: the record was built from Claude Code's events.
+  'mainwave.telemetry.built_from': v => v === 'events',
   // On the plugin's own copy only, where the protections replaced a secret or a redaction pack's match: how many.
   'mainwave.redaction.count': v => typeof v === 'number' && Number.isInteger(v) && v >= 1,
   // On the plugin's own copy only, where the person opted in to data points off by default: which, each once.
@@ -75,7 +77,7 @@ export const PROD_URL = `${PROD}/v1/logs`
 export const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{1,128}$/
 
 /** Hooks that stand for the engine: settings layers, the environment, and the collector, which records each row it receives. */
-export function boot(on: On, opts: { layers?: Layers; entrypoint?: string; env?: Record<string, string> } = {}): Rig & { envReads: string[] } {
+export function boot(on: On, opts: { layers?: Layers; entrypoint?: string; env?: Record<string, string>; version?: string } = {}): Rig & { envReads: string[] } {
   const rig: Rig & { envReads: string[] } = { rows: [], reads: [], envReads: [] }
   on('settings.read', async (_$, e) => {
     const source = String((e as { source?: string }).source)
@@ -89,7 +91,7 @@ export function boot(on: On, opts: { layers?: Layers; entrypoint?: string; env?:
     rig.envReads.push(name)
     return { value: name === 'CLAUDE_CODE_ENTRYPOINT' ? opts.entrypoint : opts.env?.[name] } as never
   })
-  on('session.version', async () => ({ value: { version: '2.1.322', base: '2.1.322' } }) as never)
+  on('session.version', async () => ({ value: { version: opts.version ?? '2.1.322', base: opts.version ?? '2.1.322' } }) as never)
   on('telemetry.log', async (_$, e) => {
     const row = e as unknown as { event: string; attributes: Record<string, unknown> }
     rig.rows.push({ event: row.event, attributes: { ...row.attributes } })

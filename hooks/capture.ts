@@ -144,6 +144,29 @@ export function streamChunk(c: Capture, agentId: unknown, chunk: unknown): void 
 
 const joined = (blocks: readonly (string | undefined)[], sep: string) => blocks.filter((b): b is string => b !== undefined).join(sep)
 
+/**
+ * The text a loop's request streamed, its blocks joined as Claude Code joins a response's (a newline), for a response row the plugin
+ * builds where none comes; undefined where it streamed none.
+ */
+export function streamedText(c: Capture, agentId: unknown): string | undefined {
+  const s = c.streams.get(loopKey(agentId))
+  const text = s ? joined(s.text, '\n') : ''
+  return text === '' ? undefined : text
+}
+
+/** The text a loop's request answered with, in place of its streamed pieces: what a response row of its length is filled with. */
+export function setStreamedText(c: Capture, agentId: unknown, text: string): void {
+  const s = c.streams.get(loopKey(agentId)) ?? { text: [], thinking: [] }
+  s.text = [text]
+  c.streams.set(loopKey(agentId), s)
+}
+
+/** The text a loop's request streamed is let go, once a row has carried it: a row that comes later fills nothing from it. */
+export function dropStreamedText(c: Capture, agentId: unknown): void {
+  const s = c.streams.get(loopKey(agentId))
+  if (s) s.text = []
+}
+
 /** The thinking a loop's request streamed, if any. */
 export function streamedThinking(c: Capture, agentId: unknown): string | undefined {
   const s = c.streams.get(loopKey(agentId))
