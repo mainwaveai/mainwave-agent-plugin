@@ -11,14 +11,19 @@
 // Two data points no Claude Code row carries come in rows the plugin makes itself, each sent only while its data point is on: the MCP
 // servers set up for the session (`mcp.url`, read from Claude's MCP settings at session start, and named when a call first names a
 // server not read there), and each skill's text as the engine expands it for the model (`skill.text`, the `skill.prompt` hook). Such a
-// row waits for the session's identity, which only Claude Code's rows carry.
+// row waits for the session's identity, which Claude Code's rows carry.
+//
+// A third says what the plugin found wrong with the session's telemetry setup (`plugin_status`, setup.ts): one per session as its first
+// turn ends, and again when that changes. When no row of Claude Code's reaches the plugin by then (a built-in plugin that runs first can
+// send them on past it), the plugin's own rows and its markers go under the identity in Claude's account file instead, until a row
+// names one.
 
 import { atom, update } from 'claude-code'
 import type { CatchHandler, EngineInterface, Frozen, Hook, Next, Register, StreamHook, TelemetryAttribute, TelemetryLogResult, TelemetryRecordEntry, Timer } from 'claude-code'
 
 import type { RowIdentity } from '../types'
 import { capturePrompt, captureTool, newCapture, rowFill, streamChunk, streamedThinking, streamStart, type Capture } from './capture.ts'
-import { MCP_SERVER_ROW, SKILL_PROMPT_ROW, type Switch } from './catalog.ts'
+import { MCP_SERVER_ROW, PLUGIN_STATUS_ROW, SKILL_PROMPT_ROW, type Switch } from './catalog.ts'
 import { mcpParts } from './derive.ts'
 import { allows, configureGate, currentGate, gateAttributes, gateMarker, gateRow, gateSpan, metricAllowed, resetPacks, setOptIn, setOverrides } from './gate.ts'
 import { classifyGlab, glabConfigDir, glabHosts, glabTexts, instanceOf, mrAttributes, mrFromApi, mrLookup, mrUrlOf, parseMrJson, repositoryIdOf, sameUrl, stripDraft, type MrDetails, type MrRef } from './glab.ts'
@@ -34,15 +39,16 @@ import type { BuiltSpan, CopiedRow } from './otlp.ts'
 import {
   agentSpawned, callerCtx, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild,
 } from './rebuild.ts'
-import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsSummary } from './orgsettings.ts'
+import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsSummary, settingsUnavailable } from './orgsettings.ts'
 import { contentLimit } from './protect.ts'
 import { adopt, collectorMalformed, collectorOf, configure, enqueue, ensureTimer, finish, isCopying, readOptions, snapshot } from './sender.ts'
 import {
   approvalsOf, approved, permitted, DESKTOP_UNDER_APPDATA, DESKTOP_UNDER_HOME, distinct, enabledPlugins, fileServers, foldersUp, globalServers, join, managedDirs, manifestServerFiles, MAX_PLUGINS, parse,
   pluginServers, projectEntry, serverAttributes, toolSpelling, type Approvals, type McpServer,
 } from './servers.ts'
+import { accountIdentityOf, exporterOf, issuesOf, signedInElsewhere, type ExporterEnv, type SignInEnv } from './setup.ts'
 import { snapshotOfText } from './snapshot.ts'
-import { applyStamps, entrypointOf, filterStamps, PLUGIN_NAME, stripOwned } from './stamps.ts'
+import { applyStamps, entrypointOf, filterStamps, issuesStamp, PLUGIN_NAME, stripOwned, type IssueCode } from './stamps.ts'
 import { VERSION } from './version.ts'
 
 export { VERSION }
@@ -112,13 +118,33 @@ let argsInFlight = 0
 let pendingArgs = new Map<string, number[]>()
 let recentArgs: { text: string; atMs: number }[] = []
 
-/** One of the plugin's own rows; `text`, for a skill's row, the text it carries, marked sent once the row is queued. */
-type OwnRow = { event: string; atMs: number; attributes: Record<string, TelemetryAttribute>; text?: string }
+/** Whether a row of Claude Code's has reached the plugin this load. */
+let rowSeen = false
+/** The session's identity from Claude's account file, read once; and in use, once a turn ended with no row of Claude Code's seen. */
+let account: Promise<Record<string, string>> | null = null
+let accountCommon: Record<string, string> | undefined
+/** The session's status: when its first main-loop turn ended, the codes last queued, how many rows, the check waiting for rows. */
+let firstTurnAtMs: number | undefined
+let lastIssues: string | undefined
+let statusRows = 0
+let statusTimer: Timer | null = null
+/** When this load's first model request ended: each one raises a row, so none seen past the grace means rows don't reach the plugin. */
+let firstStepAtMs: number | undefined
+/** Counts the status's resets: a check that began before a /clear queues nothing for the session after it. */
+let statusEpoch = 0
+
+/**
+ * One of the plugin's own rows; `text`, for a skill's row, the text it carries, marked sent once the row is queued; `issues`, for the
+ * status row, its codes, stamped as it is queued.
+ */
+type OwnRow = { event: string; atMs: number; attributes: Record<string, TelemetryAttribute>; text?: string; issues?: readonly IssueCode[] }
 /** A marker (markers.ts), waiting for the session's identity like an own row; `account`, a snapshot's, sent only for the session's. */
 type OwnMarker = { kind: MarkerKind; name: string; atMs: number; attributes: Record<string, TelemetryAttribute>; account?: string; session?: TelemetryAttribute }
 /** The markers waiting for the session's identity; and, once read for this load, the kinds whose markers the CLI's hooks send. */
 let markers: OwnMarker[] = []
 let cliKinds: Promise<ReadonlySet<MarkerKind>> | null = null
+/** The kinds whose CLI hook runs with its script on this machine, key or not: read once per load, for the status's code too. */
+let cliHooks: Promise<ReadonlySet<MarkerKind>> | null = null
 /** The marker work under way, beside the calls and prompts it came from: the session's end waits a little for it. */
 let making = new Set<Promise<void>>()
 
@@ -128,6 +154,9 @@ const MAX_SKILL_TEXTS = 200
 const ARGS_MS = 60_000
 const MAX_ARGS = 20
 const MAX_PENDING = 50
+/** How long after the first turn's end rows may still come before the plugin counts them as not reaching it; status rows at most. */
+export const STATUS_GRACE_MS = 5_000
+const MAX_STATUS_ROWS = 10
 /** How long a run given arguments waits to expand: a queued prompt waits for the turn before it. */
 const PENDING_MS = 30 * 60_000
 
@@ -331,8 +360,10 @@ async function collectNow($: EngineInterface): Promise<void> {
 async function flushOwn($: EngineInterface): Promise<void> {
   if ((own.length === 0 && markers.length === 0) || !isCopying()) return
   const r = await rebuildOf($)
-  if (r === null || Object.keys(r.common).length === 0) return
-  if (endedSession !== undefined && r.common['session.id'] === endedSession) return
+  if (r === null) return
+  const common = Object.keys(r.common).length > 0 ? r.common : await accountCommonOf($)
+  if (common === undefined) return
+  if (endedSession !== undefined && common['session.id'] === endedSession) return
   endedSession = undefined
   // This session's sets: a /clear while a row is being queued starts new ones, which the old session's texts stay out of.
   const sent = textsSent
@@ -342,9 +373,12 @@ async function flushOwn($: EngineInterface): Promise<void> {
   const ep = await entrypoint
   for (let o = own.shift(); o !== undefined; o = own.shift()) {
     const at = new Date(o.atMs).toISOString()
-    const attributes = applyStamps({ ...r.common, 'event.name': o.event, 'event.timestamp': at, ...o.attributes }, {
-      'mainwave.plugin.name': PLUGIN_NAME, 'mainwave.plugin.version': VERSION, 'mainwave.plugin.entrypoint': ep, 'mainwave.telemetry.route': 'plugin',
-    })
+    const attributes = {
+      ...applyStamps({ ...common, 'event.name': o.event, 'event.timestamp': at, ...o.attributes }, {
+        'mainwave.plugin.name': PLUGIN_NAME, 'mainwave.plugin.version': VERSION, 'mainwave.plugin.entrypoint': ep, 'mainwave.telemetry.route': 'plugin',
+      }),
+      ...issuesStamp(o.issues ?? []),
+    }
     const row = gateRow(gate, { event: o.event, loggedAt: at, attributes })
     try {
       // A text counts as sent once a row carrying it is queued; one held back or not queued is carried by the next run of it.
@@ -355,11 +389,165 @@ async function flushOwn($: EngineInterface): Promise<void> {
   }
   for (let m = markers.shift(); m !== undefined; m = markers.shift()) {
     try {
-      await sendMarker($, r.common, m, ep)
+      await sendMarker($, common, m, ep)
     } catch {
       // That marker is lost to the copy alone.
     }
   }
+}
+
+/** The session's id as the engine gives it; undefined when it can't be read. */
+async function sessionIdOf($: EngineInterface): Promise<string | undefined> {
+  try {
+    const id = await $.session.id()
+    return typeof id === 'string' && id !== '' ? id : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/** What the plugin's own rows carry while no row of Claude Code's names the session: the account file's identity and the session's id. */
+async function accountCommonOf($: EngineInterface): Promise<Record<string, string> | undefined> {
+  if (accountCommon === undefined) return undefined
+  const id = await sessionIdOf($)
+  return { ...accountCommon, ...(id !== undefined ? { 'session.id': id } : {}) }
+}
+
+/** Claude's account file: `.claude.json` in `CLAUDE_CONFIG_DIR`, else the home folder, as Claude Code keeps it; undefined when there is none. */
+async function readAccountFile($: EngineInterface): Promise<unknown> {
+  const [home, profile, configDir] = await Promise.all([settle($.env.get('HOME')), settle($.env.get('USERPROFILE')), settle($.env.get('CLAUDE_CONFIG_DIR'))])
+  const base = configDir || home || profile || undefined
+  return base === undefined ? undefined : parse(await readText($, join(base, '.claude.json')))
+}
+
+/**
+ * No row of Claude Code's reached the plugin by a turn's end: its own rows go under the identity in Claude's account file, and the
+ * organization's settings are asked for with it. A row that names the session later takes over (`stampRow`).
+ */
+async function adoptAccount($: EngineInterface): Promise<void> {
+  // A session signed in another way: the account file's login may be someone else's.
+  const [signIn, settings] = await Promise.all([readSignInEnv($), mergedSettings($)])
+  if (signedInElsewhere(signIn, settings)) return
+  account ??= readAccountFile($).then(accountIdentityOf, () => ({}))
+  const who = await account
+  if (rowSeen || who['organization.id'] === undefined || who['user.email'] === undefined) return
+  accountCommon = who
+  try {
+    await noteSessionIdentity($, { organizationId: who['organization.id'], email: who['user.email'] }, isCopying)
+  } catch {
+    // The settings in force stand.
+  }
+}
+
+/** The variables that sign a session in another way than the account file's login, each spelled out. */
+async function readSignInEnv($: EngineInterface): Promise<SignInEnv> {
+  const [apiKey, authToken, oauthToken, oauthFd, refresh, apiKeyFd, gateway, gatewayFd, bedrock, vertex, foundry] = await Promise.all([
+    settle($.env.get('ANTHROPIC_API_KEY')),
+    settle($.env.get('ANTHROPIC_AUTH_TOKEN')),
+    settle($.env.get('CLAUDE_CODE_OAUTH_TOKEN')),
+    settle($.env.get('CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR')),
+    settle($.env.get('CLAUDE_CODE_OAUTH_REFRESH_TOKEN')),
+    settle($.env.get('CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR')),
+    settle($.env.get('CLAUDE_CODE_GATEWAY_TOKEN')),
+    settle($.env.get('CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR')),
+    settle($.env.get('CLAUDE_CODE_USE_BEDROCK')),
+    settle($.env.get('CLAUDE_CODE_USE_VERTEX')),
+    settle($.env.get('CLAUDE_CODE_USE_FOUNDRY')),
+  ])
+  return {
+    ANTHROPIC_API_KEY: apiKey, ANTHROPIC_AUTH_TOKEN: authToken, CLAUDE_CODE_OAUTH_TOKEN: oauthToken, CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR: oauthFd,
+    CLAUDE_CODE_OAUTH_REFRESH_TOKEN: refresh, CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR: apiKeyFd, CLAUDE_CODE_GATEWAY_TOKEN: gateway,
+    CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR: gatewayFd, CLAUDE_CODE_USE_BEDROCK: bedrock, CLAUDE_CODE_USE_VERTEX: vertex, CLAUDE_CODE_USE_FOUNDRY: foundry,
+  }
+}
+
+/** The exporter's variables, each spelled out: the engine lists the variables a module reads from its calls. */
+async function readExporterEnv($: EngineInterface): Promise<ExporterEnv> {
+  const [on, endpoint, logs, metrics, traces, headers, logsHeaders, metricsHeaders, tracesHeaders] = await Promise.all([
+    settle($.env.get('CLAUDE_CODE_ENABLE_TELEMETRY')),
+    settle($.env.get('OTEL_EXPORTER_OTLP_ENDPOINT')),
+    settle($.env.get('OTEL_EXPORTER_OTLP_LOGS_ENDPOINT')),
+    settle($.env.get('OTEL_EXPORTER_OTLP_METRICS_ENDPOINT')),
+    settle($.env.get('OTEL_EXPORTER_OTLP_TRACES_ENDPOINT')),
+    settle($.env.get('OTEL_EXPORTER_OTLP_HEADERS')),
+    settle($.env.get('OTEL_EXPORTER_OTLP_LOGS_HEADERS')),
+    settle($.env.get('OTEL_EXPORTER_OTLP_METRICS_HEADERS')),
+    settle($.env.get('OTEL_EXPORTER_OTLP_TRACES_HEADERS')),
+  ])
+  return {
+    CLAUDE_CODE_ENABLE_TELEMETRY: on, OTEL_EXPORTER_OTLP_ENDPOINT: endpoint, OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: logs, OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: metrics,
+    OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: traces, OTEL_EXPORTER_OTLP_HEADERS: headers, OTEL_EXPORTER_OTLP_LOGS_HEADERS: logsHeaders,
+    OTEL_EXPORTER_OTLP_METRICS_HEADERS: metricsHeaders, OTEL_EXPORTER_OTLP_TRACES_HEADERS: tracesHeaders,
+  }
+}
+
+/**
+ * What is wrong with the session's telemetry setup now (setup.ts). `graceElapsed`: rows had their time to come (the grace's timer, the
+ * session's end). The environment is read each time: an env block in managed settings can arrive after the first turn.
+ */
+async function setupIssues($: EngineInterface, graceElapsed: boolean): Promise<IssueCode[]> {
+  const gate = await gateOf($)
+  const [settings, env, now, cli] = await Promise.all([mergedSettings($), readExporterEnv($), $.clock.now(), cliHooksOf($)])
+  // Only once a model request has ended: a turn that asks no model (a local command) raises no row.
+  const rowsSkipped = !rowSeen && firstStepAtMs !== undefined && (graceElapsed || now - firstStepAtMs >= STATUS_GRACE_MS)
+  return issuesOf({
+    rowsSkipped,
+    cliHooks: cli.size > 0,
+    cliKeyed: cliCanSend(env.OTEL_EXPORTER_OTLP_ENDPOINT, env.OTEL_EXPORTER_OTLP_HEADERS, settings['otelHeadersHelper']),
+    exporter: exporterOf(env, settings),
+    settingsUnavailable: settingsUnavailable(),
+    redactionHeld: 'held' in gate.redaction ? gate.redaction.held : undefined,
+    dropped: snapshot().dropped,
+  })
+}
+
+/**
+ * Queues the status row, once the session's first main-loop turn has ended: the first time whatever it says, then only when what it
+ * says changed, `MAX_STATUS_ROWS` at most.
+ */
+async function checkStatus($: EngineInterface, graceElapsed = false): Promise<void> {
+  if (!isCopying() || firstTurnAtMs === undefined) return
+  // Neither a row nor a model request yet: nothing is known of whether rows reach the plugin, and nothing names the session.
+  if (!rowSeen && firstStepAtMs === undefined) return
+  const epoch = statusEpoch
+  const issues = await setupIssues($, graceElapsed)
+  if (issues.includes('rows_skipped') && accountCommon === undefined) await adoptAccount($)
+  // A /clear or a resume while this ran: what it found is the ended session's, and the next one checks for itself.
+  if (epoch !== statusEpoch) return
+  const key = issues.join(',')
+  if (key === lastIssues || statusRows >= MAX_STATUS_ROWS) return
+  lastIssues = key
+  statusRows += 1
+  await queueOwn($, [{ event: PLUGIN_STATUS_ROW, atMs: await $.clock.now(), attributes: {}, issues }])
+}
+
+/**
+ * A main-loop turn ended: the status is checked. While no row has been seen and the first model request ended less than
+ * `STATUS_GRACE_MS` ago, the first check waits for the grace to pass, as a row can trail its request.
+ */
+async function statusAtTurnEnd($: EngineInterface): Promise<void> {
+  if (!isCopying()) return
+  const now = await $.clock.now()
+  firstTurnAtMs ??= now
+  if (!rowSeen && lastIssues === undefined && firstStepAtMs !== undefined && now - firstStepAtMs < STATUS_GRACE_MS) {
+    // The grace has passed when this runs, whatever the clock reads: a timer can fire a millisecond early.
+    statusTimer ??= $.clock.after(firstStepAtMs + STATUS_GRACE_MS - now, () => {
+      statusTimer = null
+      void checkStatus($, true).catch(() => undefined)
+    })
+    return
+  }
+  await checkStatus($)
+}
+
+/** The status starts over, for a new session or a new load. */
+function resetStatus(): void {
+  statusEpoch += 1
+  statusTimer?.cancel()
+  statusTimer = null
+  firstTurnAtMs = undefined
+  lastIssues = undefined
+  statusRows = 0
 }
 
 /** Adds the plugin's own rows to those waiting, and queues them if the session's identity is known. */
@@ -564,9 +752,21 @@ const isRecord = (v: unknown): v is Record<string, unknown> => v !== null && typ
 async function cliKindsOf($: EngineInterface): Promise<ReadonlySet<MarkerKind>> {
   cliKinds ??= (async () => {
     const settings = await mergedSettings($)
-    const [endpoint, headers, home] = await Promise.all([settle($.env.get('OTEL_EXPORTER_OTLP_ENDPOINT')), settle($.env.get('OTEL_EXPORTER_OTLP_HEADERS')), settle($.env.get('HOME'))])
+    const [endpoint, headers] = await Promise.all([settle($.env.get('OTEL_EXPORTER_OTLP_ENDPOINT')), settle($.env.get('OTEL_EXPORTER_OTLP_HEADERS'))])
+    if (!cliCanSend(endpoint, headers, settings['otelHeadersHelper'])) return new Set<MarkerKind>()
+    return cliHooksOf($)
+  })().catch(() => new Set<MarkerKind>())
+  return cliKinds
+}
+
+/**
+ * The kinds of marker whose CLI hook the merged settings run with its script on this machine, read once per load, whether or not the
+ * CLI has a key to send with: those its hooks would send. Where the CLI was never installed its hook command does nothing.
+ */
+async function cliHooksOf($: EngineInterface): Promise<ReadonlySet<MarkerKind>> {
+  cliHooks ??= (async () => {
+    const [settings, home] = await Promise.all([mergedSettings($), settle($.env.get('HOME'))])
     const out = new Set<MarkerKind>()
-    if (!cliCanSend(endpoint, headers, settings['otelHeadersHelper'])) return out
     const there = new Map<string, Promise<boolean>>()
     for (const [kind, scripts] of cliHookKinds(settings, home || undefined)) {
       for (const script of scripts) {
@@ -579,7 +779,7 @@ async function cliKindsOf($: EngineInterface): Promise<ReadonlySet<MarkerKind>> 
     }
     return out
   })().catch(() => new Set<MarkerKind>())
-  return cliKinds
+  return cliHooks
 }
 
 /**
@@ -829,7 +1029,10 @@ async function nextSession($: EngineInterface): Promise<void> {
   await serversRead
   await flushOwn($)
   const r = await rebuildOf($)
-  endedSession = r?.common['session.id']
+  endedSession = r !== null && Object.keys(r.common).length > 0 ? r.common['session.id'] : (await accountCommonOf($))?.['session.id']
+  // A status row that could not go under the ended session's identity says nothing of the next: it is let go.
+  own = own.filter(o => o.event !== PLUGIN_STATUS_ROW)
+  resetStatus()
   textIds = new Map()
   textsSent = new Set()
   textsWaiting = new Set()
@@ -855,6 +1058,9 @@ async function observe($: EngineInterface, e: Frozen<TelemetryRecordEntry>): Pro
  * exporter, and the copy, where the plugin copies at all, is queued with route `plugin`.
  */
 export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams[2]): Promise<TelemetryLogResult> {
+  // Rows reach the plugin: what they say of the session stands, not the account file's.
+  rowSeen = true
+  accountCommon = undefined
   let attributes: Record<string, TelemetryAttribute>
   if (isOrgId(e.attributes['organization.id'])) {
     entrypoint ??= readEntrypoint($)
@@ -973,6 +1179,8 @@ export async function turnCompleteHook($: TurnCompleteParams[0], e: TurnComplete
   }
   const result = await next(e)
   if (out !== null) await emit($, out).catch(() => undefined)
+  // The setup's status, as a main-loop turn ends: beside the turn, never holding it.
+  if ((e as { agentId?: string }).agentId === undefined) void statusAtTurnEnd($).catch(() => undefined)
   return result
 }
 
@@ -1020,6 +1228,11 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
   // A stream closed early (interrupted, or no longer read) leaves here and sends nothing: its row, if one comes, goes alone.
   const stream = r === null ? next(e) : watched(next(e), chunk => streamChunk(capture, e.agentId, chunk))
   const result = yield* stream
+  try {
+    firstStepAtMs ??= await $.clock.now()
+  } catch {
+    // The next request's end counts instead.
+  }
   if (r !== null) {
     try {
       await emit($, stepEnd(r, e.agentId, startMs, result, await $.clock.now(), streamedThinking(capture, e.agentId)))
@@ -1192,6 +1405,10 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
       await readOverrides($)
       await markersMade($)
       await sweepNow($, true)
+      // The setup's status as the session ends, rows given their time: queued with the own rows below.
+      statusTimer?.cancel()
+      statusTimer = null
+      await checkStatus($, true).catch(() => undefined)
       // The plugin's own rows still waiting go under the session's identity, those of the settings read beside its start too.
       await serversRead
       await flushOwn($).catch(() => undefined)
@@ -1208,7 +1425,8 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
       const s = snapshot()
       const refusals = s.refusedIdentities > 0 ? `, ${s.refusedIdentities} organization and email refused` : ''
       const stopped = s.stopped ? ', refused: nothing more sent or queued this session' : ''
-      $.ui.log(`mainwave: copy to ${collectorOf()} (keyless): ${s.sent} sent, ${s.dropped} dropped, ${s.queued} kept for a later session, ${s.withheld} held back (no organization and email)${refusals}${stopped}; data collection settings: ${settingsSummary()}`, { to: 'debug' })
+      const status = lastIssues === undefined ? '' : `; setup: ${lastIssues === '' ? 'no issues' : lastIssues}${accountCommon !== undefined ? ' (identity from the account file)' : ''}`
+      $.ui.log(`mainwave: copy to ${collectorOf()} (keyless): ${s.sent} sent, ${s.dropped} dropped, ${s.queued} kept for a later session, ${s.withheld} held back (no organization and email)${refusals}${stopped}; data collection settings: ${settingsSummary()}${status}`, { to: 'debug' })
     }
   } catch {
     // What could not be kept is lost to the copy alone: the exporter's rows went on.
@@ -1248,7 +1466,13 @@ export const register: Register = on => {
   recentArgs = []
   markers = []
   cliKinds = null
+  cliHooks = null
   making = new Set()
+  rowSeen = false
+  firstStepAtMs = undefined
+  account = null
+  accountCommon = undefined
+  resetStatus()
   configure()
 
   on('session.start', sessionStart)

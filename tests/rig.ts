@@ -27,8 +27,19 @@ export const CONTRACT: Record<string, (v: unknown) => boolean> = {
   'mainwave.command.counted': v => v === 1,
   ...Object.fromEntries(['commits', 'reverts', 'pushes', 'prs_opened', 'prs_merged', 'prs_updated', 'merges', 'tags', 'workflow_runs'].map(c => [`mainwave.command.${c}`, (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 65_535])),
   'mainwave.command.branches_opened': v => v === 1,
+  // On the plugin's own status row alone: what it found wrong with the session's telemetry setup, each code once, in this order.
+  'mainwave.telemetry.issues': v => {
+    if (!Array.isArray(v) || v.length === 0) return false
+    const at = v.map(c => ISSUE_CODES.indexOf(c as string))
+    return at.every((i, n) => i >= 0 && (n === 0 || i > at[n - 1]!))
+  },
   ...Object.fromEntries(['branch_opened', 'push_ref', 'merge_ref', 'tag_name'].map(r => [`mainwave.command.${r}`, (v: unknown) => typeof v === 'string' && /^\S{1,256}$/.test(v)])),
 }
+/** The codes of the plugin's status row, in the order it lists them. */
+export const ISSUE_CODES = [
+  'rows_skipped', 'cli_hooks_no_exporter', 'exporter_no_endpoint', 'exporter_no_key', 'exporter_elsewhere', 'settings_unavailable',
+  'redaction_unreadable', 'redaction_unknown_pack', 'copy_dropped',
+]
 /** The data points a person may opt in to: those off by default, every identifier and every piece of content. */
 export const OPT_IN_IDS = ['repo', 'file.path', 'web.url', 'work.item', 'mcp.url', 'bash.command', 'change.title', 'tool.input', 'tool.result', 'skill.text', 'prompt.text', 'response.text', 'response.thinking']
 /**

@@ -335,5 +335,15 @@ export function settingsSummary(): string {
   return `not answered yet, the store's or the defaults apply${tried}`
 }
 
+/**
+ * Whether the organization's settings were asked for and can't be had: no answer this load, and the last request timed out, failed,
+ * was answered with something not settings, or refused for now (429, a 5xx). The defaults, or the store's, apply. A 403 (the
+ * organization not claimed) and a 404 (the route off) say what Mainwave already knows, and a request not made yet says nothing.
+ */
+export function settingsUnavailable(): boolean {
+  if (org === undefined || email === undefined || (fetched !== undefined && fetched.org === org) || last === undefined) return false
+  return last === 'timeout' || last === 'failed' || last === 'invalid' || last === '429' || /^5\d\d$/.test(last)
+}
+
 /** For tests: what this load holds. */
 export const orgSettingsState = () => ({ org, fetched, last, wait, scheduled: timer !== null })
