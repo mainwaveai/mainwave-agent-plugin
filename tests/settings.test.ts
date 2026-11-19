@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from 'claude-code/testing'
 
-import { collectorUrlOf, namesOption, optionValues, type Layer } from '../hooks/settings.ts'
+import { collectorIn, collectorUrlOf, namesOption, optionValues, PROD_COLLECTOR, type Layer } from '../hooks/settings.ts'
 
 const cfg = (entries: Record<string, unknown>): Layer => ({ pluginConfigs: entries })
 const opt = (value: unknown) => ({ options: { collectorUrl: value } })
@@ -67,4 +67,20 @@ describe('optionValues', () => {
     ['a value of any type, as it is', cfg({ 'mainwave@synced': ids(42) }), [42]],
   ]
   for (const [name, layer, want] of cases) test(name, () => expect(optionValues(layer, 'extraDataPoints')).toEqual(want))
+})
+
+describe('collectorIn', () => {
+  const url = (v: unknown, id = 'mainwave@synced') => ({ [id]: { options: { collectorUrl: v } } })
+  const cases: [string, Layer, string][] = [
+    ['nothing set: production', {}, PROD_COLLECTOR],
+    ['an empty value: production', cfg(url('  ')), PROD_COLLECTOR],
+    ['a null value: production', cfg(url(null)), PROD_COLLECTOR],
+    ['a collector of the right shape', cfg(url('https://collector.example.com/')), 'https://collector.example.com'],
+    ['the same collector under two ids, written two ways', cfg({ ...url('https://collector.example.com'), ...url('https://COLLECTOR.example.com/', 'mainwave') }), 'https://collector.example.com'],
+    ['two ids naming different collectors', cfg({ ...url('https://a.example.com'), ...url('https://b.example.com', 'mainwave') }), 'malformed'],
+    ['a value of the wrong shape', cfg(url('http://collector.example.com')), 'malformed'],
+    ['a value of the wrong type', cfg(url(42)), 'malformed'],
+    ['a layer that cannot be read', 'unreadable', 'unreadable'],
+  ]
+  for (const [name, layer, want] of cases) test(name, () => expect(collectorIn(layer)).toBe(want))
 })

@@ -47,13 +47,8 @@ import { fetchWithin, type FetchOutcome } from './http.ts'
 import { applyStoredSettings } from './orgsettings.ts'
 import { logsBody, metricsBody, resourceOf, tracesBody, type BuiltSpan, type CopiedRow, type MetricPoint } from './otlp.ts'
 import { routingIdentityOf } from './identity.ts'
-import { COLLECTOR_OPTION, collectorUrlOf, namesOption, OPT_IN_OPTION, optionValues, PACKS_OPTION, type Layer } from './settings.ts'
+import { collectorIn, namesOption, OPT_IN_OPTION, optionValues, PACKS_OPTION, PROD_COLLECTOR, type Layer } from './settings.ts'
 
-/**
- * Where the copy goes, a path per signal after it, unless the person's own user settings name another collector (`collectorUrl`).
- * Nothing reads a URL from the environment or from the organization's settings.
- */
-export const PROD_COLLECTOR = 'https://collector.mainwave.com'
 export type Signal = 'logs' | 'traces' | 'metrics'
 export const SIGNALS: readonly Signal[] = ['logs', 'traces', 'metrics']
 
@@ -512,17 +507,10 @@ export async function readOptions($: EngineInterface): Promise<void> {
  * cannot be read holds this send back, the queue kept: it may name somewhere else, so the copy does not go to production on a guess.
  */
 async function readCollector($: EngineInterface): Promise<boolean> {
-  const layer = await readLayer($, 'user')
-  if (layer === 'unreadable') return true
-  const set = optionValues(layer, COLLECTOR_OPTION).filter(raw => !(raw === undefined || raw === null || (typeof raw === 'string' && raw.trim() === '')))
-  if (set.length === 0) {
-    collector = PROD_COLLECTOR
-    return false
-  }
-  const urls = new Set(set.map(collectorUrlOf))
-  const [url] = urls
-  if (urls.size === 1 && url !== null && url !== undefined) {
-    collector = url
+  const where = collectorIn(await readLayer($, 'user'))
+  if (where === 'unreadable') return true
+  if (where !== 'malformed') {
+    collector = where
     return false
   }
   mode = 'off'

@@ -72,6 +72,25 @@ export function optionValues(layer: Layer, option: string): unknown[] {
   return out
 }
 
+/**
+ * Where the copy goes, a path per signal after it, unless the person's own user settings name another collector (`collectorUrl`).
+ * Nothing reads a URL from the environment or from the organization's settings.
+ */
+export const PROD_COLLECTOR = 'https://collector.mainwave.com'
+
+/**
+ * Where the person's user settings send the copy: the `collectorUrl` they give under the plugin's ids, else production's collector.
+ * `malformed` for a value that has not the shape, or ids that give different values; `unreadable` for a layer that can't be read.
+ */
+export function collectorIn(layer: Layer): string | 'malformed' | 'unreadable' {
+  if (layer === 'unreadable') return 'unreadable'
+  const set = optionValues(layer, COLLECTOR_OPTION).filter(raw => !(raw === undefined || raw === null || (typeof raw === 'string' && raw.trim() === '')))
+  if (set.length === 0) return PROD_COLLECTOR
+  const urls = new Set(set.map(collectorUrlOf))
+  const [url] = urls
+  return urls.size === 1 && url !== null && url !== undefined ? url : 'malformed'
+}
+
 const LOOPBACK = new Set(['localhost', '127.0.0.1', '[::1]'])
 
 /**

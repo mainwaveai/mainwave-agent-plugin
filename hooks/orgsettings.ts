@@ -29,6 +29,7 @@ import type { EngineInterface, Timer } from 'claude-code'
 import { OVERRIDES_KEY, overridesOf, PACKS_KEY, packsOf, setOrgPacks, setOverrides, type Overrides, type PackChoice } from './gate.ts'
 import { fetchWithin, type FetchOutcome } from './http.ts'
 import { isOrgId } from './identity.ts'
+import { collectorIn, type Layer } from './settings.ts'
 
 /** The plugin's read of its organization's settings, on Mainwave's API. */
 export const SETTINGS_PATH = '/api/plugin/data-collection-settings'
@@ -233,8 +234,23 @@ export async function fetchNow($: EngineInterface, collector: string): Promise<O
   }
 }
 
+/**
+ * Where the copy goes as the person's user settings say now, read afresh as each request leaves, so the settings come from the
+ * Mainwave they name; `null` while those settings can't be read (they may name another) or name no collector of the right shape.
+ */
+async function collectorNow($: EngineInterface): Promise<string | null> {
+  let layer: Layer
+  try {
+    layer = await $.settings.read({ source: 'user' })
+  } catch {
+    layer = 'unreadable'
+  }
+  const where = collectorIn(layer)
+  return where === 'unreadable' || where === 'malformed' ? null : where
+}
+
 /** Asks after `ms`, then again on the outcome's wait, for as long as the load runs; one timer at a time. */
-function schedule($: EngineInterface, collector: () => string, ms: number): void {
+function schedule($: EngineInterface, ms: number): void {
   timer?.cancel()
   try {
     timer = $.clock.after(Math.max(1, ms), () => {
@@ -243,12 +259,17 @@ function schedule($: EngineInterface, collector: () => string, ms: number): void
       // asked, until the plugin loads again.
       if (!copying()) return
       const asked = `${org} ${email}`
-      void fetchNow($, collector()).then(outcome => {
+      void collectorNow($).then(where => (where === null ? 'held' : fetchNow($, where))).then(outcome => {
         // Not asked (a request already out, or nothing to ask with): the request out schedules the next.
         if (outcome === undefined) return
+        // The person's settings can't be read, or name no collector of the right shape: ask again later.
+        if (outcome === 'held') {
+          if (timer === null && copying()) schedule($, RETRY_MS)
+          return
+        }
         wait = nextWait(outcome, wait, retryAfterMs)
         // The session named another organization or email while it asked: ask again for those at once.
-        if (timer === null) schedule($, collector, asked === `${org} ${email}` ? wait : 0)
+        if (timer === null) schedule($, asked === `${org} ${email}` ? wait : 0)
       }, () => undefined)
     })
   } catch {
@@ -258,10 +279,9 @@ function schedule($: EngineInterface, collector: () => string, ms: number): void
 
 /**
  * What a row said about who the session is. A new organization brings its own settings, from the store until Mainwave answers; with
- * its email known, the plugin asks at once, and every `REFRESH_MS` after, while `sending` says it sends a copy at all. `collector`
- * answers where the copy goes as each request leaves, so the settings come from the Mainwave the person's settings name at that time.
+ * its email known, the plugin asks at once, and every `REFRESH_MS` after, while `sending` says it sends a copy at all.
  */
-export async function noteSessionIdentity($: EngineInterface, collector: () => string, who: { organizationId?: string; email?: string }, sending: () => boolean): Promise<void> {
+export async function noteSessionIdentity($: EngineInterface, who: { organizationId?: string; email?: string }, sending: () => boolean): Promise<void> {
   copying = sending
   const orgChanged = who.organizationId !== undefined && who.organizationId !== org
   const emailChanged = who.email !== undefined && who.email !== email
@@ -271,13 +291,13 @@ export async function noteSessionIdentity($: EngineInterface, collector: () => s
   if (orgChanged) await applyStoredSettings($)
   if (copying() && org !== undefined && email !== undefined) {
     wait = 0
-    schedule($, collector, 0)
+    schedule($, 0)
   }
 }
 
 /** As a session starts: asks again at once, if the organization and email are known and no request is out. */
-export function ensureFetching($: EngineInterface, collector: () => string): void {
-  if (!inflight && org !== undefined && email !== undefined) schedule($, collector, 0)
+export function ensureFetching($: EngineInterface): void {
+  if (!inflight && org !== undefined && email !== undefined) schedule($, 0)
 }
 
 /** Where the settings in force came from, for the end-of-session debug line: never the email. */

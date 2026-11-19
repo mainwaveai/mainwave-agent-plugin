@@ -102,6 +102,36 @@ describe('asking Mainwave', () => {
     expect(posts.settings.length).toBeLessThanOrEqual(1)
   })
 
+  test("the person's collectorUrl names where to ask: Mainwave's dev API beside its dev collector, read before the first request", keyless, async ($, on) => {
+    const { clock, posts } = world(on, { layers: { user: collectorOption('https://collector.dev.mainwave.com') } })
+    await row($, 'api_request', { cost_usd: 0.1 })
+    await clock.advance(1)
+    expect(posts.settings).toEqual([])
+    const asked = posts.filter(p => p.url.endsWith('/api/plugin/data-collection-settings'))
+    expect(asked.map(p => p.url)).toEqual(['https://api.dev.mainwave.com/api/plugin/data-collection-settings'])
+    expect(JSON.parse(asked[0]!.body)).toEqual({ claude_org_id: ORG, email: EMAIL })
+  })
+
+  test("user settings that can't be read ask nothing (they may name another Mainwave), and the plugin asks once they can be", keyless, async ($, on) => {
+    const layers: Layers = { user: 'reject' }
+    const { clock, posts } = world(on, { settings: () => answer({}), layers })
+    await row($, 'api_request', { cost_usd: 0.1 })
+    await clock.advance(RETRY_MS + TICK)
+    expect(posts.settings).toEqual([])
+    expect(posts.filter(p => p.url.includes('/api/plugin/'))).toEqual([])
+    layers.user = {}
+    await clock.advance(RETRY_MS + TICK)
+    expect(posts.settings.length).toBe(1)
+  })
+
+  test("a malformed collectorUrl asks nothing, as it sends nothing", keyless, async ($, on) => {
+    const { clock, posts } = world(on, { settings: () => answer({}), layers: { user: collectorOption('http://collector.example.com') } })
+    await row($, 'api_request', { cost_usd: 0.1 })
+    await clock.advance(2 * REFRESH_MS)
+    expect(posts.settings).toEqual([])
+    expect(posts).toEqual([])
+  })
+
   test('a session whose rows name no email asks nothing', keyless, async ($, on) => {
     const { clock, posts } = world(on)
     await row($, 'api_request', { cost_usd: 0.1 }, { 'organization.id': ORG, 'session.id': 's-1' })

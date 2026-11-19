@@ -128,7 +128,7 @@ async function noteIdentity($: EngineInterface, attributes: Readonly<Record<stri
   const seen = identityOf(attributes)
   // The organization's settings follow who the session is: those kept for it apply, and the plugin asks Mainwave for them.
   try {
-    await noteSessionIdentity($, collectorOf, mergeIdentity(held, seen), isCopying)
+    await noteSessionIdentity($, mergeIdentity(held, seen), isCopying)
   } catch {
     // The settings in force stand.
   }
@@ -612,7 +612,7 @@ export async function sessionStart($: SessionStartParams[0], e: SessionStartPara
       if (first && r !== null) await emit($, sessionStarted(r, await $.clock.now()))
       await adopt($)
       // The organization's settings: asked for again as a session starts, where its rows have named who it is.
-      ensureFetching($, collectorOf)
+      ensureFetching($)
       // A new session: its servers and skill texts are sent again (after a /clear, `session.end` starts them over). Claude's settings
       // are read beside the session's start, never holding it.
       textIds = new Map()
