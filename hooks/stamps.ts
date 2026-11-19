@@ -57,6 +57,29 @@ export const STAMP_RULES: Readonly<Record<StampKey, (value: string) => boolean>>
   },
 }
 
+/**
+ * The codes of what the plugin found wrong with the session's telemetry setup (setup.ts), on its own `plugin_status` row alone: a list
+ * of these, each once, in this order. A fixed list, never free text: Mainwave reads each code as one cause and what fixes it.
+ */
+export const ISSUES_STAMP = 'mainwave.telemetry.issues'
+export const ISSUE_CODES = [
+  'rows_skipped', 'cli_hooks_no_exporter', 'exporter_no_endpoint', 'exporter_no_key', 'exporter_elsewhere', 'settings_unavailable',
+  'redaction_unreadable', 'redaction_unknown_pack', 'copy_dropped',
+] as const
+export type IssueCode = (typeof ISSUE_CODES)[number]
+
+/** The value the issues stamp may carry: one or more known codes, each once, in `ISSUE_CODES`' order. */
+export const ISSUES_RULE = (v: unknown): v is IssueCode[] => {
+  if (!Array.isArray(v) || v.length === 0 || v.length > ISSUE_CODES.length) return false
+  const at = v.map(c => (ISSUE_CODES as readonly unknown[]).indexOf(c))
+  return at.every((i, n) => i >= 0 && (n === 0 || i > at[n - 1]!))
+}
+
+/** The issues stamp for a list of codes: `{}` when there are none, or the list fails its rule. */
+export function issuesStamp(codes: readonly string[]): Record<string, string[]> {
+  return codes.length > 0 && ISSUES_RULE([...codes]) ? { [ISSUES_STAMP]: [...codes] } : {}
+}
+
 /** The count of secrets the always-on protections replaced in a record's values (gate.ts), under Mainwave's SDKs' name for it. */
 export const REDACTION_COUNT = 'mainwave.redaction.count'
 

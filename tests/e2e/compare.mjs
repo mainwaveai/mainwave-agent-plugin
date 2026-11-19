@@ -472,6 +472,30 @@ function pointsOf(posts) {
 
 const problems = []
 
+/** The plugin's status row: its own, with no counterpart in the exporter's rows (hooks/setup.ts). */
+const STATUS = 'plugin_status'
+
+/**
+ * Checks the plugin's status rows and answers its other rows: one status row per session the other rows name, carrying exactly the
+ * codes `want` (none: the key absent) and nothing of the setup but them.
+ */
+function checkStatus(rows, want) {
+  const status = rows.filter(r => r.attributes['event.name']?.v === STATUS)
+  const rest = rows.filter(r => r.attributes['event.name']?.v !== STATUS)
+  const sessions = new Set(rest.map(r => r.attributes['session.id']?.v))
+  if (status.length !== sessions.size) problems.push(`status: ${status.length} ${STATUS} rows for ${sessions.size} sessions`)
+  for (const r of status) {
+    const got = r.attributes['mainwave.telemetry.issues']
+    const codes = got === undefined ? [] : got.t === 'array' ? got.v.map(c => c.v) : [`not a list: ${JSON.stringify(got)}`]
+    if (!same(codes, want)) problems.push(`status: a ${STATUS} row says ${JSON.stringify(codes)}, not ${JSON.stringify(want)}`)
+    if (got !== undefined && codes.length === 0) problems.push(`status: a ${STATUS} row with an empty list, not none`)
+    if (r.attributes['mainwave.telemetry.route']?.v !== 'plugin') problems.push(`status: a ${STATUS} row with route ${JSON.stringify(r.attributes['mainwave.telemetry.route'])}`)
+    if (!sessions.has(r.attributes['session.id']?.v)) problems.push(`status: a ${STATUS} row for a session no other row names`)
+  }
+  console.log(`  status: ${status.length} ${STATUS} row${status.length === 1 ? '' : 's'}, ${want.length ? want.join(', ') : 'no issues'}`)
+  return rest
+}
+
 /** Compares one session's two paths, adding what differs to `problems`, and prints what it found. */
 function compare(pass, details, auto, { captured, run, work }) {
   const before = problems.length
@@ -503,7 +527,8 @@ function compare(pass, details, auto, { captured, run, work }) {
 
   // Logs.
   const exporterLogs = logRecordsOf(captured.exporter.logs)
-  const pluginLogs = logRecordsOf(captured.plugin.logs)
+  // The exporter points at the local receiver, not Mainwave's collector: the one code the setup gives.
+  const pluginLogs = checkStatus(logRecordsOf(captured.plugin.logs), ['exporter_elsewhere'])
   const byKey = (list, what) => {
     const m = new Map()
     for (const r of list) {
@@ -806,7 +831,8 @@ function checkKeyless(pass, { captured, run, config }, reference) {
     for (const p of captured.plugin[s]) if (p.status !== 200) problems.push(`keyless ingest refused a ${s} request (${p.status}): ${p.error}`)
     for (const p of captured.plugin[s]) if (p.via !== 'prod') problems.push(`with no settings, a plugin ${s} request went to ${p.via}, not production's collector`)
   }
-  const rows = logRecordsOf(captured.plugin.logs)
+  // No env block and settings answered: nothing wrong.
+  const rows = checkStatus(logRecordsOf(captured.plugin.logs), [])
   if (!rows.some(r => r.attributes['event.name']?.v === 'api_request')) problems.push('no api_request row was sent')
 
   const spans = spansOf(captured.plugin.traces)

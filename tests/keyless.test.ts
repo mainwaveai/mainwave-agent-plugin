@@ -129,6 +129,9 @@ describe('a session without the env block, sending keyless', () => {
       }
     }
     const at = (n: string) => ({ traceId: by(n).traceId, spanId: by(n).spanId })
+    // The plugin's status row is its own: it ran in no span.
+    expect(rows['plugin_status']).toEqual({ traceId: undefined, spanId: undefined })
+    delete rows['plugin_status']
     expect(rows).toEqual({ user_prompt: at('interaction'), api_request: at('interaction'), tool_decision: at('tool.blocked_on_user'), tool_result: at('interaction') })
   })
 

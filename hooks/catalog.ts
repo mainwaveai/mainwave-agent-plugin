@@ -146,6 +146,11 @@ export type Owned = { key: string; id: DataPointId; in?: readonly string[]; reda
 
 /** The plugin's row for one MCP server set up for the session (`mcp.url`). */
 export const MCP_SERVER_ROW = 'mcp_server_configured'
+/**
+ * The plugin's row for what it found wrong with the session's telemetry setup (setup.ts): one per session, and again when that changes.
+ * It belongs to `session.client`, required, so it always goes.
+ */
+export const PLUGIN_STATUS_ROW = 'plugin_status'
 /** The plugin's row for one skill run (`skill.text`): the text the first time it is seen in the session, its ID every time. */
 export const SKILL_PROMPT_ROW = 'skill_prompt'
 
