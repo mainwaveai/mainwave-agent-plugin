@@ -250,7 +250,7 @@ function testPlugin(name, source, description) {
   return dir
 }
 const redirect = testPlugin('redirect', 'redirect.ts', "Test only: sends the mainwave plugin's requests to Mainwave's production collector to the local receiver the end-to-end comparison runs.")
-const skip = testPlugin('skip', 'skip.ts', "Test only: keeps Claude Code's collector rows and the session's identity from the mainwave plugin, as Claude Code's security default does.")
+const skip = testPlugin('skip', 'skip.ts', "Test only: keeps Claude Code's collector rows from the mainwave plugin, as Claude Code's security default does.")
 // Removed however the run ends: a session that throws, or an interrupt, leaves nothing behind.
 process.on('exit', () => [redirect, skip].forEach(d => rmSync(d, { recursive: true, force: true })))
 process.on('SIGINT', () => process.exit(130))
@@ -1073,8 +1073,83 @@ function checkRowless(pass, { captured, run }, reference) {
   if (Math.abs(metricCost - metricCostWant) > 0.001 * Math.max(metricCostWant, 1e-6)) problems.push(`metrics: cost.usage sums to ${metricCost}, the exporter's to ${metricCostWant}`)
   for (const p of points) if (p.attrs['mainwave.telemetry.built_from']?.v !== 'events') problems.push(`metrics: a ${p.name} point that does not say it was built from events`)
   console.log(`rowless: ${rows.length} rows, ${spans.length} spans in ${new Set(spans.map(s => s.traceId)).size} traces (${interactions} interactions), ${points.length} metric points`)
+  keysAdd(reference.plugin, { rows, spans, points })
   for (let i = before; i < problems.length; i++) problems[i] = `${pass}: ${problems[i]}`
 }
+
+/**
+ * What the copy with Claude Code's rows has that the copy built without them lacks: the plugin's own output in the reference pass (the
+ * same scripted session, with rows) against the rowless pass's, field by field. Each event the plugin builds, paired call by call and
+ * request by request; each span by its kind; each metric series by its sum. A difference that is not a known one fails, so the README's
+ * list of what the managed keys add stays true; the known ones are printed.
+ */
+const KEYS_ADD = {
+  rows: ['assistant_response', 'subagent_completed', 'retention_sweep', 'plugin_loaded'],
+  attributes: {
+    user_prompt: ['message.uuid'],
+    api_request: ['request_id', 'speed'],
+    tool_decision: ['permission_mode', 'request_id'],
+    tool_result: ['error_type', 'request_id'],
+    'claude_code.llm_request': ['gen_ai.response.id', 'request_id'],
+    'claude_code.tool.execution': ['error', 'error_class'],
+  },
+}
+/** Values that differ between any two sessions (ids, times, sequences), or by a session's own paths; never compared. */
+const PER_SESSION = new Set(['session.id', 'prompt.id', 'user.id', 'agent_id', 'message.uuid', 'event.timestamp', 'event.sequence', 'duration_ms', 'ttft_ms', 'tool_result_size_bytes', 'tool_parameters', 'tool_input', 'cost_usd', 'mainwave.telemetry.built_from'])
+function keysAdd(withRows, built) {
+  const found = []
+  const rowsWith = checkStatusQuiet(logRecordsOf(withRows.logs))
+  const ev = r => r.attributes['event.name']?.v
+  for (const name of new Set(rowsWith.map(ev))) {
+    if (!BUILT_ROWS.includes(name) && !OWN_ROWS.has(name) && !STARTUP.has(name)) {
+      if (KEYS_ADD.rows.includes(name)) found.push(`the ${name} rows`)
+      else problems.push(`keys add: ${name} rows, which the known differences do not list`)
+    }
+  }
+  const pairKey = (name, r) => (name === 'tool_decision' || name === 'tool_result') ? r.attributes.tool_use_id?.v
+    : name === 'api_request' ? ['input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_creation_tokens'].map(k => r.attributes[k]?.v).join('/') : undefined
+  for (const name of BUILT_ROWS) {
+    const a = rowsWith.filter(r => ev(r) === name)
+    const b = built.rows.filter(r => ev(r) === name)
+    const keysA = new Set(a.flatMap(r => Object.keys(r.attributes)))
+    const keysB = new Set(b.flatMap(r => Object.keys(r.attributes)))
+    const known = KEYS_ADD.attributes[name] ?? []
+    for (const k of keysA) if (!keysB.has(k)) (known.includes(k) ? found.push(`${name}.${k}`) : problems.push(`keys add: ${name} rows lack ${k}, which the known differences do not list`))
+    for (const k of keysB) if (!keysA.has(k) && k !== 'mainwave.telemetry.built_from') problems.push(`keys add: built ${name} rows carry ${k}, which Claude Code's do not`)
+    const index = list => new Map(list.map((r, i) => [pairKey(name, r) ?? String(i), r]))
+    const [ia, ib] = [index(a), index(b)]
+    for (const [key, ra] of ia) {
+      const rb = ib.get(key)
+      if (!rb) {
+        problems.push(`keys add: no built ${name} row pairs with ${key}`)
+        continue
+      }
+      for (const [k, v] of Object.entries(ra.attributes)) {
+        if (PER_SESSION.has(k) || k.startsWith('mainwave.') || rb.attributes[k] === undefined) continue
+        if (!same(v, rb.attributes[k])) problems.push(`keys add: a built ${name} row's ${k} is ${JSON.stringify(rb.attributes[k].v)}, Claude Code's ${JSON.stringify(v.v)}`)
+      }
+    }
+  }
+  const spansWith = spansOf(withRows.traces)
+  for (const name of new Set(spansWith.map(s => s.name))) {
+    if (MARKER_SPANS.has(name)) continue
+    const keysA = new Set(spansWith.filter(s => s.name === name).flatMap(s => Object.keys(s.attrs)))
+    const keysB = new Set(built.spans.filter(s => s.name === name).flatMap(s => Object.keys(s.attrs)))
+    const known = KEYS_ADD.attributes[name] ?? []
+    for (const k of keysA) if (!keysB.has(k)) (known.includes(k) ? found.push(`${name.replace('claude_code.', '')} span ${k}`) : problems.push(`keys add: built ${name} spans lack ${k}, which the known differences do not list`))
+  }
+  const sums = list => list.reduce((m, p) => m.set(`${p.name} ${p.attrs.type?.v ?? ''}`, (m.get(`${p.name} ${p.attrs.type?.v ?? ''}`) ?? 0) + p.value), new Map())
+  const [sa, sb] = [sums(pointsOf(withRows.metrics)), sums(built.points)]
+  for (const key of new Set([...sa.keys(), ...sb.keys()])) {
+    // A turn's time is the plugin's clock in both, a few milliseconds apart; a cost, to the thousandth.
+    const tolerance = key.startsWith('claude_code.active_time') ? 0.25 : key.startsWith('claude_code.cost') ? 0.001 * (sa.get(key) ?? 0) : 0
+    if (Math.abs((sa.get(key) ?? 0) - (sb.get(key) ?? 0)) > tolerance + 1e-12) problems.push(`keys add: ${key} sums to ${sb.get(key) ?? 0} built, ${sa.get(key) ?? 0} with rows`)
+  }
+  console.log(`  what Claude Code's rows add over the rows built from events: ${found.join(', ') || 'nothing'}`)
+}
+
+/** The rows of a copy, less the plugin's status rows, without checking them. */
+const checkStatusQuiet = rows => rows.filter(r => r.attributes['event.name']?.v !== STATUS)
 
 // The keyless pass is held to the second, which runs as it does: not in auto mode. So is the rowless pass, with the env block so the
 // exporter's spans and metrics are there to count against; it runs from 2.1.328, where the security default first keeps rows from a

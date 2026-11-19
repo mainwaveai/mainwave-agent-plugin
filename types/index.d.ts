@@ -18,6 +18,11 @@ declare module 'claude-code' {
       identity: RowIdentity
       /** Whether this process has counted its session in `claude_code.session.count`: once, whatever reloads the plugin. */
       sessionCounted: boolean
+      /**
+       * Whether a row of Claude Code's has reached the plugin in this process: once one has, the plugin never builds the rows itself,
+       * whatever reloads it.
+       */
+      rowsSeen: boolean
     }
   }
 }

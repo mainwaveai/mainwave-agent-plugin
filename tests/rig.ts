@@ -77,7 +77,7 @@ export const PROD_URL = `${PROD}/v1/logs`
 export const IDEMPOTENCY_KEY = /^[A-Za-z0-9._:-]{1,128}$/
 
 /** Hooks that stand for the engine: settings layers, the environment, and the collector, which records each row it receives. */
-export function boot(on: On, opts: { layers?: Layers; entrypoint?: string; env?: Record<string, string> } = {}): Rig & { envReads: string[] } {
+export function boot(on: On, opts: { layers?: Layers; entrypoint?: string; env?: Record<string, string>; version?: string } = {}): Rig & { envReads: string[] } {
   const rig: Rig & { envReads: string[] } = { rows: [], reads: [], envReads: [] }
   on('settings.read', async (_$, e) => {
     const source = String((e as { source?: string }).source)
@@ -91,7 +91,7 @@ export function boot(on: On, opts: { layers?: Layers; entrypoint?: string; env?:
     rig.envReads.push(name)
     return { value: name === 'CLAUDE_CODE_ENTRYPOINT' ? opts.entrypoint : opts.env?.[name] } as never
   })
-  on('session.version', async () => ({ value: { version: '2.1.322', base: '2.1.322' } }) as never)
+  on('session.version', async () => ({ value: { version: opts.version ?? '2.1.322', base: opts.version ?? '2.1.322' } }) as never)
   on('telemetry.log', async (_$, e) => {
     const row = e as unknown as { event: string; attributes: Record<string, unknown> }
     rig.rows.push({ event: row.event, attributes: { ...row.attributes } })

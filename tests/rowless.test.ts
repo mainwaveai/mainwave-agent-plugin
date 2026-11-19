@@ -5,7 +5,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { costOf, hostIdentityOf, newRowless, promptRow, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
+import { accountDeviceOf, costOf, decisionSource, hostIdentityOf, newRowless, promptRow, providerOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
 import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, PROD, records, type Post } from './rig.ts'
 
 const keyless = { options: {} }
@@ -16,31 +16,32 @@ const ACCOUNT_FILE = { userID: DEVICE, oauthAccount: { organizationUuid: ORG, em
 /** Another organization and person, as a host names them. */
 const HOST_ORG = '0f8fad5b-d9cb-469f-a165-70867728950e'
 const HOST_EMAIL = 'host@example.com'
-const DENY = '$.session.identity answers only a mod that managed settings enable and that is loaded in place from a source they name; mainwave is not one'
 const BUILT = 'mainwave.telemetry.built_from'
 const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 300, cache_creation_input_tokens: 40, ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 40 }
 
-type World = { env?: Record<string, string>; accountFile?: unknown; denied?: boolean; costs?: number[] }
+type World = { env?: Record<string, string>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean }
 
 function world(on: On, opts: World = {}) {
   const clock = mock.clock(on, { now: START })
   memoryStore(on)
+  // A reload: the process has seen a row of Claude Code's before.
+  if (opts.rowsSeen) on('state.get', (_$, e, next) => ((e as unknown as { key?: string }).key === 'rowsSeen' ? ({ value: true } as never) : next(e)))
   const posts = network(on, (_n, post) => {
     const answer = keylessAnswer(post)
     return { status: answer.status, text: answer.text }
   })
-  const rig = boot(on, { entrypoint: 'cli', env: { HOME, ...opts.env } })
+  // Claude Code 2.1.326 on hands each plugin a row as it loads, so a turn that begins with none seen means none comes.
+  const rig = boot(on, { entrypoint: 'cli', env: { HOME, ...opts.env }, version: opts.version ?? '2.1.328' })
   on('fs.read', (_$, e) => {
     const path = (e as unknown as { path: string }).path
     if (path === `${HOME}/.claude.json` && opts.accountFile !== undefined) return { value: JSON.stringify(opts.accountFile) } as never
     throw new Error(`no file at ${path} in test`)
   })
   on('session.id', () => ({ value: 's-1' }) as never)
-  // A built-in plugin that runs first refuses the plugin the session's identity.
-  on('session.identity', () => ({ value: opts.denied === false ? { kind: 'claude.ai', isVerified: false } : { deny: DENY } }) as never)
-  // The session's cost after each request, in turn.
+  // The session's cost after each request, in turn; `spend` adds a cost outside any request of a turn.
   const costs = [...(opts.costs ?? [0.01, 0.03, 0.06, 0.1])]
   let cost = 0
+  const spend = (usd: number) => (cost = Math.round((cost + usd) * 1e9) / 1e9)
   on('session.usage', () => ({ value: { startedAt: START, context: {}, rateLimits: [], cost: { usd: cost } } }) as never)
   on('session.start', (_$, e) => ({ cwd: (e as { cwd: string }).cwd }) as never)
   on('session.end', (_$, e) => ({ sessionId: (e as { sessionId: string }).sessionId }) as never)
@@ -51,7 +52,7 @@ function world(on: On, opts: World = {}) {
     await clock.advance(30)
     yield { kind: 'text', index: 0, text: 'ok' } as never
     await clock.advance(70)
-    cost = costs.shift() ?? cost
+    cost = Math.round(((costs.shift() ?? 0) + cost) * 1e9) / 1e9
     return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: { ...USAGE, model: 'claude-haiku-5-5' } } as never
   })
   // The permission check: an ask for a command outside the working folder, an allow for the rest.
@@ -67,7 +68,7 @@ function world(on: On, opts: World = {}) {
   })
   const logs = () => posts.filter(p => new URL(p.url).pathname === '/v1/logs').flatMap(records)
   const built = () => logs().filter(r => r.attributes[BUILT] === 'events')
-  return { clock, posts, rig, logs, built }
+  return { clock, posts, rig, logs, built, spend }
 }
 
 /** One main-loop turn: a prompt, one model request, one Bash call, as Claude Code's events alone show them. */
@@ -112,7 +113,7 @@ function points(posts: readonly Post[]) {
 }
 
 describe('the rows built from events', () => {
-  test('no row comes and the identity is refused: each turn sends a prompt, request, decision and result row, under the account file\'s identity', keyless, async ($, on) => {
+  test('no row comes by the first turn: each turn sends a prompt, request, decision and result row, under the account file\'s identity', keyless, async ($, on) => {
     const w = world(on, { accountFile: ACCOUNT_FILE })
     await start($)
     await turn($)
@@ -181,7 +182,7 @@ describe('the rows built from events', () => {
   })
 
   test('each request costs what the session\'s cost grew by since the one before', keyless, async ($, on) => {
-    const w = world(on, { accountFile: ACCOUNT_FILE, costs: [0.01, 0.03] })
+    const w = world(on, { accountFile: ACCOUNT_FILE, costs: [0.01, 0.02] })
     await start($)
     await turn($, 'go', 'toolu_1')
     await turn($, 'again', 'toolu_2')
@@ -203,7 +204,7 @@ describe('the rows built from events', () => {
     expect(w.built().length).toBe(4)
   })
 
-  test("a session signed in another way goes under the host's identity, and never reads the account file", keyless, async ($, on) => {
+  test("a session signed in another way goes under the host's identity, with the account file's device ID alone", keyless, async ($, on) => {
     const w = world(on, { accountFile: ACCOUNT_FILE, env: { CLAUDE_CODE_OAUTH_TOKEN: 'token', CLAUDE_CODE_ORGANIZATION_UUID: HOST_ORG, CLAUDE_CODE_USER_EMAIL: HOST_EMAIL } })
     await start($)
     await turn($)
@@ -211,7 +212,9 @@ describe('the rows built from events', () => {
     expect(w.built().length).toBe(4)
     for (const r of w.built()) {
       expect(r.attributes['organization.id']).toBe(HOST_ORG)
-      expect(r.attributes['user.id']).toBeUndefined()
+      expect(r.attributes['user.email']).toBe(HOST_EMAIL)
+      expect(r.attributes['user.account_uuid']).toBeUndefined()
+      expect(r.attributes['user.id']).toBe(DEVICE)
     }
   })
 
@@ -247,8 +250,8 @@ describe('the rows built from events', () => {
     expect(w.built().length).toBe(before)
   })
 
-  test("the identity is the plugin's to read: no row by the first turn builds nothing yet, and the grace's rows_skipped builds the next", keyless, async ($, on) => {
-    const w = world(on, { accountFile: ACCOUNT_FILE, denied: false })
+  test('a Claude Code that hands no row at load: no row by the first turn builds nothing yet, and the grace\'s rows_skipped builds the next', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, version: '2.1.322' })
     await start($)
     await turn($, 'go', 'toolu_1')
     await w.clock.advance(5_000)
@@ -256,6 +259,41 @@ describe('the rows built from events', () => {
     await turn($, 'again', 'toolu_2')
     await w.clock.advance(5_000)
     expect(new Set(w.built().map(r => r.attributes['event.name']))).toEqual(new Set(['user_prompt', 'api_request', 'tool_decision', 'tool_result']))
+  })
+
+  test("the prompt row carries Claude Code's own prompt id, where the session says it", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE })
+    on('session.info', () => ({ value: { transcriptPath: '', sysname: 'Darwin', promptId: 'prompt-from-claude-1' } }) as never)
+    await start($)
+    await turn($)
+    await w.clock.advance(5_000)
+    expect(new Set(w.built().map(r => r.attributes['prompt.id']))).toEqual(new Set(['prompt-from-claude-1']))
+  })
+
+  test('a reload after a row came: the process has seen rows, so the first turn after it builds nothing', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, rowsSeen: true })
+    await start($)
+    await turn($)
+    await w.clock.advance(1_000)
+    expect(w.built()).toEqual([])
+  })
+
+  test("a cost outside a turn's requests goes in cost.usage as auxiliary, between turns and at the end; the requests' own stay theirs", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, costs: [0.01, 0.02] })
+    await start($)
+    await turn($, 'go', 'toolu_1')
+    // Between turns: a suggestion, a memory, a compaction.
+    w.spend(0.005)
+    await turn($, 'again', 'toolu_2')
+    // After the last turn.
+    w.spend(0.002)
+    await end($)
+    expect(w.built().filter(r => r.attributes['event.name'] === 'api_request').map(r => r.attributes['cost_usd'])).toEqual([0.01, 0.02])
+    const cost = points(w.posts).filter(p => p.name === 'claude_code.cost.usage')
+    const sum = (list: typeof cost) => Math.round(list.reduce((n, p) => n + p.value, 0) * 1e9) / 1e9
+    expect(sum(cost.filter(p => p.attrs['query_source'] === 'auxiliary'))).toBe(0.007)
+    expect(sum(cost.filter(p => p.attrs['query_source'] === 'main'))).toBe(0.03)
+    expect(sum(cost)).toBe(0.037)
   })
 
   test('a refused call has its decision alone, a reject, as in Claude Code', keyless, async ($, on) => {
@@ -304,6 +342,29 @@ describe('the rows built from events', () => {
 })
 
 describe('rowless.ts', () => {
+  test("the head says where requests go and a terminal no person types into, as Claude Code's rows do", () => {
+    const head = rowHead({}, { 'organization.id': ORG, 'user.email': EMAIL }, 's-1', { provider: providerOf({ CLAUDE_CODE_USE_BEDROCK: '1' }), customBaseUrl: true, nonInteractive: true })
+    expect(head).toEqual({ 'session.id': 's-1', 'organization.id': ORG, 'user.email': EMAIL, 'anthropic.provider': 'bedrock', 'anthropic.custom_base_url': true, 'terminal.type': 'non-interactive' })
+    expect(rowHead({}, {}, 's-1', { provider: providerOf({}), customBaseUrl: false, nonInteractive: false })).toEqual({ 'session.id': 's-1', 'anthropic.provider': 'firstParty' })
+  })
+
+  test("a decision's source where the check names it; a subagent's requests by its type; a result's sizes in bytes", () => {
+    expect(decisionSource({ decision: 'allow', rule: 'Bash(echo:*)' })).toBe('config')
+    expect(decisionSource({ decision: 'deny', hook: 'guard' })).toBe('hook')
+    expect(decisionSource({ decision: 'ask', rule: 'x' })).toBeUndefined()
+    expect(decisionSource({ decision: 'allow' })).toBeUndefined()
+    const s = newRowless()
+    const usage = { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    const req = (agent?: { type: string; builtIn: boolean }) => requestRow(s, {}, { model: 'm', usage, agentId: 'a1', ...(agent ? { agent } : {}), startMs: 0, endMs: 1, sdk: false }).attributes
+    expect(req({ type: 'general-purpose', builtIn: true })).toEqual(expect.objectContaining({ query_source: 'agent:builtin:general-purpose', 'agent.name': 'general-purpose', cache_creation_5m_tokens: 0, cache_creation_1h_tokens: 0 }))
+    expect(req({ type: 'reviewer', builtIn: false })['query_source']).toBe('agent:custom:reviewer')
+    expect(req()['query_source']).toBe('agent:custom')
+    const ok = resultRow(s, {}, { tool: 'Bash', id: 't', startMs: 0, endMs: 1, isError: false, input: { command: 'echo é' }, text: 'é' }).attributes
+    expect([ok['tool_input_size_bytes'], ok['tool_result_size_bytes']]).toEqual(['21', '2'])
+    expect(resultRow(s, {}, { tool: 'Bash', id: 't', startMs: 0, endMs: 1, isError: true, text: 'boom' }).attributes['tool_result_size_bytes']).toBeUndefined()
+    expect(accountDeviceOf({ userID: DEVICE, oauthAccount: { organizationUuid: ORG } })).toEqual({ 'user.id': DEVICE })
+  })
+
   test("the host's identity needs both the organization and the email, each of its shape", () => {
     expect(hostIdentityOf({ CLAUDE_CODE_ORGANIZATION_UUID: HOST_ORG, CLAUDE_CODE_USER_EMAIL: HOST_EMAIL, CLAUDE_CODE_ACCOUNT_UUID: ACCOUNT })).toEqual({ 'organization.id': HOST_ORG, 'user.email': HOST_EMAIL, 'user.account_uuid': ACCOUNT })
     expect(hostIdentityOf({ CLAUDE_CODE_ORGANIZATION_UUID: HOST_ORG })).toEqual({})
@@ -343,10 +404,10 @@ describe('rowless.ts', () => {
     const p = promptRow(s, head, 'hello', 1000, 'p-1')
     const r = requestRow(s, head, { model: 'claude-haiku-5-5', usage: { input_tokens: 1, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 }, startMs: 1000, endMs: 1500, sdk: true, sessionCostUsd: 0.2 })
     const t = resultRow(s, head, { tool: 'Read', id: 'toolu_9', startMs: 1500, endMs: 1600, isError: true })
-    expect(p.attributes).toEqual({ 'session.id': 's-1', 'event.name': 'user_prompt', 'event.timestamp': new Date(1000).toISOString(), 'event.sequence': 0, 'prompt.id': 'p-1', prompt_length: '5' })
+    expect(p.attributes).toEqual({ 'session.id': 's-1', 'event.name': 'user_prompt', 'event.timestamp': new Date(1000).toISOString(), 'event.sequence': 0, 'prompt.id': 'p-1', prompt_length: '5', prompt: '<REDACTED>', prompt_text: '<REDACTED>' })
     expect(r.attributes).toEqual({
       'session.id': 's-1', 'event.name': 'api_request', 'event.timestamp': new Date(1500).toISOString(), 'event.sequence': 1, 'prompt.id': 'p-1', model: 'claude-haiku-5-5', input_tokens: 1, output_tokens: 2,
-      cache_read_tokens: 3, cache_creation_tokens: 4, cost_usd: 0.2, cost_usd_micros: 200000, duration_ms: 500, query_source: 'sdk',
+      cache_read_tokens: 3, cache_creation_tokens: 4, cache_creation_5m_tokens: 0, cache_creation_1h_tokens: 0, cost_usd: 0.2, cost_usd_micros: 200000, duration_ms: 500, query_source: 'sdk',
     })
     expect(t.attributes).toEqual(expect.objectContaining({ 'event.sequence': 2, success: 'false', duration_ms: '100', tool_name: 'Read', tool_use_id: 'toolu_9' }))
   })

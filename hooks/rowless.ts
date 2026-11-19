@@ -7,7 +7,9 @@
 // tokens or a call's outcome. Its other hooks still run: each turn's start and end, each model request's model, effort, usage and stop
 // reason (`turn.step`), each tool call and what it answered (`tool.call`), and the session's cost so far (`$.session.usage()`).
 //
-// From those, the plugin builds the four rows Mainwave reads a session from, under Claude Code's names, attributes and value types:
+// Claude Code 2.1.326 and later hands each plugin a row as it loads, and a turn's prompt row before the turn, so a first turn that
+// begins with no row seen means none comes (register.ts decides, and ends it as soon as one does). From those events, the plugin
+// builds the four rows Mainwave reads a session from, under Claude Code's names, attributes and value types:
 //
 //   user_prompt     a main-loop turn began: its prompt's length (the text itself is the gate's to add, as for Claude Code's row)
 //   api_request     a model request answered: its model, tokens, effort, duration, time to first token and cost
@@ -52,6 +54,13 @@ export function hostIdentityOf(env: HostIdentityEnv): Record<string, string> {
   }
 }
 
+/** The device ID in Claude's account file (`userID`), which Claude Code keeps per installation, whoever is signed in. */
+export function accountDeviceOf(json: unknown): Record<string, string> {
+  const userId = json !== null && typeof json === 'object' ? (json as Record<string, unknown>)['userID'] : undefined
+  const { deviceId } = identityOf({ 'user.id': userId })
+  return deviceId === undefined ? {} : { 'user.id': deviceId }
+}
+
 /**
  * Who the session is where no row says: the host's identity where it names the organization and the email, else the account file's.
  * The account file's device ID goes with either: Claude Code keeps one per installation.
@@ -62,12 +71,28 @@ export function sessionIdentityOf(host: Readonly<Record<string, string>>, file: 
   return { ...(device !== undefined ? { 'user.id': device } : {}), ...host }
 }
 
+/** What the session's environment says of where its requests go and where it runs, as Claude Code puts it on each row. */
+export type HostFacts = {
+  /** `anthropic.provider`: `firstParty`, or the cloud provider the session runs on. */
+  provider: string
+  /** `ANTHROPIC_BASE_URL` is set: requests go elsewhere than Anthropic's API (a gateway, a proxy). */
+  customBaseUrl: boolean
+  /** The session takes no input from a person (`claude -p`, an SDK host): `terminal.type` `non-interactive`. */
+  nonInteractive: boolean
+}
+
+/** `anthropic.provider` as Claude Code names it, from the variables that pick a cloud provider. */
+export function providerOf(env: { CLAUDE_CODE_USE_BEDROCK?: string | undefined; CLAUDE_CODE_USE_VERTEX?: string | undefined; CLAUDE_CODE_USE_FOUNDRY?: string | undefined }): string {
+  const on = (v: string | undefined) => ['1', 'true', 'yes', 'on'].includes((v ?? '').trim().toLowerCase())
+  return on(env.CLAUDE_CODE_USE_BEDROCK) ? 'bedrock' : on(env.CLAUDE_CODE_USE_VERTEX) ? 'vertex' : on(env.CLAUDE_CODE_USE_FOUNDRY) ? 'foundry' : 'firstParty'
+}
+
 /**
  * The attributes Claude Code puts first on each of its rows, in its order: the organization's resource attributes
- * (`OTEL_RESOURCE_ATTRIBUTES`), then the device, the session and who it is. The rebuild reads them as the session's common
- * attributes, as it reads a row's.
+ * (`OTEL_RESOURCE_ATTRIBUTES`), then the device, the session and who it is, then where requests go and the terminal (an interactive
+ * session's terminal no event names). The rebuild reads them as the session's common attributes, as it reads a row's.
  */
-export function rowHead(resource: Readonly<Record<string, string>>, identity: Readonly<Record<string, string>>, sessionId: string | undefined): Attrs {
+export function rowHead(resource: Readonly<Record<string, string>>, identity: Readonly<Record<string, string>>, sessionId: string | undefined, host?: HostFacts): Attrs {
   const out: Attrs = { ...resource }
   const put = (key: string, value: string | undefined) => {
     if (value === undefined) return
@@ -79,6 +104,11 @@ export function rowHead(resource: Readonly<Record<string, string>>, identity: Re
   put('organization.id', identity['organization.id'])
   put('user.email', identity['user.email'])
   put('user.account_uuid', identity['user.account_uuid'])
+  if (host !== undefined) {
+    out['anthropic.provider'] = host.provider
+    if (host.customBaseUrl) out['anthropic.custom_base_url'] = true
+    if (host.nonInteractive) out['terminal.type'] = 'non-interactive'
+  }
   return out
 }
 
@@ -106,8 +136,8 @@ function row(state: Rowless, head: Attrs, event: string, atMs: number, attribute
 /** A main-loop turn began with `text`: a new prompt id, and its `user_prompt` row. */
 export function promptRow(state: Rowless, head: Attrs, text: string, atMs: number, promptId: string): RowIn {
   state.promptId = promptId
-  // Claude Code logs the length as a string, and the text only where prompts are logged: the gate adds it where it allows.
-  return row(state, head, 'user_prompt', atMs, [['prompt_length', String(text.length)]])
+  // Claude Code logs the length as a string, and the text as redacted unless prompts are logged: the gate adds it where it allows.
+  return row(state, head, 'user_prompt', atMs, [['prompt_length', String(text.length)], ['prompt', '<REDACTED>'], ['prompt_text', '<REDACTED>']])
 }
 
 /** What one answered model request says, as `turn.step` and the plugin's clock saw it. */
@@ -124,6 +154,8 @@ export type RequestFacts = {
   }
   effort?: string | number
   agentId?: string
+  /** The subagent's type and whether Claude Code ships it, as its spawn said; undefined where no spawn was seen. */
+  agent?: { type: string; builtIn: boolean }
   startMs: number
   endMs: number
   firstChunkMs?: number
@@ -153,22 +185,26 @@ export function requestRow(state: Rowless, head: Attrs, f: RequestFacts): RowIn 
   const u = f.usage
   const cost = costOf(state, f.sessionCostUsd)
   const effort = typeof f.effort === 'string' ? f.effort : undefined
+  // Claude Code writes both lifetimes, 0 where no write named one.
+  const noLifetime = u.ephemeral_5m_input_tokens === undefined && u.ephemeral_1h_input_tokens === undefined ? 0 : undefined
+  const source = f.agentId === undefined ? (f.sdk ? 'sdk' : 'repl_main_thread') : f.agent === undefined ? 'agent:custom' : `agent:${f.agent.builtIn ? 'builtin' : 'custom'}:${f.agent.type}`
   return row(state, head, 'api_request', f.endMs, [
     ['model', u.model ?? f.model],
     ['input_tokens', whole(u.input_tokens) ?? 0],
     ['output_tokens', whole(u.output_tokens) ?? 0],
     ['cache_read_tokens', whole(u.cache_read_input_tokens) ?? 0],
     ['cache_creation_tokens', whole(u.cache_creation_input_tokens) ?? 0],
-    ['cache_creation_5m_tokens', whole(u.ephemeral_5m_input_tokens)],
-    ['cache_creation_1h_tokens', whole(u.ephemeral_1h_input_tokens)],
+    ['cache_creation_5m_tokens', whole(u.ephemeral_5m_input_tokens) ?? noLifetime],
+    ['cache_creation_1h_tokens', whole(u.ephemeral_1h_input_tokens) ?? noLifetime],
     ['cost_usd', cost],
     ['cost_usd_micros', cost === undefined ? undefined : Math.round(cost * 1e6)],
     ['duration_ms', Math.max(0, Math.round(f.endMs - f.startMs))],
     ['ttft_ms', f.firstChunkMs === undefined ? undefined : Math.max(0, Math.round(f.firstChunkMs - f.startMs))],
-    // Claude Code names a subagent's requests by the agent's type, which `turn.step` does not say: `agent:custom` reads as a subagent's.
-    ['query_source', f.agentId !== undefined ? 'agent:custom' : f.sdk ? 'sdk' : 'repl_main_thread'],
+    // A subagent's requests by its type, from its spawn; `agent:custom` where none was seen, which still reads as a subagent's.
+    ['query_source', source],
     ['effort', effort],
     ['agent_id', f.agentId],
+    ['agent.name', f.agent?.type],
   ])
 }
 
@@ -176,22 +212,47 @@ export function requestRow(state: Rowless, head: Attrs, f: RequestFacts): RowIn 
  * A tool call's permission decision: its `tool_decision` row, as the call began. Built once the call settles, as only its result says
  * whether it was refused; what decided (a rule, a hook, the person) no event a plugin may hook says.
  */
-export function decisionRow(state: Rowless, head: Attrs, call: { tool: string; id: string; agentId?: string; refused: boolean }, atMs: number): RowIn {
+export function decisionRow(state: Rowless, head: Attrs, call: { tool: string; id: string; agentId?: string; refused: boolean; verdict?: Verdict }, atMs: number): RowIn {
   return row(state, head, 'tool_decision', atMs, [
     ['decision', call.refused ? 'reject' : 'accept'],
+    ['source', decisionSource(call.verdict)],
     ['tool_name', call.tool],
     ['tool_use_id', call.id],
+    ['tool_source', call.tool.startsWith('mcp__') ? 'mcp' : 'builtin'],
     ['agent_id', call.agentId],
   ])
 }
 
+/** A tool call's permission check, as `tool.check` answered it. */
+export type Verdict = { decision?: string; rule?: string; hook?: string; setting?: string }
+
+/**
+ * Who decided a call, under Claude Code's names, where the check says: a hook (`hook`), or a rule or setting (`config`). An ask the
+ * person, the mode or the classifier settled says nothing of who; nor does a verdict that names none.
+ */
+export function decisionSource(v: Verdict | undefined): string | undefined {
+  if (v === undefined || v.decision === 'ask') return undefined
+  if (typeof v.hook === 'string') return 'hook'
+  if (typeof v.rule === 'string' || typeof v.setting === 'string') return 'config'
+  return undefined
+}
+
+/** A string's size in bytes of UTF-8, as Claude Code counts a tool's input and result. */
+const bytes = (text: string) => new TextEncoder().encode(text).length
+
 /** A tool call ended: its `tool_result` row, its outcome and duration as strings, as Claude Code logs them. */
-export function resultRow(state: Rowless, head: Attrs, call: { tool: string; id: string; agentId?: string; startMs: number; endMs: number; isError: boolean }): RowIn {
+export function resultRow(
+  state: Rowless,
+  head: Attrs,
+  call: { tool: string; id: string; agentId?: string; startMs: number; endMs: number; isError: boolean; input?: Readonly<Record<string, unknown>>; text?: string },
+): RowIn {
   return row(state, head, 'tool_result', call.endMs, [
     ['tool_name', call.tool],
     ['tool_use_id', call.id],
     ['success', call.isError ? 'false' : 'true'],
     ['duration_ms', String(Math.max(0, Math.round(call.endMs - call.startMs)))],
+    ['tool_input_size_bytes', call.input === undefined ? undefined : String(bytes(JSON.stringify(call.input)))],
+    ['tool_result_size_bytes', call.text === undefined || call.isError ? undefined : String(bytes(call.text))],
     ['agent_id', call.agentId],
   ])
 }
