@@ -800,7 +800,11 @@ function checkKeyless(pass, { captured, run, config }, reference) {
     return out
   }
   const wantRows = pointed(logRecordsOf(reference.exporter.logs).filter(r => !STARTUP.has(r.attributes['event.name']?.v)), spansOf(reference.exporter.traces))
-  const gotRows = pointed(rows, spans)
+  // A startup row reaches the plugin or not as the race with its loading goes: where one does, it names no span, as no interaction ran yet.
+  const gotRows = pointed(rows.filter(r => !STARTUP.has(r.attributes['event.name']?.v)), spans)
+  for (const [ev, k] of pointed(rows.filter(r => STARTUP.has(r.attributes['event.name']?.v)), spans)) {
+    if ([...k].some(kind => kind !== 'none')) problems.push(`logs: a ${ev} row, raised as the session starts, names ${[...k].join(' and ')}`)
+  }
   const kinds = m => [...m].map(([ev, k]) => `${ev}: ${[...k].sort().join(' and ')}`).sort()
   for (const ev of new Set([...wantRows.keys(), ...gotRows.keys()])) {
     const [w, g] = [[...(wantRows.get(ev) ?? [])].sort().join(' and '), [...(gotRows.get(ev) ?? [])].sort().join(' and ')]
