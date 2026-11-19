@@ -5,8 +5,8 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { accountDeviceOf, costOf, decisionSource, hostIdentityOf, isRefusal, promptIdFrom, responseTextOf, seedCost, newRowless, promptRow, providerOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
-import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, PROD, records, type Post } from './rig.ts'
+import { accountDeviceOf, costOf, decisionSource, hostIdentityOf, isRefusal, promptIdFrom, responseTextOf, seedCost, newRowless, promptRow, providerOf, remoteSessionIdOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
+import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, infoCall, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, PROD, records, type Post } from './rig.ts'
 
 const keyless = { options: {} }
 const START = 1_800_000_000_000
@@ -19,7 +19,7 @@ const HOST_EMAIL = 'host@example.com'
 const BUILT = 'mainwave.telemetry.built_from'
 const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 300, cache_creation_input_tokens: 40, ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 40 }
 
-type World = { env?: Record<string, string>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown> }
+type World = { env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown> }
 
 function world(on: On, opts: World = {}) {
   const clock = mock.clock(on, { now: START })
@@ -31,7 +31,20 @@ function world(on: On, opts: World = {}) {
     return { status: answer.status, text: answer.text }
   })
   // Claude Code 2.1.326 on hands each plugin a row as it loads, so a turn that begins with none seen means none comes.
-  const rig = boot(on, { entrypoint: 'cli', env: { HOME, ...opts.env }, version: opts.version ?? '2.1.328' })
+  const rig = boot(on, { entrypoint: opts.entrypoint ?? 'cli', env: { HOME, ...opts.env }, version: opts.version ?? '2.1.328' })
+  // `$.session.machine()`, by a glob: Claude Code before 2.1.328 has no such call, and refuses a hook that names it.
+  const machine = opts.machine
+  if (machine !== undefined) {
+    on('session.*', (_$, e, next) => ((next.event as string) === 'session.machine' ? ({ value: { sysname: 'Linux', release: '6.8.0', machine, packageManagers: [], runtimes: [] } } as never) : next(e)))
+  }
+  // The engine enters each prompt, but the one a hook drops. A prompt `turns` names starts its turn, with the text the host gives it,
+  // before the submission resolves, as Claude Code's does.
+  on('prompt.submit', async (_$, e) => {
+    const text = (e as { text: string }).text
+    if (text === opts.dropPrompt) return { drop: 'dropped in test' } as never
+    await opts.turns?.[text]?.()
+    return { text } as never
+  })
   on('fs.read', (_$, e) => {
     const path = (e as unknown as { path: string }).path
     if (path === `${HOME}/.claude.json` && opts.accountFile !== undefined) return { value: JSON.stringify(opts.accountFile) } as never
@@ -43,7 +56,12 @@ function world(on: On, opts: World = {}) {
   let cost = opts.costBefore ?? 0
   const spend = (usd: number) => (cost = Math.round((cost + usd) * 1e9) / 1e9)
   on('session.usage', () => ({ value: { startedAt: opts.startedAt ?? START, context: {}, rateLimits: [], cost: { usd: cost } } }) as never)
-  on('session.start', (_$, e) => ({ cwd: (e as { cwd: string }).cwd }) as never)
+  // Whether the engine itself has `$.session.machine()` (2.1.328 on), asked by the test's own hook as the session starts (infoCall).
+  let machineThere = false
+  on('session.start', async ($, e) => {
+    if (machine !== undefined) machineThere = await infoCall(() => ($ as unknown as { session: { machine: () => Promise<unknown> } }).session.machine())
+    return { cwd: (e as { cwd: string }).cwd } as never
+  })
   on('session.end', (_$, e) => ({ sessionId: (e as { sessionId: string }).sessionId }) as never)
   on('ui.log', () => ({ value: undefined }) as never)
   on('turn.start', (_$, e) => ({ turnId: (e as { turnId: string }).turnId }) as never)
@@ -68,7 +86,7 @@ function world(on: On, opts: World = {}) {
   })
   const logs = () => posts.filter(p => new URL(p.url).pathname === '/v1/logs').flatMap(records)
   const built = () => logs().filter(r => r.attributes[BUILT] === 'events')
-  return { clock, posts, rig, logs, built, spend }
+  return { clock, posts, rig, logs, built, spend, machineThere: () => machineThere }
 }
 
 /** One main-loop turn: a prompt, one model request, one Bash call, as Claude Code's events alone show them. */
@@ -347,6 +365,95 @@ describe('the rows built from events', () => {
     expect(w.built().filter(r => r.attributes['event.name'] === 'api_request').length).toBe(2)
   })
 
+  test("a turn the host starts with no text takes the prompt submitted while idle: one prompt row, of that prompt's length", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, env: { CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: '1' }, turns: { 'summarize the notes': () => turn($, '', 'toolu_1') } })
+    await start($)
+    await $.prompt.submit({ text: 'summarize the notes', wait: false, origin: { kind: 'sdk' } } as never)
+    // The next turn with no text is a continuation: the prompt went with the turn before.
+    await turn($, '', 'toolu_2')
+    await w.clock.advance(5_000)
+    await end($)
+    const prompts = w.built().filter(r => r.attributes['event.name'] === 'user_prompt')
+    expect(prompts.length).toBe(1)
+    expect(prompts[0]!.attributes['prompt_length']).toBe('19')
+    expect(prompts[0]!.attributes['prompt']).toBe('<REDACTED>')
+    expect(JSON.stringify(w.posts.map(p => p.body))).not.toContain('summarize the notes')
+    // The interaction takes the prompt row, and its length.
+    const interactions = spans(w.posts).filter(x => x.name === 'claude_code.interaction')
+    expect(interactions.map(x => x.attrs['user_prompt_length'])).toEqual([19, 0])
+  })
+
+  test('with prompt.text on, that prompt row carries the submitted text', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, store: { dataPoints: { 'prompt.text': 'on' } }, turns: { 'summarize the notes': () => turn($, '', 'toolu_1') } })
+    await start($)
+    await $.prompt.submit({ text: 'summarize the notes', wait: false, origin: { kind: 'sdk' } } as never)
+    await w.clock.advance(5_000)
+    const prompts = w.built().filter(r => r.attributes['event.name'] === 'user_prompt')
+    expect(prompts.map(r => [r.attributes['prompt_length'], r.attributes['prompt']])).toEqual([['19', 'summarize the notes']])
+  })
+
+  test("a prompt typed into a running turn, one dropped, or one that started no turn, is no later turn's: a turn with no text then builds no prompt row", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, dropPrompt: 'blocked' })
+    await start($)
+    await turn($, 'go', 'toolu_1')
+    await $.prompt.submit({ text: 'and also this', turnId: 't1', wait: false, origin: { kind: 'composer' } } as never)
+    await turn($, '', 'toolu_2')
+    await $.prompt.submit({ text: 'blocked', wait: false, origin: { kind: 'composer' } } as never)
+    await turn($, '', 'toolu_3')
+    // One that entered and started no turn by the time it resolved: none of the turns after it is its.
+    await $.prompt.submit({ text: 'started nothing', wait: false, origin: { kind: 'composer' } } as never)
+    await turn($, '', 'toolu_4')
+    await w.clock.advance(5_000)
+    const prompts = w.built().filter(r => r.attributes['event.name'] === 'user_prompt')
+    expect(prompts.map(r => r.attributes['prompt_length'])).toEqual(['2'])
+  })
+
+  test("a prompt the person never sees as typed (isMeta), or one a plugin submits over a running turn, is no empty turn's", keyless, async ($, on) => {
+    const w = world(on, {
+      accountFile: ACCOUNT_FILE,
+      turns: {
+        'hidden reminder': () => turn($, '', 'toolu_1'),
+        // Still entering when the running turn ends and a continuation starts.
+        'from a plugin': async () => {
+          await $.turn.complete({ turnId: 't9', answer: 'ok', durationMs: 20, isAborted: false, reason: 'answer' } as never)
+          await turn($, '', 'toolu_3')
+        },
+      },
+    })
+    await start($)
+    await $.prompt.submit({ text: 'hidden reminder', isMeta: true, wait: false, origin: { kind: 'sdk' } } as never)
+    // A plugin's prompt carries no turnId even while a turn runs; the continuation that follows the turn is not its.
+    await $.turn.start({ turnId: 't9', text: 'go' } as never)
+    await $.prompt.submit({ text: 'from a plugin', wait: false, origin: { kind: 'plugin' } } as never)
+    await w.clock.advance(5_000)
+    expect(w.built().filter(r => r.attributes['event.name'] === 'user_prompt').map(r => r.attributes['prompt_length'])).toEqual(['2'])
+  })
+
+  test("a subagent's turn with no text neither takes the prompt held for the main loop nor lets it go", keyless, async ($, on) => {
+    const w = world(on, {
+      accountFile: ACCOUNT_FILE,
+      turns: {
+        'summarize the notes': async () => {
+          await $.turn.start({ turnId: 'sub-1', text: '', agentId: 'agent-1' } as never)
+          await $.turn.complete({ turnId: 'sub-1', answer: 'ok', durationMs: 10, isAborted: false, reason: 'answer', agentId: 'agent-1' } as never)
+          await turn($, '', 'toolu_1')
+        },
+      },
+    })
+    await start($)
+    await $.prompt.submit({ text: 'summarize the notes', wait: false, origin: { kind: 'sdk' } } as never)
+    await w.clock.advance(5_000)
+    expect(w.built().filter(r => r.attributes['event.name'] === 'user_prompt').map(r => r.attributes['prompt_length'])).toEqual(['19'])
+  })
+
+  test("a turn that starts with its own text keeps it, whatever was submitted", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, turns: { typed: () => turn($, 'typed, expanded', 'toolu_1') } })
+    await start($)
+    await $.prompt.submit({ text: 'typed', wait: false, origin: { kind: 'composer' } } as never)
+    await w.clock.advance(5_000)
+    expect(w.built().filter(r => r.attributes['event.name'] === 'user_prompt').map(r => r.attributes['prompt_length'])).toEqual(['15'])
+  })
+
   test('a refused call has its decision alone, a reject, as in Claude Code', keyless, async ($, on) => {
     const w = world(on, { accountFile: ACCOUNT_FILE })
     await start($)
@@ -389,6 +496,82 @@ describe('the rows built from events', () => {
     const req = rows.find(r => r.attributes['event.name'] === 'api_request')!.attributes
     expect(req['agent_id']).toBe('a1')
     expect(req['query_source']).toBe('agent:custom')
+  })
+})
+
+describe('in Cowork', () => {
+  const COWORK_ENVS: [string, World][] = [
+    ['the entry point remote_cowork', { entrypoint: 'remote_cowork' }],
+    ['CLAUDE_CODE_IS_COWORK', { entrypoint: 'sdk-ts', env: { CLAUDE_CODE_IS_COWORK: 'true' } }],
+  ]
+  for (const [how, env] of COWORK_ENVS) {
+    test(`a Cowork session (${how}) goes as Cowork's: service cowork and surface remote on the resource, the surface and the remote session on each row`, keyless, async ($, on) => {
+      const w = world(on, { accountFile: ACCOUNT_FILE, ...env, env: { ...env.env, CLAUDE_CODE_REMOTE_SESSION_ID: 'cse_0123abcd', CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: '1' } })
+      await start($)
+      await turn($)
+      await w.clock.advance(5_000)
+      await end($)
+      const rows = w.built()
+      expect(rows.length).toBe(5)
+      for (const r of rows) {
+        expect(r.resource['service.name']).toBe('cowork')
+        expect(r.resource['cowork.surface']).toBe('remote')
+        expect(r.resource['service.version']).toBe('2.1.328')
+        expect(r.attributes['cowork.surface']).toBe('remote')
+        expect(r.attributes['ccr.session.id']).toBe('cse_0123abcd')
+        expect(contractViolations(r.attributes)).toEqual([])
+      }
+      // Claude Code's rows start with the host's resource attributes, then the session.
+      expect(Object.keys(rows[0]!.attributes).slice(0, 4)).toEqual(['cowork.surface', 'user.id', 'session.id', 'ccr.session.id'])
+      // The spans and metrics take the rows' head, and the same resource.
+      const traces = w.posts.filter(p => p.url === `${PROD}/v1/traces`).flatMap(p => JSON.parse(p.body).resourceSpans as { resource: { attributes: { key: string; value: { stringValue: string } }[] } }[])
+      expect(traces.length).toBeGreaterThan(0)
+      for (const rs of traces) expect(Object.fromEntries(rs.resource.attributes.map(a => [a.key, a.value.stringValue]))).toEqual(expect.objectContaining({ 'service.name': 'cowork', 'cowork.surface': 'remote' }))
+      const built = spans(w.posts)
+      expect(built.length).toBeGreaterThan(0)
+      for (const x of built) expect(x.attrs['cowork.surface']).toBe('remote')
+      const usage = points(w.posts).filter(p => p.name === 'claude_code.cost.usage')
+      expect(usage.length).toBeGreaterThan(0)
+      for (const p of usage) expect(p.attrs['cowork.surface']).toBe('remote')
+    })
+  }
+
+  test('a Claude Code session: service claude-code, and no surface or remote session', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, env: { CLAUDE_CODE_IS_COWORK: '0' } })
+    await start($)
+    await turn($)
+    await w.clock.advance(5_000)
+    const rows = w.built()
+    expect(rows.length).toBe(5)
+    for (const r of rows) {
+      expect(r.resource['service.name']).toBe('claude-code')
+      expect(r.resource['cowork.surface']).toBeUndefined()
+      expect(r.attributes['cowork.surface']).toBeUndefined()
+      expect(r.attributes['ccr.session.id']).toBeUndefined()
+    }
+  })
+
+  test("the variables Cowork's host sets still win: its service name and surface", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', env: { OTEL_SERVICE_NAME: 'cowork-desktop', OTEL_RESOURCE_ATTRIBUTES: 'cowork.surface=local' } })
+    await start($)
+    await turn($)
+    await w.clock.advance(5_000)
+    const rows = w.built()
+    expect(rows.length).toBe(5)
+    for (const r of rows) {
+      expect(r.resource['service.name']).toBe('cowork-desktop')
+      expect(r.resource['cowork.surface']).toBe('local')
+      expect(r.attributes['cowork.surface']).toBe('local')
+    }
+  })
+
+  test("the resource's host.arch is the machine's, as the SDK's host detector names it, where Claude Code says what the machine is", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', machine: 'x86_64' })
+    await start($)
+    await turn($)
+    await w.clock.advance(5_000)
+    // Claude Code before 2.1.328 (the floor among them) has no `$.session.machine()`: the resource goes without it.
+    expect(w.built().map(r => r.resource['host.arch'])).toEqual(Array(5).fill(w.machineThere() ? 'amd64' : undefined))
   })
 })
 
@@ -474,6 +657,18 @@ describe('rowless.ts', () => {
     const file = { 'organization.id': ORG, 'user.email': EMAIL, 'user.account_uuid': ACCOUNT, 'user.id': DEVICE }
     expect(sessionIdentityOf({}, file)).toEqual(file)
     expect(sessionIdentityOf({ 'organization.id': HOST_ORG, 'user.email': HOST_EMAIL }, file)).toEqual({ 'user.id': DEVICE, 'organization.id': HOST_ORG, 'user.email': HOST_EMAIL })
+  })
+
+  test("in Cowork the head starts with its surface, unless the resource names one, and names the remote session after the session", () => {
+    const host = { provider: 'firstParty', customBaseUrl: false, nonInteractive: true, cowork: true, remoteSessionId: 'cse_1' }
+    expect(rowHead({}, { 'organization.id': ORG, 'user.email': EMAIL }, 's-1', host)).toEqual({
+      'cowork.surface': 'remote', 'session.id': 's-1', 'ccr.session.id': 'cse_1', 'organization.id': ORG, 'user.email': EMAIL, 'anthropic.provider': 'firstParty', 'terminal.type': 'non-interactive',
+    })
+    expect(rowHead({ 'cowork.surface': 'local' }, {}, 's-1', host)['cowork.surface']).toBe('local')
+    expect(rowHead({}, {}, 's-1', { ...host, cowork: false, remoteSessionId: undefined })).toEqual({ 'session.id': 's-1', 'anthropic.provider': 'firstParty', 'terminal.type': 'non-interactive' })
+    expect(remoteSessionIdOf(' cse_01ABC ')).toBe('cse_01ABC')
+    expect(remoteSessionIdOf('a b')).toBeUndefined()
+    expect(remoteSessionIdOf(undefined)).toBeUndefined()
   })
 
   test("the head: the resource's attributes first, then the device, the session and who it is", () => {

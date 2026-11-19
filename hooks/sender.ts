@@ -45,7 +45,7 @@ import type { EngineInterface, Timer } from 'claude-code'
 import { combinePacks, currentGate, gateMarker, gatePoint, gateResource, gateRow, optInOf, packsOf, setOptIn, setOrgPacks, setPersonPacks } from './gate.ts'
 import { fetchWithin, type FetchOutcome } from './http.ts'
 import { applyStoredSettings } from './orgsettings.ts'
-import { logsBody, metricsBody, resourceOf, tracesBody, type BuiltSpan, type CopiedRow, type MetricPoint } from './otlp.ts'
+import { hostArchOf, isCowork, logsBody, metricsBody, resourceOf, tracesBody, type BuiltSpan, type CopiedRow, type MetricPoint } from './otlp.ts'
 import { routingIdentityOf } from './identity.ts'
 import { collectorIn, namesOption, OPT_IN_OPTION, optionValues, PACKS_OPTION, PROD_COLLECTOR, type Layer } from './settings.ts'
 
@@ -269,6 +269,9 @@ export function snapshot() {
   }
 }
 
+/** The engine calls newer than the plugin's floor that the sender makes, each wrapped so an older engine's lack of it is a miss. */
+type Newer = { session: { machine: () => Promise<{ machine?: unknown }> } }
+
 async function readResource($: EngineInterface): Promise<string> {
   const get = async (read: () => Promise<string | undefined>) => {
     try {
@@ -277,13 +280,18 @@ async function readResource($: EngineInterface): Promise<string> {
       return undefined
     }
   }
-  const [resourceAttributes, serviceName, version] = await Promise.all([
+  const [resourceAttributes, serviceName, version, isCoworkVar, entrypoint, machine] = await Promise.all([
     get(() => $.env.get('OTEL_RESOURCE_ATTRIBUTES')),
     get(() => $.env.get('OTEL_SERVICE_NAME')),
     get(async () => (await $.session.version()).version),
+    get(() => $.env.get('CLAUDE_CODE_IS_COWORK')),
+    get(() => $.env.get('CLAUDE_CODE_ENTRYPOINT')),
+    // Claude Code 2.1.328 on says what the machine is; an older one has no `machine`, and the resource goes without `host.arch`.
+    get(async () => hostArchOf((await ($ as unknown as Newer).session.machine()).machine)),
   ])
   scopeVersion = version
-  return JSON.stringify(resourceOf({ resourceAttributes, serviceName, version }))
+  const cowork = isCowork({ CLAUDE_CODE_IS_COWORK: isCoworkVar, CLAUDE_CODE_ENTRYPOINT: entrypoint })
+  return JSON.stringify(resourceOf({ resourceAttributes, serviceName, version, cowork, hostArch: machine }))
 }
 
 /**
