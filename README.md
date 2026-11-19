@@ -20,7 +20,7 @@ The plugin does five things.
 | `mainwave.plugin.entrypoint` | where the session runs, from `CLAUDE_CODE_ENTRYPOINT` (`cli`, `claude-vscode`, `remote_cowork` and so on); `other` for anything else |
 | `mainwave.telemetry.route` | which path the row took: `exporter` on the row Claude Code's exporter sends, `plugin` on the plugin's own copy |
 
-Mainwave can then tell which sessions run the plugin, which version, and where.
+Mainwave can then tell which sessions run the plugin, which version, and where. It stamps only the rows that reach it: since Claude Code 2.1.328, in Team and Enterprise organizations, none do (Two modes, under What it sends), so there it stamps nothing, and its own copy is what reaches Mainwave.
 
 It also reads who the session is from those rows: the organization (`organization.id`), the account (`user.account_uuid`), the email (`user.email`) and the device (`user.id`, an ID Claude Code keeps per installation). It keeps them in memory for the session. Where no row reaches the plugin (`rows_skipped` and Two modes, below), it reads them where Claude Code reads them, unless the session signs in with a key or a provider of its own (an API key or token, a gateway's token, a cloud provider, an `apiKeyHelper`): then none. First from the variables a host sets to name the session's account (`CLAUDE_CODE_ORGANIZATION_UUID`, `CLAUDE_CODE_USER_EMAIL`, `CLAUDE_CODE_ACCOUNT_UUID`; Cowork sets them), which also hold where the host hands the session its OAuth token. Otherwise, where the session signs in with the account file's login (no API key, cloud provider, gateway or host token), from Claude's account file (`oauthAccount` and `userID` in `.claude.json`, in `CLAUDE_CONFIG_DIR`, else the home folder). The device ID comes from that file alone. It is read even where the session signs in another way or with a key, as Claude Code keeps it per installation, not per login. It uses them until a row names the session, and reads nothing else in that file for it. The organization and email go to Mainwave in two places only: on the records of its own copy (below), and in its request for the organization's settings (next). The account and device go on the copy's records alone.
 
@@ -88,8 +88,8 @@ Every span and data point starts with the attributes Claude Code puts first on a
 
 **Two modes: with Claude Code's rows, or built from its events.** The plugin picks one per load by itself, and needs no setting for either.
 
-- **With rows**, it copies Claude Code's own rows, as above. This happens where they reach it: a personal account, a plugin the organization's managed settings enable (Install, below), and Claude Code before 2.1.328.
-- **Without them**, it builds the rows from Claude Code's own events. Since 2.1.328, in Team and Enterprise organizations and on machines with managed settings, Claude Code seats a built-in plugin that runs first. It sends every collector row, and every classic hook event, on past the plugins installed in the `user` tier, which an org-synced plugin is. The plugin's other hooks still run, so it builds from turns, model requests, tool calls, permission checks and the session's cost.
+- **Without them**, it builds the rows from Claude Code's own events. This is its main path: Claude Code and Cowork alike, in Team and Enterprise organizations. Since 2.1.328, there and on machines with managed settings, Claude Code seats a built-in plugin that runs first. It sends every collector row, and every classic hook event, on past the plugins in the `user` tier. An org-synced plugin is one, Required or not, and so is one the organization's managed settings enable from this repository. Claude Code seats a plugin in the organization's tier only from a marketplace in a local folder, or, from a remote source, once it records a hash of the plugin's copy, which 2.1.328 does not yet. The plugin's other hooks still run, so it builds from turns, model requests, responses, tool calls, permission checks and the session's cost.
+- **With rows**, it copies Claude Code's own rows, as above. This happens where they reach it: a personal account, and Claude Code before 2.1.328.
 
 The plugin builds rows when no row of Claude Code's has reached it by the time the first turn of a load begins. Claude Code 2.1.326 and later hands each plugin a row as it loads, and a turn's prompt row before its turn, so where rows reach the plugin one has come by then. A row seen earlier in the same process, before a reload, counts too. On an older Claude Code, the grace of `rows_skipped` decides instead, and the rows are built from the next turn on, never from the middle of one. The first row of Claude Code's that reaches the plugin ends it for the load, and from then the rows are copies again. So no record is sent twice, and a session's status row says which mode it ran in: `rows_skipped` while it builds them.
 
@@ -105,7 +105,7 @@ The plugin builds rows when no row of Claude Code's has reached it by the time t
 
 Every row starts as Claude Code's do: the organization's resource attributes, the device, the session and who it is, then `anthropic.provider`, `anthropic.custom_base_url` where `ANTHROPIC_BASE_URL` is set, and `terminal.type` `non-interactive` for a session no person types into. The rows go through the rebuild and the copy as Claude Code's rows do, so the spans and metrics go with them. Each interaction is the root of a trace the plugin builds, as without the env block. They go under the identity above: the host's variables, else the account file. What the session spends between turns, or after the last one, goes in `cost.usage` with `query_source` `auxiliary`, as the exporter sends the cost of requests outside the main loop. Examples are a compaction, a prompt suggestion or a memory. So the session's cost there is Claude Code's whole. What it spends during a turn outside a request of it goes with that turn's next request.
 
-**What Claude Code's rows add.** The end-to-end test runs the same scripted session in both modes and compares the plugin's two copies field by field (Developing, below). The rows built from events carry every other field the copied rows carry, with the same values. What the copy with Claude Code's rows has besides, and so what the managed settings add in Claude Code:
+**What Claude Code's rows add.** The end-to-end test runs the same scripted session in both modes and compares the plugin's two copies field by field (Developing, below). The rows built from events carry every other field the copied rows carry, with the same values. What the copy with Claude Code's rows has besides, where rows reach the plugin:
 
 | Only with Claude Code's rows | Why the built rows lack it |
 | --- | --- |
@@ -150,7 +150,7 @@ Each marker carries the session's organization, email, account and session ID (t
 
 | Code | When |
 | --- | --- |
-| `rows_skipped` | No row of Claude Code's reached the plugin since it loaded, 5 seconds after its first model request ended (or as the session ends): every model request raises one. A turn that asks no model counts for nothing. So the session ran on rows the plugin built from Claude Code's events (Two modes, above), which is the default for an org-synced plugin in Team and Enterprise organizations from Claude Code 2.1.328 on. For the fields only Claude Code's rows carry, in Claude Code (not Cowork, whose admin settings can't take them), the organization's managed settings add this repository as a marketplace (`extraKnownMarketplaces`) and enable `mainwave@mainwave` (`enabledPlugins`): see Install |
+| `rows_skipped` | No row of Claude Code's reached the plugin since it loaded, 5 seconds after its first model request ended (or as the session ends): every model request raises one. A turn that asks no model counts for nothing. So the session ran on rows the plugin built from Claude Code's events (Two modes, above). That is the expected mode for an org-synced plugin in Team and Enterprise organizations from Claude Code 2.1.328 on, in Claude Code and Cowork alike, and nothing needs fixing. It says which mode a session ran in |
 | `cli_hooks_no_exporter` | The settings run the Mainwave CLI's hooks (`mainwave-hook.sh`), and they have nothing to send with: the CLI reads `OTEL_EXPORTER_OTLP_ENDPOINT` and an `Authorization` header in `OTEL_EXPORTER_OTLP_HEADERS` (or an `otelHeadersHelper`), never a per-signal endpoint or headers variable |
 | `exporter_no_endpoint` | `CLAUDE_CODE_ENABLE_TELEMETRY` is on and no `OTEL_EXPORTER_OTLP_ENDPOINT` (nor a per-signal endpoint) is set |
 | `exporter_no_key` | A signal's endpoint (its own, else `OTEL_EXPORTER_OTLP_ENDPOINT`) is Mainwave's (on `mainwave.com`) and no key goes with it: no `Authorization` header in that signal's headers variable or `OTEL_EXPORTER_OTLP_HEADERS`, and no `otelHeadersHelper` |
@@ -298,18 +298,11 @@ An owner or admin of the Claude organization, on claude.ai:
 1. **Organization settings › Plugins & skills › Sync from GitHub**, then add `mainwaveai/mainwave-agent-plugin` with **Sync automatically** on. While the repository is private, Anthropic's GitHub app must be able to read it.
 2. **Inventory › mainwave › Default access › Required**, so every member's Claude Code and Cowork sessions run it with no install step.
 3. If an older Mainwave plugin is in the inventory, set it to **Not available**, so only one copy stamps rows.
-4. **Optional, for the fields only Claude Code's rows carry** (What Claude Code's rows add): add the plugin to the organization's managed settings. This loads it ahead of the built-in plugin that keeps the rows from it, in the CLI, the IDE extensions and the desktop app's Code tab. Cowork's admin settings can't take these keys, so Cowork sessions always build the rows.
+That is all the plugin needs; each re-sync picks up the repository's `main` branch. In Team and Enterprise organizations, Claude Code 2.1.328 and later keep Claude Code's rows from an org-synced plugin, so it builds them from Claude Code's events (Two modes, under What it sends).
 
-   ```json
-   {
-     "extraKnownMarketplaces": { "mainwave": { "source": { "source": "github", "repo": "mainwaveai/mainwave-agent-plugin" } } },
-     "enabledPlugins": { "mainwave@mainwave": true }
-   }
-   ```
+Don't also add this repository to the organization's managed settings (`extraKnownMarketplaces`, with `enabledPlugins` naming `mainwave@mainwave`). On 2.1.328 it does not bring the rows back: Claude Code seats a plugin from a remote-source marketplace in the organization's tier only once it records a hash of the plugin's copy, which it does not yet, so the plugin stays in the `user` tier. It does harm. It locks out the org-synced copy, and it pins the marketplace's copy in each machine's plugin cache at the version it first installed, which updates only when the version changes.
 
-Steps 1 to 3 are all the plugin needs; each re-sync picks up the repository's `main` branch. In Team and Enterprise organizations, Claude Code 2.1.328 and later keep Claude Code's rows from an org-synced plugin, so without step 4 it builds them from Claude Code's events (Two modes, under What it sends).
-
-The stamps on Claude Code's own exporter rows also need Mainwave's managed `env` block (from Mainwave's org-wide setup). Without it, there is nothing of Claude Code's for them to go on, and the plugin's copy goes on its own.
+Where rows do reach the plugin (a personal account, Claude Code before 2.1.328), its stamps on Claude Code's own exporter rows also need Mainwave's managed `env` block (from Mainwave's org-wide setup). Without it there is nothing of Claude Code's for them to go on. The plugin's copy goes either way.
 
 To check it works: run a session, then look for rows with `mainwave.plugin.name = mainwave` in Mainwave. The session's `plugin_status` row says which mode it ran in: `rows_skipped` where it built the rows.
 

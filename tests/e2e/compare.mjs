@@ -1102,7 +1102,7 @@ function checkRowless(pass, { captured, run }, reference) {
  * What the copy with Claude Code's rows has that the copy built without them lacks: the plugin's own output in the reference pass (the
  * same scripted session, with rows) against the rowless pass's, field by field. Each event the plugin builds, paired call by call and
  * request by request; each span by its kind; each metric series by its sum. A difference that is not a known one fails, so the README's
- * list of what the managed keys add stays true; the known ones are printed.
+ * list of what Claude Code's rows add stays true; the known ones are printed.
  */
 const KEYS_ADD = {
   rows: ['subagent_completed', 'retention_sweep', 'plugin_loaded'],
