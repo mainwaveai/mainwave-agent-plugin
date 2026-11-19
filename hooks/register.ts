@@ -147,6 +147,8 @@ let rowlessPending = false
 let loadedAtMs: number | undefined
 /** The readings of the session's cost, taken one at a time, in order (`takeCost`). */
 let costChain: Promise<unknown> = Promise.resolve()
+/** Since when the next reading of the cost seeds the shares (`seedCost`): the load, or the change of session; and the baseline before. */
+let seedSince: { atMs?: number; previous?: number } = {}
 /** `OTEL_RESOURCE_ATTRIBUTES`, read once per load: Claude Code puts them first on each of its rows. */
 let resourceAttrs: Promise<Record<string, string>> | null = null
 /** When each tool call the plugin builds rows for began, by its id, until it ends. */
@@ -1101,8 +1103,10 @@ async function nextSession($: EngineInterface): Promise<void> {
   textsSent = new Set()
   textsWaiting = new Set()
   pendingArgs = new Map()
-  // A new session starts its sequence over. The cost's baseline stays: a /clear that starts the session's cost over reads as lower.
-  rowlessState = { ...newRowless(), ...(rowlessState.costUsd !== undefined ? { costUsd: rowlessState.costUsd } : {}) }
+  // A new session starts its sequence over, and its first reading of the cost seeds the shares again: a resume's restored cost was
+  // sent already, a /clear starts over or carries on. What the ended session spent last went as it ended.
+  seedSince = { atMs: await $.clock.now(), ...(rowlessState.costUsd !== undefined ? { previous: rowlessState.costUsd } : {}) }
+  rowlessState = newRowless()
   await startServers($)
 }
 
@@ -1204,7 +1208,7 @@ async function startRowless($: EngineInterface): Promise<void> {
   rowless = true
   rowlessPending = false
   // The cost the session had before the rows began: none of it for the rows to carry where an earlier load or process sent it.
-  await takeCost($, (usage, now) => (seedCost(rowlessState, usage, loadedAtMs ?? now), undefined)).catch(() => undefined)
+  await takeCost($, () => undefined).catch(() => undefined)
   if (accountCommon === undefined) await adoptAccount($).catch(() => undefined)
   const r = await rebuildOf($)
   if (r !== null && !rowSeen) r.rowless = true
@@ -1264,10 +1268,12 @@ function endRowless(): void {
 async function rowlessHead($: EngineInterface): Promise<Record<string, TelemetryAttribute>> {
   resourceAttrs ??= settle($.env.get('OTEL_RESOURCE_ATTRIBUTES')).then(parseResourceAttributes, () => ({}))
   hostFacts ??= Promise.all([readSignInEnv($), settle($.env.get('ANTHROPIC_BASE_URL'))]).then(([signIn, baseUrl]) => ({
-    provider: providerOf(signIn), customBaseUrl: (baseUrl ?? '').trim() !== '', nonInteractive,
+    provider: providerOf(signIn), customBaseUrl: (baseUrl ?? '').trim() !== '', nonInteractive: false,
   }))
-  const [resource, sessionId, host, device] = await Promise.all([resourceAttrs, sessionIdOf($), hostFacts, keyDevice ?? {}])
-  return rowHead(resource, accountCommon ?? device, sessionId, host)
+  entrypoint ??= readEntrypoint($)
+  const [resource, sessionId, host, device, ep] = await Promise.all([resourceAttrs, sessionIdOf($), hostFacts, keyDevice ?? {}, entrypoint])
+  // No person types into it: its start said so, or it runs under an SDK (`claude -p` among them), which a reload's load still knows.
+  return rowHead(resource, accountCommon ?? device, sessionId, { ...host, nonInteractive: nonInteractive || ep.startsWith('sdk') })
 }
 
 /** A row built from Claude Code's events, as Claude Code's own go: stamped, through the rebuild, and copied. */
@@ -1310,7 +1316,12 @@ async function usageOf($: EngineInterface): Promise<{ startedAt?: number; costUs
  * one's baseline, and the shares never sum past the session's cost.
  */
 function takeCost<T>($: EngineInterface, take: (usage: { startedAt?: number; costUsd?: number }, nowMs: number) => T): Promise<T> {
-  const next = costChain.then(async () => take(await usageOf($), await $.clock.now()))
+  const next = costChain.then(async () => {
+    const [usage, now] = await Promise.all([usageOf($), $.clock.now()])
+    // The first reading since the rows began, or since the session changed, says where the shares start.
+    seedCost(rowlessState, usage, seedSince.atMs ?? loadedAtMs ?? now, seedSince.previous)
+    return take(usage, now)
+  })
   costChain = next.catch(() => undefined)
   return next
 }
@@ -1369,7 +1380,8 @@ export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1]
     if (e.agentId === undefined) await decideRowless($)
     const r = await rebuildOf($)
     // The prompt row, built where none comes: before the turn, as Claude Code logs it.
-    if (r !== null && rowless && e.agentId === undefined) {
+    // A turn no prompt began (a continuation) has no prompt row, as in Claude Code.
+    if (r !== null && rowless && e.agentId === undefined && e.text !== '') {
       try {
         // What the session spent between turns (a compaction, a suggestion) is not this turn's.
         await flushOutsideCost($).catch(() => undefined)
@@ -1456,10 +1468,13 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
   })
   stepsInFlight += 1
   let result: TurnStepResult
+  // The request's share of the cost, read as it ends, before any reading outside a request can be taken.
+  let costTaken: Promise<number | undefined> | undefined
   try {
     result = yield* stream
+    if (rowless && r !== null && result?.usage) costTaken = takeCost($, ({ costUsd }) => costOf(rowlessState, costUsd)).catch(() => undefined)
   } finally {
-    stepsInFlight -= 1
+    stepsInFlight = Math.max(0, stepsInFlight - 1)
   }
   try {
     firstStepAtMs ??= await $.clock.now()
@@ -1473,7 +1488,7 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
       // The request row, built where none comes: after the step, which it pairs with as Claude Code's does. A request that brought no
       // response logs none here (Claude Code's error row says what failed, which no event does).
       if (rowless && result?.usage) {
-        const [head, costUsd, firstChunkMs, ep] = await Promise.all([rowlessHead($), takeCost($, ({ costUsd }) => costOf(rowlessState, costUsd)), firstChunk, (entrypoint ??= readEntrypoint($))])
+        const [head, costUsd, firstChunkMs, ep] = await Promise.all([rowlessHead($), costTaken ?? takeCost($, ({ costUsd }) => costOf(rowlessState, costUsd)), firstChunk, (entrypoint ??= readEntrypoint($))])
         const agent = e.agentId !== undefined ? agentTypes.get(e.agentId) : undefined
         await feedRow($, requestRow(rowlessState, head, {
           model: e.model, usage: result.usage, ...(e.effort !== undefined ? { effort: e.effort } : {}), ...(e.agentId !== undefined ? { agentId: e.agentId } : {}), ...(agent ? { agent } : {}),
@@ -1721,7 +1736,7 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
       const s = snapshot()
       const refusals = s.refusedIdentities > 0 ? `, ${s.refusedIdentities} organization and email refused` : ''
       const stopped = s.stopped ? ', refused: nothing more sent or queued this session' : ''
-      const status = lastIssues === undefined ? '' : `; setup: ${lastIssues === '' ? 'no issues' : lastIssues}${accountCommon !== undefined ? ' (identity from the account file)' : ''}`
+      const status = lastIssues === undefined ? '' : `; setup: ${lastIssues === '' ? 'no issues' : lastIssues}${accountCommon !== undefined ? " (identity from the host's variables or the account file)" : ''}`
       $.ui.log(`mainwave: copy to ${collectorOf()} (keyless): ${s.sent} sent, ${s.dropped} dropped, ${s.queued} kept for a later session, ${s.withheld} held back (no organization and email)${refusals}${stopped}; data collection settings: ${settingsSummary()}${status}`, { to: 'debug' })
     }
   } catch {
@@ -1772,6 +1787,7 @@ export const register: Register = on => {
   rowlessPending = false
   loadedAtMs = undefined
   costChain = Promise.resolve()
+  seedSince = {}
   resourceAttrs = null
   callStarts = new Map()
   verdicts = new Map()

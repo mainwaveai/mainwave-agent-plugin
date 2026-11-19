@@ -181,14 +181,17 @@ export function costOf(state: Rowless, sessionCostUsd: number | undefined): numb
 }
 
 /**
- * Where the shares start when the rows begin to be built: from nothing in a session that began as the plugin loaded, else from the
- * session's cost now. A session that began well before (a resume counts from its first launch; a reload, from its own start) had its
- * cost so far sent already, by an earlier load or Claude Code's own rows.
+ * Where the shares start, at the first reading after the rows began to be built or the session changed (`sinceMs`; `previous`, the
+ * baseline before a change). A session that began well before then (a resume counts from its first launch, a reload from the
+ * session's start) had its cost so far sent already, by an earlier load, process or session: the shares start from its cost now. One
+ * that began then starts from nothing, unless its cost carried on from the session before (a /clear that keeps the ledger): then from
+ * where that one's left off.
  */
-export function seedCost(state: Rowless, usage: { startedAt?: number; costUsd?: number }, loadedAtMs: number): void {
+export function seedCost(state: Rowless, usage: { startedAt?: number; costUsd?: number }, sinceMs: number, previous?: number): void {
   if (state.costUsd !== undefined) return
-  const earlier = typeof usage.startedAt === 'number' && usage.startedAt < loadedAtMs - SEED_MS
-  state.costUsd = earlier && usage.costUsd !== undefined ? usage.costUsd : 0
+  const earlier = typeof usage.startedAt === 'number' && usage.startedAt < sinceMs - SEED_MS
+  if (earlier) state.costUsd = usage.costUsd ?? 0
+  else state.costUsd = previous !== undefined && usage.costUsd !== undefined && usage.costUsd >= previous ? previous : 0
 }
 
 /** How long before the plugin loaded a session must have begun for its cost so far to be an earlier load's or process's. */

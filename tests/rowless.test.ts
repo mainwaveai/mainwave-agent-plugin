@@ -314,6 +314,16 @@ describe('the rows built from events', () => {
     expect(w.posts).toEqual([])
   })
 
+  test('a turn no prompt began (a continuation) builds no prompt row', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE })
+    await start($)
+    await turn($, 'go', 'toolu_1')
+    await turn($, '', 'toolu_2')
+    await w.clock.advance(5_000)
+    expect(w.built().filter(r => r.attributes['event.name'] === 'user_prompt').length).toBe(1)
+    expect(w.built().filter(r => r.attributes['event.name'] === 'api_request').length).toBe(2)
+  })
+
   test('a refused call has its decision alone, a reject, as in Claude Code', keyless, async ($, on) => {
     const w = world(on, { accountFile: ACCOUNT_FILE })
     await start($)
@@ -378,6 +388,16 @@ describe('rowless.ts', () => {
     expect(resumed.costUsd).toBe(0.5)
     seedCost(resumed, { startedAt: 0, costUsd: 9 }, 1)
     expect(resumed.costUsd).toBe(0.5)
+    // After a change of session: a /clear that starts the cost over, one that carries it on, a resume that restores it.
+    const cleared = newRowless()
+    seedCost(cleared, { startedAt: 10_000, costUsd: 0.01 }, 10_000, 0.5)
+    expect(cleared.costUsd).toBe(0)
+    const carried = newRowless()
+    seedCost(carried, { startedAt: 10_000, costUsd: 0.6 }, 10_000, 0.5)
+    expect(carried.costUsd).toBe(0.5)
+    const restored = newRowless()
+    seedCost(restored, { startedAt: 1_000, costUsd: 2 }, 1_000 + 3_600_000, 0.5)
+    expect(restored.costUsd).toBe(2)
   })
 
   test("the head says where requests go and a terminal no person types into, as Claude Code's rows do", () => {

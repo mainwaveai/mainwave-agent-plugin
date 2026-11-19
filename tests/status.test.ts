@@ -124,7 +124,7 @@ describe('the status row', () => {
     expect(a['session.id']).toBe('sess-1')
     expect(a['organizationName']).toBeUndefined()
     expect(w.posts.settings.map(p => JSON.parse(p.body))).toContainEqual({ claude_org_id: ORG, email: EMAIL })
-    expect(w.logs.join('')).toContain('setup: rows_skipped (identity from the account file)')
+    expect(w.logs.join('')).toContain("setup: rows_skipped (identity from the host's variables or the account file)")
   })
 
   test('a session that ends at once after its turn counts its rows as not coming', keyless, async ($, on) => {
