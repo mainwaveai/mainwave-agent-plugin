@@ -9,12 +9,13 @@ claude plugin validate .        # manifest, marketplace and hooks module, read t
 claude plugin test .            # tests/*.test.ts against the engine
 scripts/check-version.sh        # plugin.json and hooks/version.ts agree; the Claude Code floor is the same in CI's pin, plugin.json and the README
 scripts/check-layout.sh         # one plugin, at the root: org sync refuses a .claude-plugin/ or plugin.json anywhere else
-scripts/check-hooks.sh          # the row, tool call, command, spawn and marker hooks keep their fail-open .catch; the turn hooks, tool.check, session.measure and session.end are hooked
+scripts/check-hooks.sh          # the row, tool call, command, prompt and spawn hooks keep their fail-open .catch; the turn hooks, tool.check, session.measure and session.end are hooked; no classic hook
 scripts/check-vendored.sh       # the copies of Mainwave's catalog and command cases (JSON) and the twins the tests import agree; --write rewrites the twins
 node tests/e2e/compare.mjs      # real sessions, model mocked: the plugin's copy against the exporter's; without the env block, keyless and coherent
+MW_E2E_SEATED=1 node tests/e2e/seated.mjs   # needs managed settings on the machine (CI's runner, or a container): the marker hooks run past the security default
 ```
 
-CI runs all seven on every pull request, on the latest Claude Code and on the floor (README, Developing). The type check is local only.
+CI runs all eight on every pull request, on the latest Claude Code and on the floor (README, Developing). The type check is local only.
 
 ## Rules
 
@@ -23,6 +24,7 @@ CI runs all seven on every pull request, on the latest Claude Code and on the fl
 - Commits: `<type>(<scope>): <imperative, lowercase>`. Types: feat fix chore refactor docs test perf ci.
 - Never commit to `main`: branch, open a PR, and have a fresh sub-agent that didn't write the change review it before marking it ready. Don't merge without the owner's approval.
 - Hooks fail open: a fault never holds a row, a tool call or the session.
+- No `classic.*` hooks: Claude Code's security default skips them for every plugin a person installs or an organization syncs (Team and Enterprise organizations, managed settings, remote Cowork). Use the native events; `scripts/check-hooks.sh` fails on a classic one.
 - A new stamp key needs a shape rule in `hooks/stamps.ts`, an owned prefix if it starts a new one, and an entry in the test contract in `tests/rig.ts`, which is written independently of `hooks/`.
 - Mainwave's catalog of data points is the source of `hooks/catalog.ts`: `hooks/data-points.json` is a copy of it, which `tests/catalog.test.ts` compares field by field (all but the defaults). Its command rules are the source of `commandOutcomes` in `hooks/derive.ts`: `tests/fixtures/command-outcomes.json` is a copy of their cases, which `tests/outcomes.test.ts` runs. Neither copy is edited here: replace it with Mainwave's, then run `scripts/check-vendored.sh --write`.
 - A release bumps the version in `.claude-plugin/plugin.json` and `hooks/version.ts` together.

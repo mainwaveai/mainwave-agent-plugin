@@ -280,10 +280,12 @@ describe("the MCP servers set up, and each skill's text: data points no Claude C
   }
 
   const ofEvent = (posts: readonly Post[], ev: string) => rowsOf(posts).filter(r => r['event.name'] === ev)
+  /** The plan snapshot off: it reads the account record (`.claude.json`) at each prompt, which these tests count no read of. */
+  const NO_SNAPSHOT: Overrides = { 'account.plan': 'off' }
   const pick = (r: Record<string, unknown>) => ({ server_name: r['server_name'], server_scope: r['server_scope'], transport_type: r['transport_type'], server_url: r['server_url'] })
 
   test('off by default: no row, and no settings file read', keyless, async ($, on) => {
-    const { posts, reads } = await run($, on)
+    const { posts, reads } = await run($, on, NO_SNAPSHOT)
     expect(ofEvent(posts, 'mcp_server_configured')).toEqual([])
     expect(ofEvent(posts, 'skill_prompt')).toEqual([])
     expect(reads).toEqual([])
@@ -388,7 +390,7 @@ describe("the MCP servers set up, and each skill's text: data points no Claude C
   })
 
   test('opted in to, under a session that sets MCP and skill names to 0: nothing the plugin alone would send', keyless, async ($, on) => {
-    const { posts, reads } = await run($, on, undefined, undefined, undefined, { user: optInOption(['mcp.url', 'skill.text']) }, { OTEL_LOG_TOOL_DETAILS: '0' })
+    const { posts, reads } = await run($, on, NO_SNAPSHOT, undefined, undefined, { user: optInOption(['mcp.url', 'skill.text']) }, { OTEL_LOG_TOOL_DETAILS: '0' })
     expect(ofEvent(posts, 'mcp_server_configured')).toEqual([])
     expect(ofEvent(posts, 'skill_prompt')).toEqual([])
     expect(reads).toEqual([])
@@ -397,7 +399,7 @@ describe("the MCP servers set up, and each skill's text: data points no Claude C
   })
 
   test('opted in to, where the organization set MCP names off: no server is sent', keyless, async ($, on) => {
-    const { posts, reads } = await run($, on, { 'tool.mcp': 'off' }, undefined, undefined, { user: optInOption(['mcp.url']) })
+    const { posts, reads } = await run($, on, { ...NO_SNAPSHOT, 'tool.mcp': 'off' }, undefined, undefined, { user: optInOption(['mcp.url']) })
     expect(ofEvent(posts, 'mcp_server_configured')).toEqual([])
     expect(reads).toEqual([])
     expect(posts.map(p => p.body).join('\n')).not.toContain('mainwave.telemetry.opt_in')

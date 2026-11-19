@@ -4,7 +4,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, ownedKeys, packsOption, records, type Answer, type Layers, type Post, type Reply } from './rig.ts'
+import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, infoCall, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, ownedKeys, packsOption, records, type Answer, type Layers, type Post, type Reply } from './rig.ts'
 
 const keyless = { options: {} }
 const START = 1_800_000_000_000
@@ -42,6 +42,13 @@ function world(on: On, opts: World = {}) {
     if (opts.files?.[path] !== undefined) return { value: opts.files[path] } as never
     throw new Error(`no file at ${path} in test`)
   })
+  // The same files by their metadata: a regular file where `fs.read` has one (the CLI's hook script is looked for so).
+  on('fs.stat', (_$, e) => {
+    const path = (e as unknown as { path: string }).path
+    const text = path === `${opts.env?.['CLAUDE_CONFIG_DIR'] ?? HOME}/.claude.json` && opts.accountFile !== undefined ? JSON.stringify(opts.accountFile) : opts.files?.[path]
+    if (text === undefined) throw new Error(`no file at ${path} in test`)
+    return { value: { kind: 'file', size: new TextEncoder().encode(text).length, mtimeMs: 0, isLink: false } } as never
+  })
   let sessionId = 'sess-1'
   on('session.id', () => ({ value: sessionId }) as never)
   on('session.start', (_$, e) => ({ cwd: (e as { cwd: string }).cwd }) as never)
@@ -57,7 +64,6 @@ function world(on: On, opts: World = {}) {
     yield { kind: 'stop', stopReason: 'end_turn', usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'claude-haiku-5-5' } } as never
     return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: { input_tokens: 10, output_tokens: 2, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, model: 'claude-haiku-5-5' } } as never
   })
-  on('classic.StopFailure', () => ({}) as never)
   /** The status rows sent, in order. */
   const statusRows = () => seen.filter(p => new URL(p.url).pathname === '/v1/logs').flatMap(records).filter(r => r.attributes['event.name'] === 'plugin_status')
   return { clock, store, posts, seen, reads, logs, statusRows, setSession: (id: string) => (sessionId = id) }
@@ -339,18 +345,35 @@ describe('the status row, more', () => {
     expect(w.statusRows().map(r => r.attributes[ISSUES])).toEqual([['rows_skipped']])
   })
 
-  test("a marker goes under the account file's identity where no row reaches the plugin, in the session its event names", keyless, async ($, on) => {
-    const w = world(on, { accountFile: ACCOUNT_FILE })
+  test("a marker goes under the account file's identity where no row reaches the plugin, in the session the engine names", keyless, async ($, on) => {
+    // A prompt (its plan snapshot, on every engine), then a turn that ended on a rate limit: the transcript holds the message Claude
+    // Code wrote in place of the response (its failure marker, where the engine has `$.session.info()`).
+    const transcript = '/home/dev/.claude/projects/-repo/sess-1.jsonl'
+    const line = `${JSON.stringify({ type: 'assistant', uuid: 'msg-failed', isApiErrorMessage: true, error: 'rate_limit' })}\n`
+    const w = world(on, { accountFile: ACCOUNT_FILE, files: { [transcript]: line } })
+    // `$.session.info()`, by a glob: 2.1.325 and earlier have no such call, and refuse a hook that names it.
+    on('session.*', (_$, e, next) => ((next.event as string) === 'session.info' ? ({ value: { transcriptPath: transcript, promptId: 'prompt-1', platform: 'linux', isHosted: false } } as never) : next(e)))
+    on('session.messages', () => ({ value: [{ role: 'assistant', text: 'API Error', toolUses: [], uuid: 'msg-failed' }] }) as never)
+    // Whether the engine itself has `$.session.info()`, asked by the test's own hook as the prompt enters, not the plugin's (infoCall).
+    let infoThere = false
+    on('prompt.submit', async ($, e) => {
+      infoThere = await infoCall(() => ($ as unknown as { session: { info: () => Promise<unknown> } }).session.info())
+      return { text: (e as { text: string }).text } as never
+    })
+    await $.prompt.submit({ text: 'go', wait: false, origin: { kind: 'user' } } as never)
     await turn($, false)
-    await $.classic.StopFailure({ error: 'rate_limit', prompt_id: 'prompt-1', session_id: 'sess-1' } as never)
+    await $.turn.complete({ turnId: 't2', answer: '', durationMs: 20, isAborted: false, reason: 'error' } as never)
     await w.clock.advance(2 * TICK)
     await end($)
     await w.clock.advance(TICK)
     const spans = w.seen.filter(p => new URL(p.url).pathname === '/v1/traces').flatMap(p => (JSON.parse(p.body) as { resourceSpans: { scopeSpans: { spans: { name: string; attributes: { key: string; value: { stringValue?: string } }[] }[] }[] }[] }).resourceSpans)
       .flatMap(rs => rs.scopeSpans.flatMap(ss => ss.spans))
-    const stop = spans.find(x => x.name === 'mainwave.claude_code.stop_failure')
-    expect(stop).toBeDefined()
-    const attr = (k: string) => stop!.attributes.find(a => a.key === k)?.value.stringValue
-    expect([attr('organization.id'), attr('user.email'), attr('user.account_uuid'), attr('session.id')]).toEqual([ORG, EMAIL, ACCOUNT, 'sess-1'])
+    const identity = (name: string) => {
+      const span = spans.find(x => x.name === name)
+      const attr = (k: string) => span?.attributes.find(a => a.key === k)?.value.stringValue
+      return span === undefined ? undefined : [attr('organization.id'), attr('user.email'), attr('user.account_uuid'), attr('session.id')]
+    }
+    expect(identity('mainwave.subscription.snapshot')).toEqual([ORG, EMAIL, ACCOUNT, 'sess-1'])
+    expect(identity('mainwave.claude_code.stop_failure')).toEqual(infoThere ? [ORG, EMAIL, ACCOUNT, 'sess-1'] : undefined)
   })
 })

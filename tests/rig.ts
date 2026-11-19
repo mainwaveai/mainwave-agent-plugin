@@ -309,3 +309,19 @@ export function keylessAnswer(post: Post, refused: Record<string, 'unclaimed' | 
   if (reason) return { status: 403, text: JSON.stringify({ error: 'not accepted', reason }), identity: seen }
   return { status: 200, text: '{"partialSuccess":{}}', identity: seen }
 }
+
+/**
+ * Whether a call on `$` is one the engine beneath has, asked from a test's own hook: any answer or refusal (the kit refuses a call the
+ * test's module was not scanned for) but a TypeError, which says the engine has no such call. For a call newer than the floor.
+ */
+export async function infoCall(call: () => Promise<unknown>): Promise<boolean> {
+  try {
+    await call()
+    return true
+  } catch (err) {
+    // Only the engine's own "is not a function": any other TypeError fails here, naming this check, not as a marker gone missing.
+    if (err instanceof TypeError && /not a function/.test(err.message)) return false
+    if (err instanceof TypeError) throw new Error(`infoCall: a TypeError that does not say the call is missing: ${err.message}`)
+    return true
+  }
+}

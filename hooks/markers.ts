@@ -450,6 +450,26 @@ export const ticketSpan = (attributes: Readonly<Record<string, TelemetryAttribut
 /** The kind of API error a turn ended on, as Claude Code names it (`rate_limit`, `overloaded`, ...): a word, never free text. */
 export const errorTypeOf = (v: unknown): string | undefined => (typeof v === 'string' && /^[a-z_]{1,64}$/.test(v) ? v : undefined)
 
+/**
+ * The kind of API error recorded on one message of a transcript's text (JSON lines, its end at least): the `error` Claude Code puts
+ * on the message it writes in place of the failed response (`isApiErrorMessage`), the word StopFailure carries. `null` while no line
+ * of that message is there yet; undefined for a message that records no API error.
+ */
+export function apiErrorIn(text: string, messageId: string): string | undefined | null {
+  for (const line of text.split('\n')) {
+    if (!line.includes(messageId)) continue
+    let row: unknown
+    try {
+      row = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (!isObject(row) || row['uuid'] !== messageId) continue
+    return row['isApiErrorMessage'] === true ? errorTypeOf(row['error']) : undefined
+  }
+  return null
+}
+
 // ── Ids ───────────────────────────────────────────────────────────────────────
 
 /** An opaque id as a marker carries one: letters, digits and `_ . : -`, at most 256 characters; anything else is left out. */
