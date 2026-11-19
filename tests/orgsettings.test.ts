@@ -6,6 +6,7 @@ import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
 import { nextWait, REFRESH_MS, RETRY_MS, settingsOf, settingsUrlOf } from '../hooks/orgsettings.ts'
+import vendored from './fixtures/data-points.ts'
 import { boot, collectorOption, EMAIL, keylessAnswer, LOGGED_AT, memoryStore, network, optInOption, ORG, packsOption, SETTINGS_URL, type Layers, type Post, type Reply } from './rig.ts'
 
 const keyless = { options: {} }
@@ -17,12 +18,32 @@ const COMMON = { 'organization.id': ORG, 'user.email': EMAIL, 'user.account_uuid
 const MAIL = 'ana.lee@example.com'
 const SSN = '078-05-1120'
 
-/** Mainwave's answer, as its settings API gives it. */
+/**
+ * Mainwave's answer, as its settings API gives it, but with `in_force` naming only `tool.call` and the data points the organization set:
+ * the rest keep the plugin's defaults, so these tests show what the explicit settings do. `pageAnswer` gives every data point in force.
+ */
 const answer = (dataPoints: Record<string, string>, packs: string[] = ['secrets'], revision = 3): Reply => ({
   status: 200,
   text: JSON.stringify({
     revision, catalog_version: 1, data_points: dataPoints, in_force: { 'tool.call': 'on', ...dataPoints },
     redaction_packs: packs, default_data_points: ['tool.call'], redaction_packs_default: false,
+  }),
+})
+
+/** Every switchable data point at the default of Mainwave's catalog (fixtures/data-points.ts, a copy of it): all on. */
+const CATALOG_DEFAULTS: Record<string, string> = Object.fromEntries(
+  (vendored as unknown as { data_points: { id: string; required?: boolean; default?: string }[] }).data_points.filter(d => !d.required).map(d => [d.id, d.default!]),
+)
+/**
+ * Mainwave's answer as it really comes: `data_points` the organization set, and `in_force` every switchable data point as its settings
+ * page shows it, the catalog's defaults for the rest. `inForce: null` leaves it out, as an older Mainwave's answer does.
+ */
+const pageAnswer = (dataPoints: Record<string, string>, opts: { inForce?: Record<string, string> | null; packs?: string[]; revision?: number } = {}): Reply => ({
+  status: 200,
+  text: JSON.stringify({
+    revision: opts.revision ?? 3, catalog_version: 1, data_points: dataPoints,
+    ...(opts.inForce === null ? {} : { in_force: opts.inForce ?? { ...CATALOG_DEFAULTS, ...dataPoints } }),
+    redaction_packs: opts.packs ?? ['secrets'], default_data_points: Object.keys(CATALOG_DEFAULTS).filter(id => !(id in dataPoints)), redaction_packs_default: opts.packs === undefined,
   }),
 })
 
@@ -90,7 +111,7 @@ describe('asking Mainwave', () => {
     await row($, 'api_request', { cost_usd: 0.1 })
     await clock.advance(1)
     await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
-    expect(logs.join('')).toContain('data collection settings: from Mainwave, revision 7; last request: ok')
+    expect(logs.join('')).toContain('data collection settings: from Mainwave, revision 7, 1 data point in force; last request: ok')
     expect(logs.join('')).not.toContain(EMAIL)
   })
 
@@ -207,7 +228,7 @@ describe('the answer', () => {
     expect(sent(posts, 'user_prompt')[0]!['prompt']).toBe('mail [REDACTED:pii.contact.email]')
     // Kept whole, in one write, with the organization it is for.
     expect(store.sets.filter(s => !s.key.startsWith('outbox:'))).toEqual([
-      { key: 'dataCollectionSettings', value: { organizationId: ORG, revision: 3, dataPoints: { 'tool.call': 'off', 'prompt.text': 'on' }, redactionPacks: ['secrets', 'pii.contact'] } },
+      { key: 'dataCollectionSettings', value: { organizationId: ORG, revision: 3, dataPoints: { 'tool.call': 'off', 'prompt.text': 'on' }, inForce: { 'tool.call': 'off', 'prompt.text': 'on' }, redactionPacks: ['secrets', 'pii.contact'] } },
     ])
   })
 
@@ -232,7 +253,7 @@ describe('the answer', () => {
     await prompt($, 'captured under revision 1')
     expect(store.data.get('dataCollectionSettings')).toMatchObject({ organizationId: ORG, revision: 1 })
     await clock.advance(REFRESH_MS)
-    expect(store.data.get('dataCollectionSettings')).toEqual({ organizationId: ORG, revision: 2, dataPoints: { 'prompt.text': 'off' }, redactionPacks: ['secrets'] })
+    expect(store.data.get('dataCollectionSettings')).toEqual({ organizationId: ORG, revision: 2, dataPoints: { 'prompt.text': 'off' }, inForce: { 'tool.call': 'on', 'prompt.text': 'off' }, redactionPacks: ['secrets'] })
     down = false
     const before = posts.length
     await clock.advance(2 * 60_000)
@@ -388,9 +409,107 @@ describe('what the store keeps', () => {
   })
 })
 
+describe("what Mainwave's settings page shows", () => {
+  // The organization set two data points itself; the page shows the rest at the catalog's defaults, all on.
+  const SET = { 'file.path': 'on', 'tool.input': 'on' }
+  const keptPage = { organizationId: ORG, revision: 3, dataPoints: SET, inForce: { ...CATALOG_DEFAULTS, ...SET }, redactionPacks: ['secrets'] }
+
+  test('the data points the organization left alone go as the page shows them, and the store keeps what is in force with the rest', keyless, async ($, on) => {
+    const { clock, posts, store, logs } = world(on, { settings: () => pageAnswer(SET, { packs: ['secrets'] }) })
+    await row($, 'api_request', { cost_usd: 0.1 })
+    await clock.advance(1)
+    await prompt($, 'shown')
+    await response($, 'also shown')
+    await clock.advance(TICK)
+    expect(sent(posts, 'user_prompt')[0]!['prompt']).toBe('shown')
+    expect(sent(posts, 'assistant_response')[0]!['response']).toBe('also shown')
+    expect(store.data.get('dataCollectionSettings')).toEqual(keptPage)
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    expect(logs.join('')).toContain(`from Mainwave, revision 3, ${Object.keys(CATALOG_DEFAULTS).length} data points in force; last request: ok`)
+  })
+
+  test('a later session starts from what the store keeps in force, while Mainwave cannot be reached', keyless, async ($, on) => {
+    const { clock, posts } = world(on, { settings: () => ({ status: 503 }), store: { dataCollectionSettings: keptPage } })
+    await prompt($, 'shown')
+    await clock.advance(TICK)
+    expect(sent(posts, 'user_prompt')[0]!['prompt']).toBe('shown')
+  })
+
+  test("what the organization set itself wins over what is in force", keyless, async ($, on) => {
+    const { clock, posts } = world(on, { settings: () => pageAnswer({ 'prompt.text': 'off' }, { inForce: CATALOG_DEFAULTS }) })
+    await row($, 'api_request', { cost_usd: 0.1 })
+    await clock.advance(1)
+    await prompt($, 'hidden')
+    await response($, 'shown')
+    await clock.advance(TICK)
+    expect(sent(posts, 'user_prompt')[0]!['prompt']).toBe('<REDACTED>')
+    expect(sent(posts, 'assistant_response')[0]!['response']).toBe('shown')
+  })
+
+  test("an answer without in_force (an older Mainwave's): the explicit settings alone, the plugin's defaults for the rest", keyless, async ($, on) => {
+    const { clock, posts, store, logs } = world(on, { settings: () => pageAnswer({ 'response.text': 'on' }, { inForce: null }) })
+    await row($, 'api_request', { cost_usd: 0.1 })
+    await clock.advance(1)
+    await prompt($, 'hidden')
+    await response($, 'shown')
+    await clock.advance(TICK)
+    expect(sent(posts, 'user_prompt')[0]!['prompt']).toBe('<REDACTED>')
+    expect(sent(posts, 'assistant_response')[0]!['response']).toBe('shown')
+    expect(store.data.get('dataCollectionSettings')).not.toHaveProperty('inForce')
+    await $.session.end({ reason: 'other', sessionId: 's-1', resume: { id: 's-1' } } as never)
+    expect(logs.join('')).toContain('from Mainwave, revision 3, explicit settings only; last request: ok')
+  })
+
+  test('an answer an earlier version kept, without in_force: its explicit settings alone', keyless, async ($, on) => {
+    const older = { organizationId: ORG, revision: 3, dataPoints: { 'response.text': 'on' }, redactionPacks: ['secrets'] }
+    const { clock, posts } = world(on, { settings: () => ({ status: 503 }), store: { dataCollectionSettings: older } })
+    await prompt($, 'hidden')
+    await response($, 'shown')
+    await clock.advance(TICK)
+    expect(sent(posts, 'user_prompt')[0]!['prompt']).toBe('<REDACTED>')
+    expect(sent(posts, 'assistant_response')[0]!['response']).toBe('shown')
+  })
+
+  test("what another organization's kept answer gives in force never applies", keyless, async ($, on) => {
+    const { clock, posts } = world(on, { settings: () => ({ status: 503 }), store: { dataCollectionSettings: { ...keptPage, organizationId: ORG_B } } })
+    await prompt($, 'hidden')
+    await clock.advance(TICK)
+    expect(sent(posts, 'user_prompt')[0]!['prompt']).toBe('<REDACTED>')
+  })
+
+  test("a later answer without in_force: the store drops it, and the plugin's defaults stand for the rest", keyless, async ($, on) => {
+    const { clock, posts, store } = world(on, { settings: n => (n === 1 ? pageAnswer(SET) : pageAnswer(SET, { inForce: null })) })
+    await row($, 'api_request', { cost_usd: 0.1 })
+    await clock.advance(1)
+    await prompt($, 'shown')
+    await clock.advance(REFRESH_MS)
+    await prompt($, 'hidden')
+    await clock.advance(TICK)
+    expect(sent(posts, 'user_prompt').map(r => r['prompt'])).toEqual(['shown', '<REDACTED>'])
+    expect(store.data.get('dataCollectionSettings')).toEqual({ organizationId: ORG, revision: 3, dataPoints: SET, redactionPacks: ['secrets'] })
+  })
+
+  test('a change to what is in force alone (a catalog default changed in a deploy, no new revision) reaches the session and the store', keyless, async ($, on) => {
+    const { clock, posts, store } = world(on, {
+      settings: n => pageAnswer({}, { inForce: n === 1 ? CATALOG_DEFAULTS : { ...CATALOG_DEFAULTS, 'prompt.text': 'off' } }),
+    })
+    await row($, 'api_request', { cost_usd: 0.1 })
+    await clock.advance(1)
+    await prompt($, 'shown')
+    await clock.advance(REFRESH_MS)
+    await prompt($, 'hidden')
+    await clock.advance(TICK)
+    expect(sent(posts, 'user_prompt').map(r => r['prompt'])).toEqual(['shown', '<REDACTED>'])
+    expect(store.data.get('dataCollectionSettings')).toMatchObject({ revision: 3, inForce: { 'prompt.text': 'off' } })
+  })
+})
+
 describe('the answer, read', () => {
   test('the fields the plugin keeps, as they came', () => {
-    expect(settingsOf(JSON.stringify({ revision: 0, data_points: {}, redaction_packs: ['secrets'], in_force: {} }))).toEqual({ revision: 0, dataPoints: {}, redactionPacks: ['secrets'] })
+    expect(settingsOf(JSON.stringify({ revision: 0, data_points: {}, redaction_packs: ['secrets'], in_force: { repo: 'on' } }))).toEqual({ revision: 0, dataPoints: {}, inForce: { repo: 'on' }, redactionPacks: ['secrets'] })
+    // An `in_force` of another shape is left out; the answer still counts.
+    expect(settingsOf(JSON.stringify({ revision: 1, data_points: { repo: 'on' }, redaction_packs: [], in_force: ['repo'] }))).toEqual({ revision: 1, dataPoints: { repo: 'on' }, redactionPacks: [] })
+    expect(settingsOf(JSON.stringify({ revision: 1, data_points: {}, redaction_packs: [], in_force: { repo: true } }))).toEqual({ revision: 1, dataPoints: {}, redactionPacks: [] })
     expect(settingsOf(JSON.stringify({ revision: 7, data_points: { 'future.point': 'on' }, redaction_packs: [] }))).toEqual({ revision: 7, dataPoints: { 'future.point': 'on' }, redactionPacks: [] })
   })
   for (const bad of ['', 'null', '[]', '{}', '{"revision":-1,"data_points":{},"redaction_packs":[]}', '{"revision":1.5,"data_points":{},"redaction_packs":[]}', '{"revision":1,"data_points":[],"redaction_packs":[]}', '{"revision":1,"data_points":{"a":true},"redaction_packs":[]}', '{"revision":1,"data_points":{},"redaction_packs":"secrets"}', '{"revision":1,"data_points":{},"redaction_packs":[1]}']) {

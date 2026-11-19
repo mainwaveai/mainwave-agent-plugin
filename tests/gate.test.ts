@@ -2,8 +2,8 @@
 
 import { describe, expect, test } from 'claude-code/testing'
 
-import { CATALOG, DEFAULTS, ownerOf } from '../hooks/catalog.ts'
-import { allows, combinePacks, gateAttributes, gateEvent, gateMarker, gatePoint, gateRow, gateSpan, optInOf, packsOf, resolveGate, resolveRedaction } from '../hooks/gate.ts'
+import { CATALOG, DEFAULTS, ownerOf, type DataPointId } from '../hooks/catalog.ts'
+import { allows, combinePacks, gateAttributes, gateEvent, gateMarker, gatePoint, gateRow, gateSpan, optInOf, packsOf, resolveGate, resolveRedaction, type Overrides } from '../hooks/gate.ts'
 import type { BuiltSpan } from '../hooks/otlp.ts'
 import { contentLimit, CONTENT_MAX_LENGTH, cut, redact } from '../hooks/protect.ts'
 import { CAPTURES_ON } from './rig.ts'
@@ -75,6 +75,46 @@ describe('resolveGate', () => {
     expect(g.settings.get('tool.call')).toBe('off')
     expect(g.settings.get('response.thinking')).toBe('on')
     expect(g.settings.get('usage')).toBe('required')
+  })
+})
+
+describe("what is in force for the organization (Mainwave's in_force)", () => {
+  const ALL_ON = Object.fromEntries(CATALOG.filter(d => !d.required).map(d => [d.id, 'on'])) as Overrides
+  const gate = (env: Parameters<typeof resolveGate>[0], explicit: Overrides, inForce: Overrides, optIn: DataPointId[] = []) => resolveGate(env, explicit, undefined, optIn, undefined, inForce)
+
+  test("stands in for the plugin's defaults where it names a data point; one it doesn't name keeps the plugin's", () => {
+    const g = gate({}, {}, { repo: 'on', 'prompt.text': 'on', 'tool.call': 'off' })
+    expect(g.settings.get('repo')).toBe('on')
+    expect(g.settings.get('prompt.text')).toBe('on')
+    expect(g.settings.get('tool.call')).toBe('off')
+    expect(g.settings.get('response.text')).toBe('off')
+    expect(g.settings.get('skill.name')).toBe('on')
+    expect(gate({}, {}, ALL_ON).settings.get('work.item')).toBe('on')
+  })
+
+  test('an explicit setting wins over it', () => {
+    const g = gate({}, { repo: 'off', 'tool.call': 'claude' }, ALL_ON)
+    expect(g.settings.get('repo')).toBe('off')
+    expect(g.settings.get('tool.call')).toBe('claude')
+  })
+
+  test("a switch at 0 keeps what it governs that is on in force as Claude Code sends it; an explicit on wins over the switch", () => {
+    const g = gate({ OTEL_METRICS_INCLUDE_REPOSITORY: '0', OTEL_LOG_TOOL_DETAILS: '0' }, { 'file.path': 'on' }, ALL_ON)
+    expect(g.settings.get('repo')).toBe('claude')
+    expect(g.settings.get('bash.command')).toBe('claude')
+    expect(g.settings.get('file.path')).toBe('on')
+    // Not governed by either: as in force.
+    expect(g.settings.get('work.item')).toBe('on')
+    expect(g.settings.get('tool.result')).toBe('on')
+  })
+
+  test("the opt-in raises a data point off in force only where the plugin's default is off too, so the stamp names only what it may", () => {
+    const g = gate({}, {}, { 'prompt.text': 'off', 'tool.call': 'off' }, ['prompt.text', 'tool.call'])
+    expect(g.settings.get('prompt.text')).toBe('on')
+    expect(g.settings.get('tool.call')).toBe('off')
+    expect(g.optedIn).toEqual(['prompt.text'])
+    // On in force: nothing to raise, and nothing stamped.
+    expect(gate({}, {}, ALL_ON, ['prompt.text']).optedIn).toEqual([])
   })
 })
 

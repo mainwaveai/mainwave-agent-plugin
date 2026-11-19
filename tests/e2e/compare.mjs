@@ -33,7 +33,8 @@
 // The plugin asks Mainwave for its organization's data collection settings once the rows name the organization and email, on the API
 // beside the collector the copy goes to. In the keyless pass that is production's API, which the test-only hooks send here too, and
 // the receiver answers as Mainwave's settings API would, with settings that turn a metadata data point off (`file.kind`) and add a
-// redaction pack; with the env block it is the receiver the person's settings name, which answers as the route off, so the explicit
+// redaction pack, and whose `in_force` names that data point alone, so the rest keep the plugin's defaults and the pass can check the
+// copy carries no identifier or content (tests/orgsettings.test.ts covers an answer with every data point in force); with the env block it is the receiver the person's settings name, which answers as the route off, so the explicit
 // settings below stand. The keyless pass checks the request carried the organization and email alone, that the answer was kept in the store with
 // its organization, and that the copy went without the data point turned off. (The pass sends no content, so the pack is checked as
 // kept, not as run: the unit tests run it.)
@@ -989,7 +990,7 @@ function checkKeyless(pass, { captured, run, config }, reference) {
   } catch {
     problems.push('settings: the plugin kept no store')
   }
-  const keptWant = { dataCollectionSettings: { organizationId: ORG, revision: SETTINGS.revision, dataPoints: SETTINGS.data_points, redactionPacks: SETTINGS.redaction_packs } }
+  const keptWant = { dataCollectionSettings: { organizationId: ORG, revision: SETTINGS.revision, dataPoints: SETTINGS.data_points, inForce: SETTINGS.in_force, redactionPacks: SETTINGS.redaction_packs } }
   for (const [k, v] of Object.entries(keptWant)) if (JSON.stringify(kept[k]) !== JSON.stringify(v)) problems.push(`settings: the store keeps ${k} as ${JSON.stringify(kept[k])}, not ${JSON.stringify(v)}`)
   const decisions = points.filter(p => p.name === 'claude_code.code_edit_tool.decision')
   if (decisions.length === 0) problems.push('settings: no code_edit_tool.decision point was sent')

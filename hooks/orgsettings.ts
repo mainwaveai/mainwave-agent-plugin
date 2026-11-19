@@ -7,10 +7,13 @@
 // no record. It goes in a POST body, so no request log keeps the address. Mainwave answers only for an organization and email its
 // keyless ingest would route, and refuses the rest as keyless ingest does (403 `unclaimed` or `email_domain`).
 //
-// The answer goes to the gate: `data_points` as the explicit settings that win over everything else (`setOverrides`), and
-// `redaction_packs` as the organization's packs, with those of its managed settings and the person's added (`setOrgPacks`). It is kept
-// in the store under one key, `dataCollectionSettings`, as it came and with the organization it is for, written whole in one write, so
-// a store is never left holding one organization's data points beside another's packs or name.
+// The answer goes to the gate: `data_points`, the data points the organization set itself, as the explicit settings that win over
+// everything else; `in_force`, every data point as Mainwave's settings page shows it (its catalog's defaults for those the organization
+// left alone), in place of the plugin's own defaults (`setOverrides`, gate.ts); and `redaction_packs` as the organization's packs, with
+// those of its managed settings and the person's added (`setOrgPacks`). An answer without `in_force` (an older Mainwave's) gives the
+// explicit settings alone, and the plugin's defaults stand for the rest. It is kept in the store under one key, `dataCollectionSettings`,
+// as it came and with the organization it is for, written whole in one write, so a store is never left holding one organization's data
+// points beside another's packs or name.
 //
 // What applies, in order:
 //   - this load's answer, for the session's organization;
@@ -46,7 +49,10 @@ export function settingsUrlOf(collector: string): string {
   return `${API_OF[base] ?? base}${SETTINGS_PATH}`
 }
 
-/** Where the store keeps the last answer: `{ organizationId, revision, dataPoints, redactionPacks }`, the last two as they came. */
+/**
+ * Where the store keeps the last answer: `{ organizationId, revision, dataPoints, inForce, redactionPacks }`, the last three as they
+ * came (`inForce` only where the answer had it).
+ */
 export const SETTINGS_KEY = 'dataCollectionSettings'
 /** The longest wait a `Retry-After` may ask for. */
 const MAX_RETRY_AFTER_MS = 60 * 60_000
@@ -61,14 +67,16 @@ export const FETCH_TIMEOUT_MS = 5_000
 const MAX_ANSWER = 64 * 1024
 
 /** The settings as Mainwave answers them: the parts the plugin keeps. */
-export type OrgSettings = { revision: number; dataPoints: Readonly<Record<string, unknown>>; redactionPacks: readonly string[] }
+export type OrgSettings = { revision: number; dataPoints: Readonly<Record<string, unknown>>; inForce?: Readonly<Record<string, unknown>>; redactionPacks: readonly string[] }
 
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v)
 
 /**
  * The settings in an answer's body, or null when it is not an answer of the right shape: `revision` a whole number, `data_points` an
  * object of `on` and `off` (any other value, or an ID this version does not know, is kept as it came and ignored by the gate), and
- * `redaction_packs` a list of names. The other fields (`in_force`, the defaults) are not kept.
+ * `redaction_packs` a list of names. `in_force`, an object of the same shape, is kept where it is one; where it is missing or of another
+ * shape, the answer is kept without it, and its explicit settings still apply. The other fields (the defaults, the catalog's version)
+ * are not kept.
  */
 export function settingsOf(text: string): OrgSettings | null {
   if (text.length > MAX_ANSWER) return null
@@ -79,11 +87,12 @@ export function settingsOf(text: string): OrgSettings | null {
     return null
   }
   if (!isObject(body)) return null
-  const { revision, data_points: dataPoints, redaction_packs: packs } = body
+  const { revision, data_points: dataPoints, in_force: inForce, redaction_packs: packs } = body
   if (typeof revision !== 'number' || !Number.isSafeInteger(revision) || revision < 0) return null
   if (!isObject(dataPoints) || !Object.values(dataPoints).every(v => typeof v === 'string')) return null
   if (!Array.isArray(packs) || !packs.every(p => typeof p === 'string')) return null
-  return { revision, dataPoints, redactionPacks: packs as string[] }
+  const keepInForce = isObject(inForce) && Object.values(inForce).every(v => typeof v === 'string')
+  return { revision, dataPoints, ...(keepInForce ? { inForce } : {}), redactionPacks: packs as string[] }
 }
 
 /** What one request came to, for the next try and the debug line: never the email. */
@@ -160,7 +169,7 @@ export function resetOrgSettings(): void {
 
 /**
  * The organization's settings in force for the session, from this load's answer or the store, applied to the gate: the explicit
- * settings per data point, and the organization's packs. Read once per load, again before each send and at session end, so an answer
+ * settings per data point, what is in force for the rest, and the organization's packs. Read once per load, again before each send and at session end, so an answer
  * another session wrote reaches this one too. Each call sets both, so nothing an earlier organization's settings put in force outlives
  * a call. A store that can't be read applies none of the organization's data points, and holds identifier and content values back, as
  * the packs chosen are not known.
@@ -171,9 +180,11 @@ export async function applyStoredSettings($: EngineInterface): Promise<void> {
   // Decided after the reads, against the organization as it is then: a row that named it while they ran counts.
   const answer = fetched !== undefined && fetched.org === org ? fetched : undefined
   let overrides: Overrides = {}
+  let inForce: Overrides = {}
   let choice: PackChoice = undefined
   if (answer !== undefined) {
     overrides = overridesOf(answer.dataPoints)
+    inForce = overridesOf(answer.inForce)
     choice = packsOf(answer.redactionPacks)
   } else if (!kept.ok) {
     choice = 'unreadable'
@@ -182,6 +193,8 @@ export async function applyStoredSettings($: EngineInterface): Promise<void> {
     const k = isObject(kept.v) ? kept.v : {}
     if (isOrgId(k['organizationId']) && k['organizationId'] === org) {
       overrides = overridesOf(k['dataPoints'])
+      // Kept by an earlier version, or from an answer without it: the explicit settings alone.
+      inForce = overridesOf(k['inForce'])
       choice = packsOf(k['redactionPacks'])
     }
   } else {
@@ -189,21 +202,31 @@ export async function applyStoredSettings($: EngineInterface): Promise<void> {
     overrides = points.ok ? overridesOf(points.v) : {}
     choice = packs.ok ? packsOf(packs.v) : 'unreadable'
   }
-  setOverrides(overrides)
+  setOverrides(overrides, inForce)
   setOrgPacks('settings', choice)
 }
 
 /** Keeps an answer, whole, in one write. A write that fails leaves the store as it was; the answer still applies this load. */
 async function keep($: EngineInterface, forOrg: string, s: OrgSettings): Promise<void> {
   try {
-    await $.store.set(SETTINGS_KEY, { organizationId: forOrg, revision: s.revision, dataPoints: s.dataPoints, redactionPacks: s.redactionPacks })
+    await $.store.set(SETTINGS_KEY, {
+      organizationId: forOrg,
+      revision: s.revision,
+      dataPoints: s.dataPoints,
+      ...(s.inForce !== undefined ? { inForce: s.inForce } : {}),
+      redactionPacks: s.redactionPacks,
+    })
   } catch {
     // The next answer is kept instead.
   }
 }
 
+// `in_force` too: a deploy that changes a default of Mainwave's catalog changes it without a new revision.
 const same = (a: OrgSettings, b: OrgSettings) =>
-  a.revision === b.revision && JSON.stringify(a.dataPoints) === JSON.stringify(b.dataPoints) && JSON.stringify(a.redactionPacks) === JSON.stringify(b.redactionPacks)
+  a.revision === b.revision &&
+  JSON.stringify(a.dataPoints) === JSON.stringify(b.dataPoints) &&
+  JSON.stringify(a.inForce) === JSON.stringify(b.inForce) &&
+  JSON.stringify(a.redactionPacks) === JSON.stringify(b.redactionPacks)
 
 /** Asks once for the session's organization and email, applies and keeps the answer, and answers how it went. Never throws. */
 export async function fetchNow($: EngineInterface, collector: string): Promise<Outcome | undefined> {
@@ -226,7 +249,7 @@ export async function fetchNow($: EngineInterface, collector: string): Promise<O
     if (settings !== null && forOrg === org) {
       const changed = fetched === undefined || fetched.org !== forOrg || !same(fetched, settings)
       fetched = { ...settings, org: forOrg }
-      setOverrides(overridesOf(settings.dataPoints))
+      setOverrides(overridesOf(settings.dataPoints), overridesOf(settings.inForce))
       setOrgPacks('settings', packsOf(settings.redactionPacks))
       if (changed) await keep($, forOrg, settings)
     }
@@ -331,7 +354,12 @@ export function ensureFetching($: EngineInterface): void {
 export function settingsSummary(): string {
   const tried = last === undefined ? '' : `; last request: ${last}`
   if (org === undefined || email === undefined) return 'not asked: no organization and email named yet'
-  if (fetched !== undefined && fetched.org === org) return `from Mainwave, revision ${fetched.revision}${tried}`
+  if (fetched !== undefined && fetched.org === org) {
+    // How many data points the answer gave in force for the rest, or that it gave the explicit settings alone (an older Mainwave's).
+    const n = Object.keys(overridesOf(fetched.inForce)).length
+    const rest = fetched.inForce === undefined ? 'explicit settings only' : `${n} data point${n === 1 ? '' : 's'} in force`
+    return `from Mainwave, revision ${fetched.revision}, ${rest}${tried}`
+  }
   return `not answered yet, the store's or the defaults apply${tried}`
 }
 

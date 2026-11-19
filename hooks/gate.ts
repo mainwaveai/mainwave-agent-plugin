@@ -5,13 +5,16 @@
 //   on      sent, by the plugin's own reading where Claude Code's row or span leaves it out.
 //   off     never sent: removed from every record, or `<REDACTED>` where Claude Code marks withheld text so.
 //   claude  sent exactly where Claude Code sends it under the session's own settings, and nowhere more.
-// With no organization settings, each takes its default (catalog.ts, `DEFAULTS`: metadata on, identifiers and content off); a Claude
-// Code switch the session's environment sets to `0` (`false`, `no`, `off`) turns the data points it governs that are on by default to
-// `claude`, so an admin who turned a capture off in Mainwave's org-wide setup keeps that choice. The person can opt in to data points
-// still at a default of `off` (`setOptIn`, from their own user settings): each turns `on`. An explicit setting for a data point
-// (`setOverrides`: the organization's settings from Mainwave, orgsettings.ts) wins over all three, and the opt-in never raises a data point a switch at `0` governs
-// (thinking counts as governed by the responses' switch, for this). It only adds: it never turns anything off. Required data points
-// are always sent.
+// With no organization settings, each takes its default (catalog.ts, `DEFAULTS`: metadata on, identifiers and content off). Once the
+// organization's settings from Mainwave are in force (orgsettings.ts), each data point they name in force takes that instead
+// (`setOverrides`, its second argument: what Mainwave's settings page shows, its catalog defaults included), so the plugin sends what the
+// page shows; a data point they don't name keeps the plugin's default. A Claude Code switch the session's environment sets to `0`
+// (`false`, `no`, `off`) turns the data points it governs that are on by default (or in force by default) to `claude`, so an admin who
+// turned a capture off in Mainwave's org-wide setup keeps that choice. The person can opt in to data points still at a default of `off`
+// (`setOptIn`, from their own user settings): each turns `on`. An explicit setting for a data point (`setOverrides`, its first argument:
+// the data points the organization set itself on Mainwave's settings page) wins over all three, and the opt-in never raises a data point
+// a switch at `0` governs (thinking counts as governed by the responses' switch, for this). It only adds: it never turns anything off.
+// Required data points are always sent.
 //
 // Whatever the gate says, every identifier and content value goes through the always-on protections (protect.ts) before it is queued,
 // with the redaction packs in force (packs.ts): those the organization chose (`setOrgPacks`: its managed settings and its data
@@ -54,8 +57,10 @@ export const switchedOff = (raw: string | undefined): boolean => ['0', 'false', 
 /**
  * The settings in force, in this order: an explicit setting; else, where the session's environment switched the data point's switch
  * off, `claude` for one on by default (one off by default stays off); else `on` for one off by default that the person opted in to;
- * else the default. `optedIn` lists those the opt-in turned on that can go somewhere: not one the data point it adds detail to keeps
- * from going.
+ * else the default. The default is the organization's in force (`inForce`, Mainwave's reading of its settings with its catalog's
+ * defaults) where it names the data point, else the plugin's own (`DEFAULTS`). The opt-in raises only a data point off by both, so
+ * it lists only data points the person can opt in to (stamps.ts, `OPT_IN_IDS`). `optedIn` lists those the opt-in turned on that can
+ * go somewhere: not one the data point it adds detail to keeps from going.
  */
 export function resolveGate(
   env: Readonly<Partial<Record<Switch, string | undefined>>>,
@@ -63,6 +68,7 @@ export function resolveGate(
   limit = CONTENT_MAX_LENGTH,
   optIn: Iterable<DataPointId> = [],
   redaction: Redaction = resolveRedaction(undefined, undefined),
+  inForce: Overrides = {},
 ): Gate {
   const settings = new Map<DataPointId, Setting | 'required'>()
   const wanted = new Set(optIn)
@@ -74,12 +80,13 @@ export function resolveGate(
       continue
     }
     const explicit = overrides[d.id]
-    const byDefault = DEFAULTS[d.id as keyof typeof DEFAULTS]
+    const own = DEFAULTS[d.id as keyof typeof DEFAULTS]
+    const byDefault = inForce[d.id] ?? own
     const switched = d.switch !== undefined && switchedOff(value(d.switch))
     const follows = OPT_IN_SWITCH[d.id]
     if (explicit !== undefined) settings.set(d.id, explicit)
     else if (switched) settings.set(d.id, byDefault === 'on' ? 'claude' : byDefault)
-    else if (byDefault === 'off' && wanted.has(d.id) && !(follows !== undefined && switchedOff(value(follows)))) {
+    else if (byDefault === 'off' && own === 'off' && wanted.has(d.id) && !(follows !== undefined && switchedOff(value(follows)))) {
       settings.set(d.id, 'on')
       raised.push(d.id)
     } else settings.set(d.id, byDefault)
@@ -146,6 +153,7 @@ export function allows(gate: Gate, id: DataPointId, claude: boolean): boolean {
 
 let env: Partial<Record<Switch, string | undefined>> = {}
 let overrides: Overrides = {}
+let inForce: Overrides = {}
 let limit = CONTENT_MAX_LENGTH
 let optIn: readonly DataPointId[] = []
 /** The organization's choice of packs by where it came from: its data collection settings (`settings`), its managed settings. */
@@ -154,7 +162,7 @@ let personPacks: PackChoice = undefined
 let current: Gate = resolveGate(env, overrides, limit, optIn)
 
 const refresh = () => {
-  current = resolveGate(env, overrides, limit, optIn, resolveRedaction(combinePacks(Object.values(orgPacks)), personPacks))
+  current = resolveGate(env, overrides, limit, optIn, resolveRedaction(combinePacks(Object.values(orgPacks)), personPacks), inForce)
 }
 
 /** The gate in force for this load. */
@@ -167,9 +175,13 @@ export function configureGate(switches: Partial<Record<Switch, string | undefine
   refresh()
 }
 
-/** Explicit settings per data point, over the defaults: for organization settings, and for tests. */
-export function setOverrides(next: Overrides): void {
+/**
+ * The organization's settings per data point: `next`, the explicit settings, over everything else; `org`, what is in force for the
+ * organization (Mainwave's `in_force`), in place of the plugin's defaults for each data point it names. For tests, too.
+ */
+export function setOverrides(next: Overrides, org: Overrides = {}): void {
   overrides = { ...next }
+  inForce = { ...org }
   refresh()
 }
 
