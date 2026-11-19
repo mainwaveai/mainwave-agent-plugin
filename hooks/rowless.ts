@@ -159,8 +159,8 @@ export type RequestFacts = {
   startMs: number
   endMs: number
   firstChunkMs?: number
-  /** The session's cost after the request, as `$.session.usage()` reads it; undefined where it could not be read. */
-  sessionCostUsd?: number
+  /** The request's cost: what the session's grew by since the last reading (`costOf`); undefined where it could not be read. */
+  costUsd?: number
   /** Whether the session is a print or SDK session: its main loop's requests' `query_source` is `sdk` there. */
   sdk: boolean
 }
@@ -168,22 +168,50 @@ export type RequestFacts = {
 const whole = (n: unknown): number | undefined => (typeof n === 'number' && Number.isFinite(n) && n >= 0 ? Math.round(n) : undefined)
 
 /**
- * The cost of the request that just ended: what the session's cost grew by since the last request ended. Requests that end together
- * (subagents) may trade a share of their cost, but never add to or lose any of the session's. Undefined where the cost could not be
- * read, or where it went down (a /clear starts it over).
+ * What the session's cost grew by since the last reading taken: the share of the request that just ended, or of what the session
+ * spent outside its requests. The caller takes readings one at a time, in order, so the shares sum to the session's cost, never more.
+ * A reading below the last means the session's cost started over (a /clear): all of it is new. Undefined where it could not be read.
  */
 export function costOf(state: Rowless, sessionCostUsd: number | undefined): number | undefined {
   if (sessionCostUsd === undefined || !Number.isFinite(sessionCostUsd) || sessionCostUsd < 0) return undefined
   const before = state.costUsd ?? 0
   state.costUsd = sessionCostUsd
-  if (sessionCostUsd < before) return undefined
+  if (sessionCostUsd < before) return sessionCostUsd
   return Math.round((sessionCostUsd - before) * 1e10) / 1e10
 }
+
+/**
+ * Where the shares start when the rows begin to be built: from nothing in a session that began as the plugin loaded, else from the
+ * session's cost now. A session that began well before (a resume counts from its first launch; a reload, from its own start) had its
+ * cost so far sent already, by an earlier load or Claude Code's own rows.
+ */
+export function seedCost(state: Rowless, usage: { startedAt?: number; costUsd?: number }, loadedAtMs: number): void {
+  if (state.costUsd !== undefined) return
+  const earlier = typeof usage.startedAt === 'number' && usage.startedAt < loadedAtMs - SEED_MS
+  state.costUsd = earlier && usage.costUsd !== undefined ? usage.costUsd : 0
+}
+
+/** How long before the plugin loaded a session must have begun for its cost so far to be an earlier load's or process's. */
+export const SEED_MS = 30_000
+
+/**
+ * Whether a failed call's text is Claude Code's refusal of it: the person's, the one a session that can't ask gives, or the ask's own
+ * reason, which a session that can't ask gives too.
+ */
+export function isRefusal(text: unknown, reason: string | undefined): boolean {
+  if (typeof text !== 'string') return false
+  return text.includes(REFUSED_BY_PERSON) || NOT_ASKED.test(text) || (reason !== undefined && reason.length >= 8 && text.includes(reason))
+}
+
+/** The start of the text Claude Code gives the model for a call the person refused. */
+const REFUSED_BY_PERSON = "The user doesn't want to proceed with this tool use"
+/** The text Claude Code gives the model for a call it could not ask anyone about. */
+const NOT_ASKED = /Permission to use \S+ has been denied/
 
 /** A model request answered: its `api_request` row, under Claude Code's attribute names and types. */
 export function requestRow(state: Rowless, head: Attrs, f: RequestFacts): RowIn {
   const u = f.usage
-  const cost = costOf(state, f.sessionCostUsd)
+  const cost = f.costUsd
   const effort = typeof f.effort === 'string' ? f.effort : undefined
   // Claude Code writes both lifetimes, 0 where no write named one.
   const noLifetime = u.ephemeral_5m_input_tokens === undefined && u.ephemeral_1h_input_tokens === undefined ? 0 : undefined
@@ -224,7 +252,7 @@ export function decisionRow(state: Rowless, head: Attrs, call: { tool: string; i
 }
 
 /** A tool call's permission check, as `tool.check` answered it. */
-export type Verdict = { decision?: string; rule?: string; hook?: string; setting?: string }
+export type Verdict = { decision?: string; rule?: string; hook?: string; setting?: string; reason?: string }
 
 /**
  * Who decided a call, under Claude Code's names, where the check says: a hook (`hook`), or a rule or setting (`config`). An ask the

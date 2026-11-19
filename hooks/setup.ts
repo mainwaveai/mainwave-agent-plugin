@@ -149,6 +149,18 @@ export function signedInElsewhere(env: SignInEnv, settings: Readonly<Record<stri
 }
 
 /**
+ * Whether the session is signed in with a key or a provider of its own: an API key or token, one on a file descriptor, a gateway's
+ * token, a cloud provider, or an API key helper. Neither a host's identity variables nor the account file then say who it is. A host's
+ * OAuth token, which `signedInElsewhere` counts too, is not one: the host names the account it hands in.
+ */
+export function signedInWithKey(env: SignInEnv, settings: Readonly<Record<string, unknown>>): boolean {
+  const helper = settings['apiKeyHelper']
+  return [env.ANTHROPIC_API_KEY, env.ANTHROPIC_AUTH_TOKEN, env.CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR, env.CLAUDE_CODE_GATEWAY_TOKEN, env.CLAUDE_CODE_GATEWAY_TOKEN_FILE_DESCRIPTOR].some(set)
+    || truthy(env.CLAUDE_CODE_USE_BEDROCK) || truthy(env.CLAUDE_CODE_USE_VERTEX) || truthy(env.CLAUDE_CODE_USE_FOUNDRY)
+    || (typeof helper === 'string' && helper.trim() !== '')
+}
+
+/**
  * Who the session is, as Claude's account file (`.claude.json`) says: `oauthAccount`'s organization, email and account, and the
  * installation's `userID`, under the attributes Claude Code's rows name them by, each where it fits its shape (identity.ts). Empty
  * unless both the organization and the email fit: the plugin's rows go nowhere without them.

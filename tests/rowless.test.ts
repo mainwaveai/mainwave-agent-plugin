@@ -5,7 +5,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { accountDeviceOf, costOf, decisionSource, hostIdentityOf, newRowless, promptRow, providerOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
+import { accountDeviceOf, costOf, decisionSource, hostIdentityOf, isRefusal, seedCost, newRowless, promptRow, providerOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
 import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, PROD, records, type Post } from './rig.ts'
 
 const keyless = { options: {} }
@@ -19,7 +19,7 @@ const HOST_EMAIL = 'host@example.com'
 const BUILT = 'mainwave.telemetry.built_from'
 const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 300, cache_creation_input_tokens: 40, ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 40 }
 
-type World = { env?: Record<string, string>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean }
+type World = { env?: Record<string, string>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number }
 
 function world(on: On, opts: World = {}) {
   const clock = mock.clock(on, { now: START })
@@ -40,9 +40,9 @@ function world(on: On, opts: World = {}) {
   on('session.id', () => ({ value: 's-1' }) as never)
   // The session's cost after each request, in turn; `spend` adds a cost outside any request of a turn.
   const costs = [...(opts.costs ?? [0.01, 0.03, 0.06, 0.1])]
-  let cost = 0
+  let cost = opts.costBefore ?? 0
   const spend = (usd: number) => (cost = Math.round((cost + usd) * 1e9) / 1e9)
-  on('session.usage', () => ({ value: { startedAt: START, context: {}, rateLimits: [], cost: { usd: cost } } }) as never)
+  on('session.usage', () => ({ value: { startedAt: opts.startedAt ?? START, context: {}, rateLimits: [], cost: { usd: cost } } }) as never)
   on('session.start', (_$, e) => ({ cwd: (e as { cwd: string }).cwd }) as never)
   on('session.end', (_$, e) => ({ sessionId: (e as { sessionId: string }).sessionId }) as never)
   on('ui.log', () => ({ value: undefined }) as never)
@@ -296,6 +296,24 @@ describe('the rows built from events', () => {
     expect(sum(cost)).toBe(0.037)
   })
 
+  test('a session resumed or reloaded long after it began: the cost it had already is not the first request\'s', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, startedAt: START - 3_600_000, costBefore: 0.5, costs: [0.01] })
+    await start($)
+    await turn($)
+    await end($)
+    expect(w.built().filter(r => r.attributes['event.name'] === 'api_request').map(r => r.attributes['cost_usd'])).toEqual([0.01])
+    expect(points(w.posts).filter(p => p.name === 'claude_code.cost.usage').reduce((n, p) => n + p.value, 0)).toBe(0.01)
+  })
+
+  test("a session on an API key goes under no one, whatever the host's variables say", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, env: { ANTHROPIC_API_KEY: 'key', CLAUDE_CODE_ORGANIZATION_UUID: HOST_ORG, CLAUDE_CODE_USER_EMAIL: HOST_EMAIL } })
+    await start($)
+    await turn($)
+    await w.clock.advance(5_000)
+    await end($)
+    expect(w.posts).toEqual([])
+  })
+
   test('a refused call has its decision alone, a reject, as in Claude Code', keyless, async ($, on) => {
     const w = world(on, { accountFile: ACCOUNT_FILE })
     await start($)
@@ -342,6 +360,26 @@ describe('the rows built from events', () => {
 })
 
 describe('rowless.ts', () => {
+  test("Claude Code's texts of a refusal: the person's, one no one could be asked about, the ask's own reason; not a tool's own failure", () => {
+    expect(isRefusal("The user doesn't want to proceed with this tool use. The tool use was rejected.", undefined)).toBe(true)
+    expect(isRefusal('Error: Permission to use Bash has been denied. IMPORTANT: ...', undefined)).toBe(true)
+    expect(isRefusal("Error: touch in '/tmp/x' needs approval.", "touch in '/tmp/x' needs approval.")).toBe(true)
+    expect(isRefusal('Error: Exit code 1', 'needs approval for this')).toBe(false)
+    expect(isRefusal('Error: x', 'x')).toBe(false)
+    expect(isRefusal(undefined, undefined)).toBe(false)
+  })
+
+  test("the shares start from nothing where the session began as the plugin loaded, else from the session's cost then", () => {
+    const fresh = newRowless()
+    seedCost(fresh, { startedAt: 1_000, costUsd: 0.002 }, 2_000)
+    expect(fresh.costUsd).toBe(0)
+    const resumed = newRowless()
+    seedCost(resumed, { startedAt: 1_000, costUsd: 0.5 }, 1_000 + 3_600_000)
+    expect(resumed.costUsd).toBe(0.5)
+    seedCost(resumed, { startedAt: 0, costUsd: 9 }, 1)
+    expect(resumed.costUsd).toBe(0.5)
+  })
+
   test("the head says where requests go and a terminal no person types into, as Claude Code's rows do", () => {
     const head = rowHead({}, { 'organization.id': ORG, 'user.email': EMAIL }, 's-1', { provider: providerOf({ CLAUDE_CODE_USE_BEDROCK: '1' }), customBaseUrl: true, nonInteractive: true })
     expect(head).toEqual({ 'session.id': 's-1', 'organization.id': ORG, 'user.email': EMAIL, 'anthropic.provider': 'bedrock', 'anthropic.custom_base_url': true, 'terminal.type': 'non-interactive' })
@@ -389,12 +427,13 @@ describe('rowless.ts', () => {
     expect(uuidOf('0123456789abcdef0123456789abcdef')).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/)
   })
 
-  test("a request's cost is the session's growth; none where it can't be read or went down", () => {
+  test("a request's cost is the session's growth since the last reading; none where it can't be read; all of it after it started over", () => {
     const s = newRowless()
     expect(costOf(s, 0.5)).toBe(0.5)
     expect(costOf(s, 0.75)).toBe(0.25)
     expect(costOf(s, undefined)).toBeUndefined()
-    expect(costOf(s, 0.1)).toBeUndefined()
+    // Lower than the last: the session's cost started over, and all of it is new.
+    expect(costOf(s, 0.1)).toBe(0.1)
     expect(costOf(s, 0.3)).toBe(0.2)
   })
 
@@ -402,7 +441,7 @@ describe('rowless.ts', () => {
     const s = newRowless()
     const head = { 'session.id': 's-1' }
     const p = promptRow(s, head, 'hello', 1000, 'p-1')
-    const r = requestRow(s, head, { model: 'claude-haiku-5-5', usage: { input_tokens: 1, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 }, startMs: 1000, endMs: 1500, sdk: true, sessionCostUsd: 0.2 })
+    const r = requestRow(s, head, { model: 'claude-haiku-5-5', usage: { input_tokens: 1, output_tokens: 2, cache_read_input_tokens: 3, cache_creation_input_tokens: 4 }, startMs: 1000, endMs: 1500, sdk: true, costUsd: 0.2 })
     const t = resultRow(s, head, { tool: 'Read', id: 'toolu_9', startMs: 1500, endMs: 1600, isError: true })
     expect(p.attributes).toEqual({ 'session.id': 's-1', 'event.name': 'user_prompt', 'event.timestamp': new Date(1000).toISOString(), 'event.sequence': 0, 'prompt.id': 'p-1', prompt_length: '5', prompt: '<REDACTED>', prompt_text: '<REDACTED>' })
     expect(r.attributes).toEqual({

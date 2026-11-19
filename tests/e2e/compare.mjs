@@ -311,7 +311,7 @@ const base = `http://127.0.0.1:${server.address().port}`
 /**
  * One session, its telemetry captured. `details` turns prompt and tool-detail logging on; `envBlock` false runs it without Mainwave's
  * env block, the plugin sending keyless; `auto` runs it in auto mode; `rowless` loads skip.ts ahead of the plugin, so no row of Claude
- * Code's reaches it, and names the session's organization and email as remote Cowork's host does.
+ * Code's reaches it.
  */
 async function session(details, envBlock, auto, rowless = false) {
   captured = { exporter: { logs: [], traces: [], metrics: [] }, plugin: { logs: [], traces: [], metrics: [] }, settings: [], other: [] }
@@ -368,9 +368,6 @@ async function session(details, envBlock, auto, rowless = false) {
     // Mainwave's org-wide setup's captures, all on (its default), or all turned off: it writes `0` for a capture an admin turns off.
     ...Object.fromEntries(CAPTURES.map(k => [k, details ? '1' : '0'])),
   })
-  // The session's organization and email, as a host names them: the plugin's only source of who the session is without rows, as the
-  // session runs on an API key and has no login.
-  if (rowless) Object.assign(env, { CLAUDE_CODE_ORGANIZATION_UUID: ORG, CLAUDE_CODE_USER_EMAIL: EMAIL })
 
   const args = [
     '-p', 'E2E_MAINTASK: run the steps, then say ok.',
@@ -1026,7 +1023,7 @@ function checkRowless(pass, { captured, run }, reference) {
     if (OWN_ROWS.has(ev(r))) continue
     if (r.attributes['mainwave.telemetry.built_from']?.v !== 'events') problems.push(`logs: a ${ev(r)} row the plugin did not build: a row of Claude Code's reached it`)
     if (!BUILT_ROWS.includes(ev(r))) problems.push(`logs: a ${ev(r)} row, which the plugin never builds`)
-    if (r.attributes['organization.id']?.v !== ORG || r.attributes['user.email']?.v !== EMAIL) problems.push(`logs: a ${ev(r)} row not under the host's organization and email`)
+    if (r.attributes['organization.id']?.v !== ORG || r.attributes['user.email']?.v !== EMAIL) problems.push(`logs: a ${ev(r)} row not under the session's organization and email`)
   }
   const ofEvent = (list, name) => list.filter(r => ev(r) === name)
   const requests = { plugin: ofEvent(rows, 'api_request'), exporter: ofEvent(theirs, 'api_request').filter(r => stepSource(r.attributes.query_source?.v)) }
