@@ -408,6 +408,44 @@ describe('the rows built from events', () => {
     expect(prompts.map(r => r.attributes['prompt_length'])).toEqual(['2'])
   })
 
+  test("a prompt the person never sees as typed (isMeta), or one a plugin submits over a running turn, is no empty turn's", keyless, async ($, on) => {
+    const w = world(on, {
+      accountFile: ACCOUNT_FILE,
+      turns: {
+        'hidden reminder': () => turn($, '', 'toolu_1'),
+        // Still entering when the running turn ends and a continuation starts.
+        'from a plugin': async () => {
+          await $.turn.complete({ turnId: 't9', answer: 'ok', durationMs: 20, isAborted: false, reason: 'answer' } as never)
+          await turn($, '', 'toolu_3')
+        },
+      },
+    })
+    await start($)
+    await $.prompt.submit({ text: 'hidden reminder', isMeta: true, wait: false, origin: { kind: 'sdk' } } as never)
+    // A plugin's prompt carries no turnId even while a turn runs; the continuation that follows the turn is not its.
+    await $.turn.start({ turnId: 't9', text: 'go' } as never)
+    await $.prompt.submit({ text: 'from a plugin', wait: false, origin: { kind: 'plugin' } } as never)
+    await w.clock.advance(5_000)
+    expect(w.built().filter(r => r.attributes['event.name'] === 'user_prompt').map(r => r.attributes['prompt_length'])).toEqual(['2'])
+  })
+
+  test("a subagent's turn with no text neither takes the prompt held for the main loop nor lets it go", keyless, async ($, on) => {
+    const w = world(on, {
+      accountFile: ACCOUNT_FILE,
+      turns: {
+        'summarize the notes': async () => {
+          await $.turn.start({ turnId: 'sub-1', text: '', agentId: 'agent-1' } as never)
+          await $.turn.complete({ turnId: 'sub-1', answer: 'ok', durationMs: 10, isAborted: false, reason: 'answer', agentId: 'agent-1' } as never)
+          await turn($, '', 'toolu_1')
+        },
+      },
+    })
+    await start($)
+    await $.prompt.submit({ text: 'summarize the notes', wait: false, origin: { kind: 'sdk' } } as never)
+    await w.clock.advance(5_000)
+    expect(w.built().filter(r => r.attributes['event.name'] === 'user_prompt').map(r => r.attributes['prompt_length'])).toEqual(['19'])
+  })
+
   test("a turn that starts with its own text keeps it, whatever was submitted", keyless, async ($, on) => {
     const w = world(on, { accountFile: ACCOUNT_FILE, turns: { typed: () => turn($, 'typed, expanded', 'toolu_1') } })
     await start($)

@@ -269,6 +269,9 @@ export function snapshot() {
   }
 }
 
+/** The engine calls newer than the plugin's floor that the sender makes, each wrapped so an older engine's lack of it is a miss. */
+type Newer = { session: { machine: () => Promise<{ machine?: unknown }> } }
+
 async function readResource($: EngineInterface): Promise<string> {
   const get = async (read: () => Promise<string | undefined>) => {
     try {
@@ -284,11 +287,11 @@ async function readResource($: EngineInterface): Promise<string> {
     get(() => $.env.get('CLAUDE_CODE_IS_COWORK')),
     get(() => $.env.get('CLAUDE_CODE_ENTRYPOINT')),
     // Claude Code 2.1.328 on says what the machine is; an older one has no `machine`, and the resource goes without `host.arch`.
-    get(async () => (await ($ as unknown as { session: { machine: () => Promise<{ machine?: unknown }> } }).session.machine()).machine as string | undefined),
+    get(async () => hostArchOf((await ($ as unknown as Newer).session.machine()).machine)),
   ])
   scopeVersion = version
   const cowork = isCowork({ CLAUDE_CODE_IS_COWORK: isCoworkVar, CLAUDE_CODE_ENTRYPOINT: entrypoint })
-  return JSON.stringify(resourceOf({ resourceAttributes, serviceName, version, cowork, hostArch: hostArchOf(machine) }))
+  return JSON.stringify(resourceOf({ resourceAttributes, serviceName, version, cowork, hostArch: machine }))
 }
 
 /**

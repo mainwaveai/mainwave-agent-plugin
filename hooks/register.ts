@@ -161,6 +161,8 @@ let resourceAttrs: Promise<Record<string, string>> | null = null
  * takes this text instead, for its prompt row and its interaction.
  */
 let idleSubmitted: { text: string } | undefined
+/** A main-loop turn is running, from its `turn.start` to its `turn.complete`: a prompt submitted then is not one a turn starts with. */
+let mainTurnOpen = false
 /** When each tool call the plugin builds rows for began, by its id, until it ends. */
 let callStarts = new Map<string, number>()
 /** The permission check's verdict on each of those calls (`allow`, `deny` or `ask`), by its id, until it ends. */
@@ -1438,7 +1440,10 @@ export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1]
   let out: Emit | null = null
   // A main-loop turn takes the prompt submitted while the session was idle, if one was, whatever text it starts with.
   const submitted = e.agentId === undefined ? idleSubmitted?.text : undefined
-  if (e.agentId === undefined) idleSubmitted = undefined
+  if (e.agentId === undefined) {
+    idleSubmitted = undefined
+    mainTurnOpen = true
+  }
   try {
     // The turn's prompt: its own text, else (a host that starts the turn with none) the prompt submitted to start it.
     const text = e.text !== '' ? e.text : (submitted ?? '')
@@ -1469,6 +1474,7 @@ export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1]
 /** A turn ended: a main-loop interaction is sent. */
 export async function turnCompleteHook($: TurnCompleteParams[0], e: TurnCompleteParams[1], next: TurnCompleteParams[2]) {
   let out: Emit | null = null
+  if (e.agentId === undefined) mainTurnOpen = false
   // A main-loop turn an API error ended: where it failed, read before its interaction closes.
   let failedAt: Record<string, TelemetryAttribute> | undefined
   try {
@@ -1738,10 +1744,12 @@ export async function commandHook($: CommandParams[0], e: CommandParams[1], next
 export async function promptHook($: PromptParams[0], e: PromptParams[1], next: PromptParams[2]) {
   let r: Rebuild | null = null
   let out: Emit | null = null
-  // Submitted while idle, it starts a turn: held for that turn's start, which comes before `next` resolves.
+  // Submitted while idle, it starts a turn: held for that turn's start, which comes before `next` resolves. Not one submitted over a
+  // running turn (a plugin's own carries no `turnId` even then), nor one the person never sees as typed (`isMeta`).
   let held: { text: string } | undefined
   try {
-    if (e.turnId === undefined && e.command === undefined && typeof e.text === 'string') held = idleSubmitted = { text: e.text }
+    const idle = e.turnId === undefined && !mainTurnOpen
+    if (idle && e.command === undefined && e.isMeta !== true && typeof e.text === 'string') held = idleSubmitted = { text: e.text }
   } catch {
     held = undefined
   }
@@ -1921,6 +1929,7 @@ export const register: Register = on => {
   seedSince = {}
   resourceAttrs = null
   idleSubmitted = undefined
+  mainTurnOpen = false
   callStarts = new Map()
   verdicts = new Map()
   agentTypes = new Map()
