@@ -341,6 +341,96 @@ export function personPrompt(messages: readonly WalkedMessage[], acrossCalls = f
   return ''
 }
 
+/**
+ * Whether a user message's text is the one Cowork's host submits as it hands a conversation begun in chat over to Claude Code with the
+ * chat's last call not run: its own words, asking the model to run that call again, not the person's.
+ */
+export function hostContinue(text: string): boolean {
+  return /^Continue with the task described in the conversation above\. Your most recent [^\n]{1,200}? call has not run yet;/.test(typedText(text).trimStart())
+}
+
+/** Whether a user message answers a call with the result the handover gives a call the chat part of the conversation never ran. */
+const notRun = (m: WalkedMessage | undefined) =>
+  hasResults(m) && m!.toolResults!.some(r => r !== null && typeof r === 'object' && typeof (r as { text?: unknown }).text === 'string' && (r as { text: string }).text.trimStart().startsWith('NOT RUN: this tool call has not run yet'))
+
+/**
+ * Where Cowork handed a conversation begun in chat over to Claude Code with the chat's last call not run, read from the session's
+ * messages: the person's message that turn began with, back past the host's message, the model's messages with no calls after it
+ * (its "No response requested."), then across the turn's calls (`personPrompt`). '' where that turn holds none; undefined where the
+ * newest messages do not have that shape.
+ *
+ * With `host`, the turn's text, which the transcript's own fields mark as the host's (`handoverIn`): the newest message must be that
+ * text. Without it, the host's message is known by its words (`hostContinue`), and the walk must also pass the call's not-run result.
+ */
+export function handoffPrompt(messages: readonly WalkedMessage[], host?: string): string | undefined {
+  let i = messages.length - 1
+  // Past what Claude Code inserted after the host's message: a notice, or a message of Cowork's reminders alone.
+  const inserted = (m: WalkedMessage | undefined) => m?.role === 'user' && !hasResults(m) && typeof m.text === 'string' && (typedText(m.text).trim() === '' || insertedText(m.text))
+  while (i >= 0 && inserted(messages[i])) i--
+  const said = messages[i]
+  if (said?.role !== 'user' || hasResults(said) || typeof said.text !== 'string') return undefined
+  if (host !== undefined ? typedText(said.text).trim() !== typedText(host).trim() : !hostContinue(said.text)) return undefined
+  i--
+  while (i >= 0 && messages[i]?.role === 'assistant' && (messages[i]!.toolUses?.length ?? 0) === 0) i--
+  if (host === undefined && !notRun(messages[i])) return undefined
+  return personPrompt(messages.slice(0, i + 1), true)
+}
+
+/**
+ * What the end of a session's transcript says of a handover from chat, as Cowork's host marks it on the rows it writes: `relay`, the
+ * system row it leaves at the handover (`upgrade_relay_marker`); `hostWritten`, the newest prompt row is one it wrote after that row
+ * (`textNotTyped`), its text `newest`; `carried`, the newest prompt row is from before that row and not the host's (no prompt has
+ * been written since the handover); `handedOff`, it is also marked as the person's message the host carried over from chat
+ * (`handedOff`). `person`, the text of the newest prompt row before the handover's row that the host did not write: the person's last
+ * message in chat. A prompt row is a user row of text that is not a tool's result, a message Claude Code inserted, or `isMeta`.
+ */
+export type Handover = { relay: boolean; hostWritten: boolean; carried: boolean; handedOff: boolean; newest?: string; person?: string }
+
+/** The text of a transcript row's message content: a string, or its text blocks joined; undefined for a tool's results, or none. */
+function rowText(content: unknown): string | undefined {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return undefined
+  const blocks = content.filter((b): b is Record<string, unknown> => b !== null && typeof b === 'object')
+  if (blocks.some(b => b['type'] === 'tool_result')) return undefined
+  const texts = blocks.filter(b => b['type'] === 'text' && typeof b['text'] === 'string').map(b => b['text'] as string)
+  return texts.length > 0 ? texts.join('') : undefined
+}
+
+/** What a stretch of transcript lines, its end, says of a handover from chat (`Handover`). A line cut where the read began is skipped. */
+export function handoverIn(text: string): Handover {
+  let relayAt = -1
+  const prompts: { at: number; text: string; notTyped: boolean; handedOff: boolean }[] = []
+  text.split('\n').forEach((line, at) => {
+    if (line.trim() === '') return
+    let row: unknown
+    try {
+      row = JSON.parse(line)
+    } catch {
+      return
+    }
+    if (row === null || typeof row !== 'object') return
+    const r = row as Record<string, unknown>
+    if (r['type'] === 'system' && r['subtype'] === 'upgrade_relay_marker') relayAt = at
+    if (r['type'] !== 'user' || r['isMeta'] === true) return
+    const message = r['message']
+    const said = rowText(message !== null && typeof message === 'object' ? (message as { content?: unknown }).content : undefined)
+    if (said === undefined || typedText(said).trim() === '' || insertedText(said)) return
+    prompts.push({ at, text: said, notTyped: r['textNotTyped'] === true, handedOff: r['handedOff'] === true })
+  })
+  const relay = relayAt >= 0
+  const newest = prompts.at(-1)
+  const carried = relay && newest !== undefined && !newest.notTyped && newest.at < relayAt
+  const person = relay ? [...prompts].reverse().find(p => !p.notTyped && p.at < relayAt) : undefined
+  return {
+    relay,
+    hostWritten: relay && newest !== undefined && newest.notTyped && newest.at > relayAt,
+    carried,
+    handedOff: carried && newest!.handedOff,
+    ...(newest !== undefined ? { newest: newest.text } : {}),
+    ...(person !== undefined ? { person: person.text } : {}),
+  }
+}
+
 /** The rules a settings layer's `permissions.allow` lists; none for a layer of another shape. */
 export function permissionRules(layer: unknown): string[] {
   const permissions = layer !== null && typeof layer === 'object' ? (layer as { permissions?: unknown }).permissions : undefined

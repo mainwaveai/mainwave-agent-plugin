@@ -44,11 +44,11 @@ import {
 } from './markers.ts'
 import { isCowork, isTruthy, parseResourceAttributes, type BuiltSpan, type CopiedRow } from './otlp.ts'
 import {
-  agentSpawned, callerCtx, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnPrompted, turnStart, waits, type Emit, type Rebuild, type RowIn,
+  agentSpawned, callerCtx, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolJoinsTurn, toolStart, turnComplete, turnPrompted, turnStart, waits, type Emit, type Rebuild, type RowIn,
 } from './rebuild.ts'
 import {
   accountDeviceOf, costOf, decisionOf, decisionRow, headOf, hostIdentityOf, joinPath, madeCommit, newRowless, promptIdFrom, promptRow, providerOf, remoteSessionIdOf, repoAttributes, requestRow, responseRow,
-  permissionRules, personPrompt, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, typedText, uuidOf, type HostFacts, type HostIdentityEnv, type MadeCommit, type Rowless, type Verdict,
+  handoffPrompt, handoverIn, hostContinue, permissionRules, personPrompt, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, typedText, uuidOf, type Handover, type HostFacts, type HostIdentityEnv, type MadeCommit, type Rowless, type Verdict,
 } from './rowless.ts'
 import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsPending, settingsSummary, settingsUnavailable } from './orgsettings.ts'
 import { contentLimit } from './protect.ts'
@@ -182,6 +182,17 @@ let mainTurnSeen = false
 let promptLater: { turnId: string; atMs: number } | undefined
 /** How many of the transcript's newest messages a turn begun with no text reads back for its prompt (`personPrompt`). */
 const TRANSCRIPT_WALK = 500
+/**
+ * Main-loop calls that ran before the load's first turn began, while the plugin builds the rows: as in Cowork, where Claude Code runs
+ * the call the chat part of the conversation left without its result as it takes the conversation over, just before the turn that
+ * call is part of starts. Their rows wait for that turn's prompt row, so they carry its prompt (`releaseEarlyCalls`).
+ */
+let earlyCalls: CallRows[] = []
+const MAX_EARLY_CALLS = 50
+/** A main-loop call began before the load's first turn, in Cowork: a handover's first turn may take the person's carried-over message. */
+let earlySeen = false
+/** When each of those calls began, by its id, while it runs: the first turn's prompt row is timed no later (`earliestStart`). */
+let earlyRunning = new Map<string, number>()
 /** When each tool call the plugin builds rows for began, by its id, until it ends. */
 let callStarts = new Map<string, number>()
 /** The permission check's verdict on each of those calls (`allow`, `deny` or `ask`), by its id, until it ends. */
@@ -1470,6 +1481,58 @@ async function transcriptPrompt($: EngineInterface, acrossCalls: boolean): Promi
   }
 }
 
+/** How much of the transcript's end is read for what Cowork's host marks on the rows of a handover from chat (`handoverOf`). */
+const HANDOVER_TAIL_BYTES = 1_048_576
+
+/**
+ * What the end of the session's transcript says of a handover from chat (`handoverIn`): the fields Cowork's host writes on the rows,
+ * which neither `$.session.messages` nor the hooks' events carry. Undefined where there is no transcript, or it can't be read.
+ */
+async function handoverOf($: EngineInterface): Promise<Handover | undefined> {
+  try {
+    const { transcriptPath } = await infoOf($)
+    if (transcriptPath === undefined) return undefined
+    const size = (await $.fs.stat(transcriptPath)).size
+    const length = Math.min(size, HANDOVER_TAIL_BYTES)
+    return handoverIn(await ($ as unknown as Newer).fs.read(transcriptPath, { offset: size - length, length }))
+  } catch {
+    return undefined
+  }
+}
+
+/** The session's newest messages, read back for a handover's prompt (`handoffPrompt`); undefined where they can't be read. */
+async function handoffWalk($: EngineInterface, host?: string): Promise<string | undefined> {
+  try {
+    const newest = await ($ as unknown as Newer).session.messages({ last: TRANSCRIPT_WALK })
+    return Array.isArray(newest) ? handoffPrompt(newest, host) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The prompt of the load's first turn in Cowork, where Cowork handed the conversation over from chat; undefined where nothing shows a
+ * handover, and the turn's text stands. By the fields the host writes on the transcript's rows (`handoverOf`), where they are there:
+ *
+ * - a turn whose text is the newest prompt row, one the host wrote after the handover (`textNotTyped`: its message asking to run the
+ *   chat's last call, not run): the person's last message in chat, from the transcript, else read back through the session's messages
+ *   past the host's; '' where neither finds one, as the host's text is never the person's;
+ * - a turn begun with no text, whose newest prompt row is the person's message carried over (`handedOff`), after a call began before
+ *   it (the cut-off call Claude Code runs as it takes the conversation over): that message. A later load's first turn, with no such
+ *   call, never takes it, though the rows of a past handover still end the transcript until the person's next message is written.
+ *
+ * Without them: a turn whose text is the host's message by its words (`hostContinue`), after the call's not-run result, with the
+ * handover's row in the transcript.
+ */
+async function handoverPrompt($: EngineInterface, text: string): Promise<string | undefined> {
+  const t = await handoverOf($)
+  if (t === undefined || !t.relay) return undefined
+  if (text !== '' && t.hostWritten && t.newest !== undefined && typedText(t.newest).trim() === typedText(text).trim()) return t.person ?? (await handoffWalk($, text)) ?? ''
+  if (text === '' && t.handedOff && t.person !== undefined && earlySeen) return t.person
+  if (text !== '' && hostContinue(text)) return handoffWalk($)
+  return undefined
+}
+
 /** The session's repository, as its `origin` remote names it (`repoAttributes`); none where it is in none, or it can't be read. */
 async function readRepo($: EngineInterface): Promise<Record<string, string>> {
   try {
@@ -1615,20 +1678,25 @@ async function turnText($: EngineInterface, text: string): Promise<string> {
 /**
  * The first model request of the load's first turn, where that turn began with no prompt at the transcript's end: the request's
  * messages are in the transcript now, the person's among them, read back past what the turn has done (a turn begun before the plugin's
- * hooks were in place). Its prompt row goes before the request's rows, timed at the turn's start, and the turn's interaction takes its
- * text.
+ * hooks were in place). Its prompt row goes before the request's rows, timed at the turn's start (or the start of a call that ran
+ * before it began, if earlier), and the turn's interaction takes its text. The rows of the calls that ran before the turn began follow
+ * it.
  */
 async function promptAtFirstStep($: EngineInterface, e: { turnId: string; agentId?: string }): Promise<void> {
   const later = promptLater
   if (later === undefined || e.agentId !== undefined || e.turnId !== later.turnId) return
   promptLater = undefined
   const r = await rebuildOf($)
-  if (r === null || !rowless) return
-  const text = await turnText($, await transcriptPrompt($, true))
-  if (text === '') return
-  if (isCopying()) capturePrompt(capture, text)
-  turnPrompted(r, e.turnId, text)
-  await buildPromptRow($, text, later.atMs)
+  try {
+    if (r === null || !rowless) return
+    const text = await turnText($, await transcriptPrompt($, true))
+    if (text === '') return
+    if (isCopying()) capturePrompt(capture, text)
+    turnPrompted(r, e.turnId, text)
+    await buildPromptRow($, text, earliestStart(later.atMs))
+  } finally {
+    await releaseEarlyCalls($, r)
+  }
 }
 
 /** A main-loop turn began: an interaction opens. */
@@ -1649,7 +1717,17 @@ export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1]
     const first = e.agentId === undefined && !mainTurnSeen
     if (e.agentId === undefined) mainTurnSeen = true
     if (e.agentId === undefined) await decideRowless($)
-    if (text === '' && first && rowless) text = await transcriptPrompt($, false)
+    // Cowork handing a conversation begun in chat over (`handoverPrompt`): the turn begins with the host's own message, or with none,
+    // and its prompt is the person's last message in chat ('' where none is found: the host's text is never taken for it).
+    let handedOver = false
+    if (first && rowless && (await hostFactsOf($)).cowork === true) {
+      const found = await handoverPrompt($, text)
+      if (found !== undefined) {
+        text = found
+        handedOver = true
+      }
+    }
+    if (text === '' && first && rowless && !handedOver) text = await transcriptPrompt($, false)
     if (e.agentId === undefined) text = await turnText($, text)
     if (e.agentId === undefined && isCopying()) capturePrompt(capture, text)
     // The repository the turn runs in, read again each turn: the session may have moved to another, or the remote changed.
@@ -1661,12 +1739,14 @@ export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1]
     // model request.
     if (r !== null && rowless && e.agentId === undefined && text !== '') {
       try {
-        await buildPromptRow($, text, nowMs)
+        await buildPromptRow($, text, first ? earliestStart(nowMs) : nowMs)
       } catch {
         // The turn goes without its prompt row.
       }
-    } else if (r !== null && rowless && first && text === '') promptLater = { turnId: e.turnId, atMs: nowMs }
+    } else if (r !== null && rowless && first && text === '' && !handedOver) promptLater = { turnId: e.turnId, atMs: nowMs }
     if (r !== null) out = turnStart(r, { ...e, text }, nowMs)
+    // The calls that ran before the turn began, under its prompt: now, unless the prompt waits for the turn's first request.
+    if (first && promptLater === undefined) await releaseEarlyCalls($, r)
   } catch {
     // The turn's interaction is not rebuilt.
   }
@@ -1689,6 +1769,8 @@ export async function turnCompleteHook($: TurnCompleteParams[0], e: TurnComplete
   }
   try {
     const r = await rebuildOf($)
+    // Calls that ran before the turn began and still wait (the turn made no request): theirs go before it closes.
+    if (e.agentId === undefined && earlyCalls.length > 0) await releaseEarlyCalls($, r)
     if (r !== null) out = turnComplete(r, e, await $.clock.now())
   } catch {
     // The turn's interaction is not rebuilt.
@@ -1811,6 +1893,53 @@ function endedCall(e: ToolCallParams[1]): EndedCall {
 }
 
 /**
+ * What a tool call that ended leaves for the rebuild and its rows: the call, its result and end; with `decision`, the rows are built
+ * (its decision row); with `ran`, it ran (its result row).
+ */
+type CallRows = {
+  id: string | undefined
+  call: { tool: string; id: string; agentId?: string }
+  result: unknown
+  startMs: number
+  endMs: number
+  decision?: { refused: boolean; source?: string; atMs: number }
+  ran?: { startMs: number; runStartMs?: number; endMs: number; isError: boolean; input: Readonly<Record<string, unknown>>; text?: string; commit?: MadeCommit }
+}
+
+/** A tool call's decision row, its end in the rebuild, then its result row: the decision first, so a refused call's spans go as it ends. */
+async function sendCall($: EngineInterface, r: Rebuild, c: CallRows): Promise<void> {
+  const built = c.decision !== undefined && rowless
+  const head = built ? await rowlessHead($) : undefined
+  if (built) await feedRow($, decisionRow(rowlessState, head!, { ...c.call, ...c.decision! }, c.decision!.atMs))
+  await emit($, toolEnd(r, c.id, c.result as never, c.endMs))
+  if (built && c.ran !== undefined) await feedRow($, resultRow(rowlessState, head!, { ...c.call, ...c.ran }))
+}
+
+/**
+ * The calls that ran before the load's first turn began (`earlyCalls`), once that turn's prompt row is built, or none comes: their rows,
+ * timed as they ran, under the turn's prompt, and their spans under its interaction.
+ */
+async function releaseEarlyCalls($: EngineInterface, r: Rebuild | null): Promise<void> {
+  const calls = earlyCalls
+  earlyCalls = []
+  if (r === null) return
+  for (const c of calls) {
+    try {
+      if (c.id !== undefined) toolJoinsTurn(r, c.id)
+      await sendCall($, r, c)
+    } catch {
+      // That call goes without its rows.
+    }
+  }
+}
+
+/**
+ * When the load's first turn's prompt row is timed: as the turn began, or as the first call that began before it, if earlier, ended or
+ * still running.
+ */
+const earliestStart = (atMs: number) => Math.min(earlyCalls.reduce((min, c) => Math.min(min, c.startMs), atMs), ...earlyRunning.values())
+
+/**
  * One tool call: when it began and ended, and what it did; once it ended without error, its markers, beside it. The call and its
  * result pass through untouched.
  */
@@ -1822,13 +1951,24 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
   } catch {
     ended = undefined
   }
+  // A main-loop call before the load's first turn began, in Cowork (`earlyCalls`): whether the plugin builds the rows is decided as it
+  // ends, as that turn's start would decide it, so what its check and run say is kept meanwhile.
+  let early = false
+  // What the transcript's end says of a handover, for a call begun before the first turn: read as it begins, its rows written by then.
+  let handover: Promise<Handover | undefined> | undefined
   try {
     r = await rebuildOf($)
     if (r !== null) {
+      early = e.agentId === undefined && !mainTurnSeen && !mainTurnOpen && !rowSeen && typeof e.tool_use_id === 'string' && e.tool_use_id !== '' && (await hostFactsOf($)).cowork === true
+      if (early) {
+        earlySeen = true
+        handover = handoverOf($)
+      }
       if (ended !== undefined) captureTool(capture, ended.toolUseId, ended.tool, ended.input)
       const startMs = await $.clock.now()
+      if (early) earlyRunning.set(e.tool_use_id!, startMs)
       toolStart(r, e as never, startMs)
-      if (rowless && e.tool_use_id !== undefined) callStarts.set(e.tool_use_id, startMs)
+      if ((rowless || early) && e.tool_use_id !== undefined) callStarts.set(e.tool_use_id, startMs)
     }
   } catch {
     r = null
@@ -1848,6 +1988,9 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
   const startMs = id !== undefined ? callStarts.get(id) : undefined
   try {
     result = await next(e)
+  } catch (err) {
+    if (id !== undefined) earlyRunning.delete(id)
+    throw err
   } finally {
     if (withArgs) argsInFlight -= 1
     if (id !== undefined) callStarts.delete(id)
@@ -1855,6 +1998,15 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
   if (r !== null) {
     try {
       const endMs = await $.clock.now()
+      // Begun before the first turn, in a handover from chat (the transcript's newest prompt is the person's message carried over, from
+      // before the handover's row): the plugin builds the rows from here on where no row of Claude Code's reaches it, as that turn's start
+      // would decide. Their rows wait for the turn's prompt row while it is still to come; where the turn has begun and has it, they go
+      // now, under its interaction.
+      // Its read waits no longer than HEAD's does: a read that hangs never holds the call's result.
+      const handed = handover !== undefined && (await Promise.race([handover, $.clock.sleep(HEAD_READ_MS).then(() => undefined)]))?.carried === true
+      if (handed) await decideRowless($).catch(() => undefined)
+      const hold = handed && rowless && (!mainTurnSeen || promptLater !== undefined) && earlyCalls.length < MAX_EARLY_CALLS
+      const joins = handed && rowless && !hold
       const verdict = id !== undefined ? verdicts.get(id) : undefined
       const judged = id !== undefined ? judgments.get(id) : undefined
       const ranAtMs = id !== undefined ? runs.get(id) : undefined
@@ -1881,9 +2033,7 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
       })
       const refused = decision.refused
       const call = { tool: e.tool, id: id!, ...(e.agentId !== undefined ? { agentId: e.agentId } : {}) }
-      const head = built ? await rowlessHead($) : undefined
-      if (built) await feedRow($, decisionRow(rowlessState, head!, { ...call, refused, ...(decision.source !== undefined ? { source: decision.source } : {}) }, decision.atMs))
-      await emit($, toolEnd(r, id, result as never, endMs))
+      let ran: CallRows['ran']
       if (built && !refused) {
         const { tool: _tool, tool_use_id: _id, agentId: _agent, consent: _consent, requestMeta: _meta, ...input } = e as unknown as Record<string, unknown>
         const text = settled?.text
@@ -1893,14 +2043,22 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
         const reported = !isError && repoMayGo && ended?.tool === 'Bash' ? commitsInOutput(outputTexts(settled?.result)) : []
         const commit = reported.length > 0 ? madeCommit(reported, await Promise.race([readHead($).catch(() => undefined), $.clock.sleep(HEAD_READ_MS).then(() => undefined)])) : undefined
         if (commit !== undefined) captureCommit(capture, id!, commit)
-        await feedRow($, resultRow(rowlessState, head!, {
-          ...call, startMs: startMs!, ...(ranAtMs !== undefined ? { runStartMs: ranAtMs } : {}), endMs, isError, input, ...(typeof text === 'string' ? { text } : {}), ...(commit !== undefined ? { commit } : {}),
-        }))
+        ran = { startMs: startMs!, ...(ranAtMs !== undefined ? { runStartMs: ranAtMs } : {}), endMs, isError, input, ...(typeof text === 'string' ? { text } : {}), ...(commit !== undefined ? { commit } : {}) }
+      }
+      const rows: CallRows = {
+        id, call, result, startMs: startMs ?? endMs, endMs, ...(built ? { decision: { refused, ...(decision.source !== undefined ? { source: decision.source } : {}), atMs: decision.atMs } } : {}), ...(ran !== undefined ? { ran } : {}),
+      }
+      if (hold && built) earlyCalls.push(rows)
+      else {
+        if (joins && id !== undefined) toolJoinsTurn(r, id)
+        await sendCall($, r, rows)
       }
     } catch {
       // The call's spans go with what the rows say.
     }
   }
+  // Held by now where it waits, or sent: no longer running before the first turn.
+  if (id !== undefined) earlyRunning.delete(id)
   // A refused or failed call makes no marker.
   try {
     if (ended !== undefined && result.deny === undefined && result.isError !== true && isCopying() && mayMark(ended)) {
@@ -1924,7 +2082,7 @@ export async function toolCheckHook($: ToolCheckParams[0], e: ToolCheckParams[1]
     const id = (e as { tool_use_id?: unknown }).tool_use_id
     const approver = (e as { approver?: unknown }).approver
     const v = verdict as Verdict | undefined
-    if (rowless && typeof id === 'string' && typeof v?.decision === 'string') {
+    if (typeof id === 'string' && (rowless || callStarts.has(id)) && typeof v?.decision === 'string') {
       verdicts.set(id, {
         decision: v.decision, ...(typeof v.rule === 'string' ? { rule: v.rule } : {}), ...(typeof v.hook === 'string' ? { hook: v.hook } : {}),
         ...(typeof v.setting === 'string' ? { setting: v.setting } : {}), ...(typeof v.reason === 'string' ? { reason: v.reason } : {}),
@@ -1947,7 +2105,7 @@ export async function toolJudgeHook($: ToolJudgeParams[0], e: ToolJudgeParams[1]
   try {
     const id = (e as { tool_use_id?: unknown }).tool_use_id
     const decision = (answer as { decision?: unknown } | undefined)?.decision
-    if (rowless && typeof id === 'string' && typeof decision === 'string') {
+    if (typeof id === 'string' && (rowless || callStarts.has(id)) && typeof decision === 'string') {
       judgments.set(id, decision)
       if (judgments.size > MAX_VERDICTS) judgments.delete(judgments.keys().next().value!)
     }
@@ -1965,7 +2123,7 @@ export async function toolJudgeHook($: ToolJudgeParams[0], e: ToolJudgeParams[1]
 export async function toolRunHook($: ToolRunParams[0], e: ToolRunParams[1], next: ToolRunParams[2]) {
   try {
     const id = e.tool_use_id
-    if (rowless && typeof id === 'string' && callStarts.has(id)) {
+    if (typeof id === 'string' && callStarts.has(id)) {
       runs.set(id, await $.clock.now())
       if (runs.size > MAX_VERDICTS) runs.delete(runs.keys().next().value!)
       const v = verdicts.get(id)
@@ -2144,6 +2302,8 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
       await readOverrides($)
       await markersMade($)
       await flushOutsideCost($).catch(() => undefined)
+      // Calls that ran before a first turn that never came: theirs go, with no prompt.
+      if (earlyCalls.length > 0) await releaseEarlyCalls($, await rebuildOf($)).catch(() => undefined)
       await sweepNow($, true)
       // What waits for the settings' first answer goes now, before the meter collects for the last time.
       await flushHeldCopies()
@@ -2225,6 +2385,9 @@ export const register: Register = on => {
   mainTurnOpen = false
   mainTurnSeen = false
   promptLater = undefined
+  earlyCalls = []
+  earlySeen = false
+  earlyRunning = new Map()
   callStarts = new Map()
   verdicts = new Map()
   judgments = new Map()
