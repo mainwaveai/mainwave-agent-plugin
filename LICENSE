@@ -1,0 +1,75 @@
+Mainwave Agent Plugin License
+
+Copyright (c) 2026 Mainwave. All rights reserved.
+
+The source code in this repository (the "Software") is published so that anyone
+can read what the plugin does and what it sends. It is not open source. Your
+use of the Software is governed by this license.
+
+"You" means the person or organization using the Software. Where an
+organization makes the Software available to its people (for example through
+an organization-wide plugin sync), "you" includes the people it lets run it.
+
+1. Permitted use
+
+   You may:
+
+   a. install and run the Software, as Mainwave distributes it, to send data to
+      Mainwave's services under your agreement with Mainwave or Mainwave's
+      published terms of service ("Your Agreement"), including the copying
+      that installing it requires: an organization-wide plugin sync, a
+      marketplace install or loading it from a folder;
+
+   b. point the Software at a receiver you run yourself, to test it or to
+      inspect what it sends; and
+
+   c. read, copy and modify the source code, build it and run its tests, to
+      evaluate or review the Software, to prepare a contribution under section
+      3, or to research its security as SECURITY.md describes.
+
+2. Restrictions
+
+   Except as section 1 permits, or as Mainwave agrees in writing, you may not:
+
+   a. copy, modify, merge, publish, distribute, sublicense or sell the
+      Software, in whole or in part, or make derivative works of it, or use a
+      modified copy other than to prepare a contribution or to do the
+      research section 1.c permits;
+
+   b. use the Software, or any part of it, to send the data it collects to a
+      service other than Mainwave's, except as section 1.b permits; or
+
+   c. remove or change this license or any copyright notice in the Software.
+
+3. Contributions
+
+   If you submit a contribution to Mainwave (an issue, a pull request, a patch
+   or any other material), you grant Mainwave a perpetual, worldwide,
+   non-exclusive, royalty-free, irrevocable license to use, reproduce, modify,
+   distribute and sublicense it, as part of the Software or otherwise. You
+   confirm that you have the right to grant this license.
+
+4. Termination
+
+   Your rights under this license end automatically if you break its terms,
+   and, for section 1.a, when Your Agreement ends. When they end, stop using
+   the Software and delete your copies of it. Sections 3, 6 and 7 continue to
+   apply after your rights end.
+
+5. Your Agreement
+
+   Where this license and Your Agreement conflict, Your Agreement governs.
+
+6. No warranty
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT, EXCEPT AS YOUR
+   AGREEMENT PROVIDES OTHERWISE.
+
+7. Limitation of liability
+
+   IN NO EVENT SHALL MAINWAVE BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OF OR OTHER
+   DEALINGS IN THE SOFTWARE, EXCEPT AS YOUR AGREEMENT PROVIDES OTHERWISE.

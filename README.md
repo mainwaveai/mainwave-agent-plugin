@@ -305,7 +305,7 @@ An organization can turn older versions away: the managed setting `requiredMinim
 
 An owner or admin of the Claude organization, on claude.ai:
 
-1. **Organization settings › Plugins & skills › Sync from GitHub**, then add `mainwaveai/mainwave-agent-plugin` with **Sync automatically** on. While the repository is private, Anthropic's GitHub app must be able to read it.
+1. **Organization settings › Plugins & skills › Sync from GitHub**, then add `mainwaveai/mainwave-agent-plugin` with **Sync automatically** on.
 2. **Inventory › mainwave › Default access › Required**, so every member's Claude Code and Cowork sessions run it with no install step.
 3. If an older Mainwave plugin is in the inventory, set it to **Not available**, so only one copy stamps rows.
 4. For Cowork: **Organization settings › Capabilities**, add `collector.mainwave.com` and `api.mainwave.com` to Cowork's allowed domains. Cowork's sessions reach only the domains listed there. Without the collector, nothing from Cowork reaches Mainwave. Without the API, the organization's settings never reach the plugin in Cowork: its identifiers and content stay off there, whatever Mainwave's settings page says, and each session's status row says `settings_unavailable`.
@@ -325,7 +325,7 @@ At the prompt of a Claude Code session in a terminal:
 /plugin install mainwave --marketplace mainwaveai/mainwave-agent-plugin
 ```
 
-Answer `y` to add the marketplace, then pick a scope. From a shell: `claude plugin install mainwave --marketplace mainwaveai/mainwave-agent-plugin`. While the repository is private, your machine needs a git credential for github.com that can read it.
+Answer `y` to add the marketplace, then pick a scope. From a shell: `claude plugin install mainwave --marketplace mainwaveai/mainwave-agent-plugin`.
 
 ## Settings
 
@@ -400,6 +400,8 @@ The value is a list of pack names, or one string of names separated by commas or
 
 ## Developing
 
+[CONTRIBUTING.md](CONTRIBUTING.md) has the rules for a change and how to submit it.
+
 The plugin sits at the repository's root: `.claude-plugin/plugin.json` (the manifest), `.claude-plugin/marketplace.json` (this repository as a marketplace), `hooks/` (the hooks module, `register.ts`, and the modules it imports), `types/index.d.ts` (what it keeps in `$.state`) and `tests/`.
 
 ```sh
@@ -451,4 +453,4 @@ The redaction packs are Mainwave's, shared with its SDKs and CLI hooks: a change
 
 ## License
 
-Not chosen yet. Until a license is added, no rights are granted to use, copy or redistribute this code.
+Proprietary: the code is published so that anyone can read it, not under an open-source license. [LICENSE](LICENSE) says what you may do with it. To report a vulnerability, see [SECURITY.md](SECURITY.md).
