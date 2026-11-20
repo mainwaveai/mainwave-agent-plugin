@@ -48,7 +48,7 @@ import {
 } from './rebuild.ts'
 import {
   accountDeviceOf, costOf, decisionOf, decisionRow, headOf, hostIdentityOf, joinPath, madeCommit, newRowless, promptIdFrom, promptRow, providerOf, remoteSessionIdOf, repoAttributes, requestRow, responseRow,
-  permissionRules, personPrompt, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, typedText, uuidOf, type HostFacts, type HostIdentityEnv, type MadeCommit, type Rowless, type Verdict,
+  handoffPrompt, handoverIn, hostContinue, permissionRules, personPrompt, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, typedText, uuidOf, type Handover, type HostFacts, type HostIdentityEnv, type MadeCommit, type Rowless, type Verdict,
 } from './rowless.ts'
 import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsPending, settingsSummary, settingsUnavailable } from './orgsettings.ts'
 import { contentLimit } from './protect.ts'
@@ -1477,6 +1477,56 @@ async function transcriptPrompt($: EngineInterface, acrossCalls: boolean): Promi
   }
 }
 
+/** How much of the transcript's end is read for what Cowork's host marks on the rows of a handover from chat (`handoverOf`). */
+const HANDOVER_TAIL_BYTES = 1_048_576
+
+/**
+ * What the end of the session's transcript says of a handover from chat (`handoverIn`): the fields Cowork's host writes on the rows,
+ * which neither `$.session.messages` nor the hooks' events carry. Undefined where there is no transcript, or it can't be read.
+ */
+async function handoverOf($: EngineInterface): Promise<Handover | undefined> {
+  try {
+    const { transcriptPath } = await infoOf($)
+    if (transcriptPath === undefined) return undefined
+    const size = (await $.fs.stat(transcriptPath)).size
+    const length = Math.min(size, HANDOVER_TAIL_BYTES)
+    return handoverIn(await ($ as unknown as Newer).fs.read(transcriptPath, { offset: size - length, length }))
+  } catch {
+    return undefined
+  }
+}
+
+/** The session's newest messages, read back for a handover's prompt (`handoffPrompt`); undefined where they can't be read. */
+async function handoffWalk($: EngineInterface, host?: string): Promise<string | undefined> {
+  try {
+    const newest = await ($ as unknown as Newer).session.messages({ last: TRANSCRIPT_WALK })
+    return Array.isArray(newest) ? handoffPrompt(newest, host) : undefined
+  } catch {
+    return undefined
+  }
+}
+
+/**
+ * The prompt of the load's first turn in Cowork, where Cowork handed the conversation over from chat; undefined where nothing shows a
+ * handover, and the turn's text stands. By the fields the host writes on the transcript's rows (`handoverOf`), where they are there:
+ *
+ * - a turn whose text is the newest prompt row, one the host wrote after the handover (`textNotTyped`: its message asking to run the
+ *   chat's last call, not run): the person's last message in chat, from the transcript, else read back through the session's messages
+ *   past the host's; '' where neither finds one, as the host's text is never the person's;
+ * - a turn begun with no text, whose newest prompt row is the person's message carried over (`handedOff`): that message.
+ *
+ * Without them: a turn whose text is the host's message by its words (`hostContinue`), after the call's not-run result, with the
+ * handover's row in the transcript.
+ */
+async function handoverPrompt($: EngineInterface, text: string): Promise<string | undefined> {
+  const t = await handoverOf($)
+  if (t === undefined || !t.relay) return undefined
+  if (text !== '' && t.hostWritten && t.newest !== undefined && typedText(t.newest).trim() === typedText(text).trim()) return t.person ?? (await handoffWalk($, text)) ?? ''
+  if (text === '' && t.handedOff && t.person !== undefined) return t.person
+  if (text !== '' && hostContinue(text)) return handoffWalk($)
+  return undefined
+}
+
 /** The session's repository, as its `origin` remote names it (`repoAttributes`); none where it is in none, or it can't be read. */
 async function readRepo($: EngineInterface): Promise<Record<string, string>> {
   try {
@@ -1661,7 +1711,17 @@ export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1]
     const first = e.agentId === undefined && !mainTurnSeen
     if (e.agentId === undefined) mainTurnSeen = true
     if (e.agentId === undefined) await decideRowless($)
-    if (text === '' && first && rowless) text = await transcriptPrompt($, false)
+    // Cowork handing a conversation begun in chat over (`handoverPrompt`): the turn begins with the host's own message, or with none,
+    // and its prompt is the person's last message in chat ('' where none is found: the host's text is never taken for it).
+    let handedOver = false
+    if (first && rowless && (await hostFactsOf($)).cowork === true) {
+      const found = await handoverPrompt($, text)
+      if (found !== undefined) {
+        text = found
+        handedOver = true
+      }
+    }
+    if (text === '' && first && rowless && !handedOver) text = await transcriptPrompt($, false)
     if (e.agentId === undefined) text = await turnText($, text)
     if (e.agentId === undefined && isCopying()) capturePrompt(capture, text)
     // The repository the turn runs in, read again each turn: the session may have moved to another, or the remote changed.
@@ -1677,7 +1737,7 @@ export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1]
       } catch {
         // The turn goes without its prompt row.
       }
-    } else if (r !== null && rowless && first && text === '') promptLater = { turnId: e.turnId, atMs: nowMs }
+    } else if (r !== null && rowless && first && text === '' && !handedOver) promptLater = { turnId: e.turnId, atMs: nowMs }
     if (r !== null) out = turnStart(r, { ...e, text }, nowMs)
     // The calls that ran before the turn began, under its prompt: now, unless the prompt waits for the turn's first request.
     if (first && promptLater === undefined) await releaseEarlyCalls($, r)
