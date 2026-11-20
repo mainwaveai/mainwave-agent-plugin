@@ -1184,7 +1184,7 @@ function checkRowless(pass, { captured, run }, reference) {
 
 /**
  * The handoff pass: the session began its one turn as Cowork's handoff does (observe.ts: no text, only a prompt Claude Code inserted
- * submitted; the first request's messages: the person's prompt, then the chat's calls and their results), and the plugin's rows of it
+ * submitted; the first request's messages: the person's prompt, then a call of the chat's and its result), and the plugin's rows of it
  * carry the person's typed text as the turn's prompt, its length the text's, and that prompt's id on every row of the turn, which ends.
  */
 function checkHandoff({ captured, run, config }) {
@@ -1198,7 +1198,8 @@ function checkHandoff({ captured, run, config }) {
   const observed = existsSync(observedFile) ? readFileSync(observedFile, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)) : []
   const starts = observed.filter(o => o.event === 'turn.start')
   if (starts.length !== 1 || starts[0].text !== '') problems.push(`the session's turns began with ${JSON.stringify(starts.map(o => o.text))}, not one turn with no text: the pass no longer reproduces the handoff`)
-  for (const o of observed) if (o.event === 'prompt.submit' && !o.isMeta) problems.push(`a prompt submitted that Claude Code did not insert itself: ${JSON.stringify(o.text)}`)
+  const submitted = observed.filter(o => o.event === 'prompt.submit')
+  if (submitted.length !== 1 || !submitted[0].isMeta) problems.push(`the prompts submitted are ${JSON.stringify(submitted)}, not the one Claude Code inserts itself to take the turn up`)
   // At the turn's start and its first request, the person's message is in the transcript, behind a call of the chat's and its result.
   for (const name of ['turn.start', 'turn.step']) {
     const messages = observed.find(o => o.event === name)?.messages
@@ -1208,7 +1209,10 @@ function checkHandoff({ captured, run, config }) {
   }
 
   const ev = r => r.attributes['event.name']?.v
+  // As in the rowless pass: no row of Claude Code's goes past skip.ts, and every row the plugin sends it built from events.
+  for (const r of logRecordsOf(captured.exporter.logs)) if (!STARTUP.has(ev(r))) problems.push(`a ${ev(r)} row went past skip.ts`)
   const rows = checkStatus(logRecordsOf(captured.plugin.logs), ['rows_skipped', 'exporter_elsewhere']).filter(r => !OWN_ROWS.has(ev(r)))
+  for (const r of rows) if (r.attributes['mainwave.telemetry.built_from']?.v !== 'events') problems.push(`logs: a ${ev(r)} row the plugin did not build: a row of Claude Code's reached it`)
   const prompts = rows.filter(r => ev(r) === 'user_prompt')
   const prompt = prompts[0]
   if (prompts.length !== 1) problems.push(`${prompts.length} prompt rows built, not 1`)
@@ -1362,8 +1366,10 @@ for (const [pass, details, envBlock, auto, rowless] of passes) {
 // The turn Cowork hands Claude Code after a conversation moves from chat to Cowork: the chat's prompt and calls already in the
 // transcript, the turn begun with no text. A local `claude -p` comes closest by resuming such a transcript with the cut-off turn taken
 // up (CLAUDE_CODE_RESUME_INTERRUPTED_TURN): the turn begins with no text, after a prompt Claude Code inserts itself (`isMeta`), and its
-// first request's messages end with the cut-off call's result. Rowless, as behind the security default, with the content on: the
-// plugin's prompt row must carry what the person typed, found back past the chat's calls, and every row of the turn its prompt's id.
+// first request's messages end with the chat's Glob call and its result (the cut-off call is dropped, and the model makes it again in
+// the turn). Rowless, as behind the security default, with the content on: the plugin's prompt row must carry what the person typed,
+// found back past the chat's calls, and every row of the turn its prompt's id. It runs on every version, unlike the rowless pass:
+// skip.ts stands in for the security default, and the walk back it covers is the plugin's on any version.
 {
   console.log('\na turn handed over from a chat, built from events:')
   const result = await session(false, true, false, true, false, true)
