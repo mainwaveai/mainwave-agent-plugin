@@ -22,7 +22,7 @@ const HOST_EMAIL = 'host@example.com'
 const BUILT = 'mainwave.telemetry.built_from'
 const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 300, cache_creation_input_tokens: 40, ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 40 }
 
-type World = { messages?: unknown[] | (() => unknown[]); settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown>; transcript?: string; duringCall?: (id: string) => Promise<void> }
+type World = { messages?: unknown[] | (() => unknown[]); settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown>; transcript?: string | (() => string); promptId?: string | (() => string); duringCall?: (id: string) => Promise<void> }
 
 function world(on: On, opts: World = {}) {
   const clock = mock.clock(on, { now: START })
@@ -48,18 +48,20 @@ function world(on: On, opts: World = {}) {
     await opts.turns?.[text]?.()
     return { text } as never
   })
-  // With `transcript`, the session's transcript file, its lines as given: `$.session.info()` says where it is, by a glob, as Claude Code
-  // before 2.1.326 refuses a hook that names that call. A read may take a stretch of it.
-  const transcript = opts.transcript
+  // With `transcript`, the session's transcript file, its lines as given (a function reads it as it is at the call), and `promptId` the
+  // prompt the session is on: `$.session.info()` says where it is, by a glob, as Claude Code before 2.1.326 refuses a hook that names
+  // that call. A read may take a stretch of it.
+  const transcript = opts.transcript === undefined ? undefined : typeof opts.transcript === 'function' ? opts.transcript : () => opts.transcript as string
+  const promptNow = () => (typeof opts.promptId === 'function' ? opts.promptId() : opts.promptId ?? 'prompt-host')
   if (transcript !== undefined) {
-    on('session.*', (_$, e, next) => ((next.event as string) === 'session.info' ? ({ value: { transcriptPath: TRANSCRIPT, promptId: 'prompt-host', platform: 'linux', isHosted: true } } as never) : next(e)))
-    on('fs.stat', (_$, e, next) => ((e as unknown as { path: string }).path === TRANSCRIPT ? ({ value: { kind: 'file', size: new TextEncoder().encode(transcript).length, mtimeMs: START, isLink: false } } as never) : next(e)))
+    on('session.*', (_$, e, next) => ((next.event as string) === 'session.info' ? ({ value: { transcriptPath: TRANSCRIPT, promptId: promptNow(), platform: 'linux', isHosted: true } } as never) : next(e)))
+    on('fs.stat', (_$, e, next) => ((e as unknown as { path: string }).path === TRANSCRIPT ? ({ value: { kind: 'file', size: new TextEncoder().encode(transcript()).length, mtimeMs: START, isLink: false } } as never) : next(e)))
   }
   on('fs.read', (_$, e) => {
     const path = (e as unknown as { path: string }).path
     if (path === TRANSCRIPT && transcript !== undefined) {
       const { offset = 0, length } = e as unknown as { offset?: number; length?: number }
-      return { value: new TextDecoder().decode(new TextEncoder().encode(transcript).subarray(offset, length === undefined ? undefined : offset + length)) } as never
+      return { value: new TextDecoder().decode(new TextEncoder().encode(transcript()).subarray(offset, length === undefined ? undefined : offset + length)) } as never
     }
     if (path === `${HOME}/.claude.json` && opts.accountFile !== undefined) return { value: JSON.stringify(opts.accountFile) } as never
     if (opts.files?.[path] !== undefined) return { value: opts.files[path] } as never
@@ -1565,5 +1567,113 @@ describe('rowless.ts', () => {
       cache_read_tokens: 3, cache_creation_tokens: 4, cache_creation_5m_tokens: 0, cache_creation_1h_tokens: 0, cost_usd: 0.2, cost_usd_micros: 200000, duration_ms: 500, query_source: 'sdk',
     })
     expect(t.attributes).toEqual(expect.objectContaining({ 'event.sequence': 2, success: 'false', duration_ms: '100', tool_name: 'Read', tool_use_id: 'toolu_9' }))
+  })
+})
+
+describe('the client a remote Cowork prompt was sent from', () => {
+  const CLIENT = 'mainwave.cowork.client_platform'
+  const line = (row: Record<string, unknown>) => `${JSON.stringify({ sessionId: 's-1', timestamp: '2026-11-19T21:50:00.000Z', ...row })}\n`
+  // A prompt's row as Cowork's host writes it, and the rows that follow it in its turn: a call, its result, the text Claude Code adds.
+  const PROMPT_ROW = (promptId: string, fields: Record<string, unknown> = {}) => line({
+    type: 'user', promptId, uuid: `u-${promptId}`, message: { role: 'user', content: [{ type: 'text', text: 'please check the deploy' }] },
+    permissionMode: 'auto', origin: { kind: 'human' }, promptSource: 'sdk', turnOrigin: 'human', turnPromptId: promptId, ...fields,
+  })
+  const TURN_ROWS = (promptId: string) => `${line({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'ls' } }] } })}${
+    line({ type: 'user', promptId, message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'a.txt' }] }, clientPlatform: 'ios' })}${
+    line({ type: 'user', promptId, isMeta: true, message: { role: 'user', content: [{ type: 'text', text: 'a skill body' }] }, clientPlatform: 'ios' })}`
+  const clientsOf = (rows: readonly { attributes: Record<string, unknown> }[]) => rows.map(r => [r.attributes['event.name'], r.attributes[CLIENT]])
+
+  test('each built row of a turn carries the client its prompt was sent from, and a conversation that moves between clients changes it', keyless, async ($, on) => {
+    let transcript = PROMPT_ROW('p-1', { clientPlatform: 'desktop_app' })
+    let promptId = 'p-1'
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', transcript: () => transcript, promptId: () => promptId })
+    await start($)
+    await turn($, 'please check the deploy')
+    transcript += `${TURN_ROWS('p-1')}${PROMPT_ROW('p-2', { clientPlatform: 'web_claude_ai' })}`
+    promptId = 'p-2'
+    await turn($, 'please check the deploy', 'toolu_2')
+    await w.clock.advance(5_000)
+    const rows = w.built()
+    expect(rows.length).toBe(10)
+    for (const r of rows) {
+      expect(r.attributes[CLIENT]).toBe(r.attributes['prompt.id'] === 'p-1' ? 'desktop_app' : 'web_claude_ai')
+      expect(contractViolations(r.attributes)).toEqual([])
+    }
+    expect(rows.filter(r => r.attributes['prompt.id'] === 'p-2').length).toBe(5)
+  })
+
+  test("a prompt carried over from chat at a handover names no client: its turn's rows carry none, and the next prompt's do", keyless, async ($, on) => {
+    // The person's message from chat, under no prompt of this session's, and the host's row that marks the handover.
+    let transcript = `${line({ type: 'user', handedOff: true, origin: { kind: 'human' }, message: { role: 'user', content: [{ type: 'text', text: 'please check the deploy' }] } })}${
+      line({ type: 'system', subtype: 'upgrade_relay_marker', content: '{}' })}`
+    let promptId = 'p-1'
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', transcript: () => transcript, promptId: () => promptId, messages: [{ role: 'user', text: 'please check the deploy', toolUses: [] }] })
+    await start($)
+    await turn($, '')
+    transcript += PROMPT_ROW('p-2', { clientPlatform: 'ios' })
+    promptId = 'p-2'
+    await turn($, 'next', 'toolu_2')
+    await w.clock.advance(5_000)
+    const rows = w.built()
+    expect(rows.filter(r => r.attributes['prompt.id'] === 'p-1').map(r => r.attributes[CLIENT])).toEqual([undefined, undefined, undefined, undefined, undefined])
+    expect(rows.filter(r => r.attributes['prompt.id'] === 'p-2').map(r => r.attributes[CLIENT])).toEqual(['ios', 'ios', 'ios', 'ios', 'ios'])
+  })
+
+  test('the host\'s own prompt at a handover carries the client it names', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', transcript: PROMPT_ROW('prompt-host', { textNotTyped: true, clientPlatform: 'desktop_app' }) })
+    await start($)
+    await turn($, 'Continue with the task described in the conversation above.')
+    await w.clock.advance(5_000)
+    expect(new Set(w.built().map(r => r.attributes[CLIENT]))).toEqual(new Set(['desktop_app']))
+  })
+
+  test('a client name not of its shape, or none, is left off', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', transcript: PROMPT_ROW('prompt-host', { clientPlatform: 'Desktop App <script>' }) })
+    await start($)
+    await turn($)
+    await w.clock.advance(5_000)
+    expect(w.built().length).toBe(5)
+    for (const r of w.built()) expect(r.attributes[CLIENT]).toBeUndefined()
+  })
+
+  for (const [entrypoint, env] of [['cli', {}], ['local-agent', { CLAUDE_CODE_IS_COWORK: '1' }], ['remote_cowork_trigger', {}]] as const) {
+    test(`outside remote Cowork (${entrypoint}), the transcript's client is not read`, keyless, async ($, on) => {
+      const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint, env, transcript: PROMPT_ROW('prompt-host', { clientPlatform: 'claude_code_cli' }) })
+      await start($)
+      await turn($)
+      await w.clock.advance(5_000)
+      expect(w.built().length).toBe(5)
+      for (const r of w.built()) expect(r.attributes[CLIENT]).toBeUndefined()
+    })
+  }
+
+  test('a prompt whose row is far back in the transcript, the turn well under way, is found further back', keyless, async ($, on) => {
+    // The load's first turn began before the plugin's hooks were in place: its prompt is read at its first model request, past a large result.
+    const big = line({ type: 'user', promptId: 'prompt-host', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_0', content: 'x'.repeat(300_000) }] } })
+    const w = world(on, {
+      accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', transcript: `${PROMPT_ROW('prompt-host', { clientPlatform: 'ios' })}${big}`,
+      messages: [{ role: 'user', text: 'please check the deploy', toolUses: [] }, { role: 'assistant', text: '', toolUses: [{ id: 'toolu_0' }] }, { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'toolu_0' }] }],
+    })
+    await start($)
+    await turn($, '')
+    await w.clock.advance(5_000)
+    expect(clientsOf(w.built())).toEqual(expect.arrayContaining([['user_prompt', 'ios'], ['api_request', 'ios']]))
+    for (const r of w.built()) expect(r.attributes[CLIENT]).toBe('ios')
+  })
+
+  test("Claude Code's own rows carry it too, on the exporter's row and the copy; a prompt's row logged before its transcript row is read again", keyless, async ($, on) => {
+    let transcript = ''
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', transcript: () => transcript, promptId: 'p-1' })
+    await start($)
+    const row = (event: string, extra: Record<string, unknown> = {}) =>
+      $.telemetry.log({ to: 'collector', event, loggedAt: LOGGED_AT, attributes: { 'organization.id': ORG, 'user.email': EMAIL, 'session.id': 's-1', 'event.name': event, 'prompt.id': 'p-1', ...extra } } as never)
+    await row('user_prompt', { prompt_length: '5' })
+    transcript = PROMPT_ROW('p-1', { clientPlatform: 'web_claude_ai' })
+    await row('api_request', { model: 'claude-haiku-5-5' })
+    await $.telemetry.log({ to: 'collector', event: 'plugin_loaded', loggedAt: LOGGED_AT, attributes: { 'organization.id': ORG, 'user.email': EMAIL, 'session.id': 's-1', 'event.name': 'plugin_loaded', [CLIENT]: 'forged' } } as never)
+    await w.clock.advance(5_000)
+    expect(clientsOf(w.rig.rows)).toEqual([['user_prompt', undefined], ['api_request', 'web_claude_ai'], ['plugin_loaded', undefined]])
+    expect(clientsOf(w.logs().filter(r => r.attributes['mainwave.telemetry.route'] === 'plugin'))).toEqual(expect.arrayContaining([['user_prompt', undefined], ['api_request', 'web_claude_ai'], ['plugin_loaded', undefined]]))
+    for (const r of w.rig.rows) expect(contractViolations(r.attributes)).toEqual([])
   })
 })

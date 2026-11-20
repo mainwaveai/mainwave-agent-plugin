@@ -9,8 +9,9 @@ describe('stripOwned', () => {
     const out = stripOwned({
       a: 1, 'mainwave.plugin.name': 'x', b: 'two', 'mainwave.telemetry.anything': 'y', 'mainwave.redaction.count': 3, 'mainwave.attr.k': 'v',
       'mainwave.mod.name': 'old', 'mainwave.pluginx': 'kept', 'mainwave.command.commits': 9, 'mainwave.command.push_ref': 'forged', 'mainwave.commandx': 'kept',
+      'mainwave.cowork.client_platform': 'forged', 'mainwave.coworkx': 'kept',
     })
-    expect(Object.keys(out)).toEqual(['a', 'b', 'mainwave.attr.k', 'mainwave.pluginx', 'mainwave.commandx'])
+    expect(Object.keys(out)).toEqual(['a', 'b', 'mainwave.attr.k', 'mainwave.pluginx', 'mainwave.commandx', 'mainwave.coworkx'])
   })
 
   test('a key named __proto__ stays a plain key and changes no prototype', () => {
@@ -54,6 +55,13 @@ describe('filterStamps', () => {
     ['mainwave.telemetry.opt_in', 'mcp.url,mcp.url'],
     ['mainwave.telemetry.opt_in', 'mcp.url, skill.text'],
     ['mainwave.telemetry.opt_in', 'usage'],
+    ['mainwave.cowork.client_platform', ''],
+    ['mainwave.cowork.client_platform', 'Desktop_App'],
+    ['mainwave.cowork.client_platform', 'desktop app'],
+    ['mainwave.cowork.client_platform', 'desktop-app'],
+    ['mainwave.cowork.client_platform', 'a'.repeat(33)],
+    ['mainwave.cowork.client_platform', 3],
+    ['mainwave.cowork.other', 'ios'],
   ]
   for (const [key, value] of bad) {
     test(`drops ${key}=${JSON.stringify(value).slice(0, 30)}`, () => {
@@ -67,6 +75,14 @@ describe('the opt-in stamp', () => {
     const value = 'mcp.url,skill.text,response.thinking'
     expect(filterStamps({ 'mainwave.telemetry.opt_in': value })).toEqual({ kept: { 'mainwave.telemetry.opt_in': value }, dropped: [] })
     expect(filterStamps({ 'mainwave.telemetry.opt_in': 'response.thinking' }).dropped).toEqual([])
+  })
+})
+
+describe('the client stamp', () => {
+  test("passes the host's word for a Cowork client through, of its shape", () => {
+    for (const value of ['desktop_app', 'web_claude_ai', 'ios', 'android', 'a'.repeat(32)]) {
+      expect(filterStamps({ 'mainwave.cowork.client_platform': value })).toEqual({ kept: { 'mainwave.cowork.client_platform': value }, dropped: [] })
+    }
   })
 })
 

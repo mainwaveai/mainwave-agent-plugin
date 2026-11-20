@@ -20,6 +20,8 @@ export const CONTRACT: Record<string, (v: unknown) => boolean> = {
   'mainwave.telemetry.route': v => v === 'exporter' || v === 'plugin',
   // On the plugin's own copy only, where no row of Claude Code's reached the plugin: the record was built from Claude Code's events.
   'mainwave.telemetry.built_from': v => v === 'events',
+  // On a remote Cowork turn's rows: the client its prompt was sent from, as Cowork's host names it (`desktop_app`, `web_claude_ai`, `ios`).
+  'mainwave.cowork.client_platform': v => typeof v === 'string' && /^[a-z0-9_]{1,32}$/.test(v),
   // On the plugin's own copy only, where the protections replaced a secret or a redaction pack's match: how many.
   'mainwave.redaction.count': v => typeof v === 'number' && Number.isInteger(v) && v >= 1,
   // On the plugin's own copy only, where the person opted in to data points off by default: which, each once.
@@ -55,7 +57,7 @@ export const CAPTURES_ON = {
 export const STAMPED = ['mainwave.plugin.entrypoint', 'mainwave.plugin.name', 'mainwave.plugin.version', 'mainwave.telemetry.route']
 // mainwave.mod. is the old prefix: the plugin writes nothing there, so a key under it on a row is a violation.
 export const isOwned = (k: string) =>
-  k.startsWith('mainwave.plugin.') || k.startsWith('mainwave.telemetry.') || k.startsWith('mainwave.redaction.') || k.startsWith('mainwave.mod.') || k.startsWith('mainwave.command.')
+  k.startsWith('mainwave.plugin.') || k.startsWith('mainwave.telemetry.') || k.startsWith('mainwave.redaction.') || k.startsWith('mainwave.mod.') || k.startsWith('mainwave.command.') || k.startsWith('mainwave.cowork.')
 
 /** A settings layer as the test answers it: an object, or `reject` for a read that fails. */
 export type Answer = Record<string, unknown> | 'reject'

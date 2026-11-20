@@ -14,15 +14,18 @@ export const PLUGIN_NAME = 'mainwave'
 /** Where the plugin stamps what a shell command did on the command's `claude_code.tool` span (`commandStamps`). */
 export const COMMAND_PREFIX = 'mainwave.command.'
 
+/** Where the plugin stamps what it reads of a remote Cowork session's client (`CLIENT_PLATFORM_STAMP`). */
+export const COWORK_PREFIX = 'mainwave.cowork.'
+
 /**
  * Key prefixes the plugin owns. Any key under one of them that the plugin did not write this time is removed from the row.
  * `mainwave.mod.` is where earlier Mainwave plugins, and this one before it named its stamps `mainwave.plugin.*`, put theirs: the
  * plugin writes nothing there, and strips it so no row carries an old-named stamp beside its own.
  */
-export const OWNED_PREFIXES: readonly string[] = ['mainwave.plugin.', 'mainwave.telemetry.', 'mainwave.redaction.', 'mainwave.mod.', COMMAND_PREFIX]
+export const OWNED_PREFIXES: readonly string[] = ['mainwave.plugin.', 'mainwave.telemetry.', 'mainwave.redaction.', 'mainwave.mod.', COMMAND_PREFIX, COWORK_PREFIX]
 
 /** Every key the plugin stamps. */
-export type StampKey = 'mainwave.plugin.name' | 'mainwave.plugin.version' | 'mainwave.plugin.entrypoint' | 'mainwave.telemetry.route' | 'mainwave.telemetry.opt_in' | 'mainwave.telemetry.built_from'
+export type StampKey = 'mainwave.plugin.name' | 'mainwave.plugin.version' | 'mainwave.plugin.entrypoint' | 'mainwave.telemetry.route' | 'mainwave.telemetry.opt_in' | 'mainwave.telemetry.built_from' | 'mainwave.cowork.client_platform'
 
 /**
  * On the plugin's own copy alone (gate.ts): the data points the person's opt-in turned on for the record, comma-separated, so an admin
@@ -37,6 +40,15 @@ export const OPT_IN_IDS: readonly string[] = Object.entries(DEFAULTS).filter(([,
  * the plugin, not copied from one. Its one value is `events`.
  */
 export const BUILT_FROM_STAMP = 'mainwave.telemetry.built_from'
+
+/**
+ * On a remote Cowork turn's rows (register.ts): the client its prompt was sent from, as Cowork's host names it on the prompt's row in
+ * the transcript (`clientPlatform`: `desktop_app`, `web_claude_ai`, `ios` and so on). The host's own word, passed through where it has
+ * the shape below: the list is the host's, and not documented.
+ */
+export const CLIENT_PLATFORM_STAMP = 'mainwave.cowork.client_platform'
+/** The shape a client's name must have to be stamped: lowercase letters, digits and `_`, at most 32. */
+export const CLIENT_PLATFORM = /^[a-z0-9_]{1,32}$/
 
 /** `CLAUDE_CODE_ENTRYPOINT` values the plugin reports as they are; anything else is reported as `other`. */
 export const ENTRYPOINTS: readonly string[] = [
@@ -58,6 +70,7 @@ export const STAMP_RULES: Readonly<Record<StampKey, (value: string) => boolean>>
   'mainwave.plugin.entrypoint': v => ENTRYPOINTS.includes(v),
   'mainwave.telemetry.route': v => ROUTES.includes(v),
   [BUILT_FROM_STAMP]: v => v === 'events',
+  [CLIENT_PLATFORM_STAMP]: v => CLIENT_PLATFORM.test(v),
   [OPT_IN_STAMP]: v => {
     const ids = v.split(',')
     return new Set(ids).size === ids.length && ids.every(id => OPT_IN_IDS.includes(id))

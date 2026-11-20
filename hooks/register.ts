@@ -31,6 +31,7 @@ import type { CatchHandler, EngineInterface, Frozen, Hook, Next, Register, Strea
 import type { RowIdentity } from '../types'
 import { captureCommit, capturePrompt, captureTool, dropStreamedText, newCapture, rowFill, setStreamedText, streamChunk, streamedText, streamedThinking, streamStart, type Capture } from './capture.ts'
 import { MCP_SERVER_ROW, PLUGIN_STATUS_ROW, SKILL_PROMPT_ROW, type Switch } from './catalog.ts'
+import { clientPlatformIn } from './client.ts'
 import { mcpParts } from './derive.ts'
 import { allows, configureGate, currentGate, gateAttributes, gateMarker, gateRow, gateSpan, metricAllowed, openGate, resetPacks, setOptIn, setOverrides } from './gate.ts'
 import { classifyGlab, glabConfigDir, glabHosts, glabTexts, instanceOf, mrAttributes, mrFromApi, mrLookup, mrUrlOf, parseMrJson, repositoryIdOf, sameUrl, stripDraft, type MrDetails, type MrRef } from './glab.ts'
@@ -59,7 +60,7 @@ import {
 } from './servers.ts'
 import { accountIdentityOf, exporterOf, issuesOf, signedInElsewhere, signedInWithKey, type ExporterEnv, type SignInEnv } from './setup.ts'
 import { snapshotOfText } from './snapshot.ts'
-import { applyStamps, BUILT_FROM_STAMP, entrypointOf, filterStamps, issuesStamp, PLUGIN_NAME, stripOwned, type IssueCode } from './stamps.ts'
+import { applyStamps, BUILT_FROM_STAMP, CLIENT_PLATFORM_STAMP, entrypointOf, filterStamps, issuesStamp, PLUGIN_NAME, stripOwned, type IssueCode } from './stamps.ts'
 import { VERSION } from './version.ts'
 
 export { VERSION }
@@ -1191,6 +1192,46 @@ async function turnErrorOf($: EngineInterface, transcriptPath: string, messageId
   return undefined
 }
 
+/** The client the prompt the session's rows were last stamped for was sent from (`clientOf`); `platform` absent where none is known. */
+let promptClient: { promptId: string; platform?: string } | undefined
+
+/**
+ * The client a remote Cowork prompt was sent from (`clientPlatformIn`), read once per prompt from the end of the session's
+ * transcript, where Cowork's host writes it on the prompt's row and no event carries it: the end the turn's prompt row is in, four
+ * times more at each read that does not find it, up to what one read takes. `settle`: the prompt's row is written by now, so a prompt
+ * whose row is not found is not read again. Undefined outside remote Cowork (the entry point `remote_cowork`), for no prompt, or where
+ * the transcript can't be read.
+ */
+async function clientOf($: EngineInterface, promptId: unknown, settle: boolean): Promise<string | undefined> {
+  if (typeof promptId !== 'string' || promptId === '') return undefined
+  if (promptClient?.promptId === promptId) return promptClient.platform
+  entrypoint ??= readEntrypoint($)
+  if ((await entrypoint) !== 'remote_cowork') return undefined
+  let found: string | undefined | null = null
+  try {
+    const { transcriptPath } = await infoOf($)
+    if (transcriptPath !== undefined) {
+      const size = (await $.fs.stat(transcriptPath)).size
+      for (let window = TRANSCRIPT_TAIL_BYTES; found === null; window *= 4) {
+        const length = Math.min(window, size, MAX_READ_BYTES)
+        found = clientPlatformIn(await ($ as unknown as Newer).fs.read(transcriptPath, { offset: size - length, length }), promptId)
+        if (length >= size || length >= MAX_READ_BYTES) break
+      }
+    }
+  } catch {
+    found = null
+  }
+  if (found !== null || settle) promptClient = { promptId, ...(typeof found === 'string' ? { platform: found } : {}) }
+  return found ?? undefined
+}
+
+/** The stamp of a row's client (`clientOf`), by the prompt it carries: none where it has none. */
+async function clientStamp($: EngineInterface, attributes: Readonly<Record<string, TelemetryAttribute>>, event: string): Promise<Record<string, string>> {
+  // A prompt's own row may be logged as its row in the transcript is written: a row that follows it in the turn reads again.
+  const client = await clientOf($, attributes['prompt.id'], event !== 'user_prompt').catch(() => undefined)
+  return client === undefined ? {} : { [CLIENT_PLATFORM_STAMP]: client }
+}
+
 /** The id of the session's last message where it is the model's (a failed turn's is the one Claude Code wrote in its place). */
 async function lastAnswerId($: EngineInterface): Promise<string | undefined> {
   try {
@@ -1251,8 +1292,9 @@ async function observe($: EngineInterface, e: Frozen<TelemetryRecordEntry>): Pro
 
 /**
  * Stamps one collector row and queues the plugin's copy of it. A row that names an organization carries the plugin's name, version,
- * entry point and route (`exporter`); one that does not goes on without any key the plugin owns. Either way the row goes on to the
- * exporter, and the copy, where the plugin copies at all, is queued with route `plugin`.
+ * entry point and route (`exporter`), and in remote Cowork the client its prompt was sent from (`clientOf`); one that does not goes
+ * on without any key the plugin owns. Either way the row goes on to the exporter, and the copy, where the plugin copies at all, is
+ * queued with route `plugin`.
  */
 export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams[2]): Promise<TelemetryLogResult> {
   // Rows reach the plugin: what they say of the session stands, not the account file's, and the rows are theirs, not built.
@@ -1274,6 +1316,7 @@ export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams
       'mainwave.plugin.version': VERSION,
       'mainwave.plugin.entrypoint': ep,
       'mainwave.telemetry.route': 'exporter',
+      ...(await clientStamp($, e.attributes, e.event)),
     })
   } else {
     attributes = stripOwned(e.attributes)
@@ -1569,13 +1612,14 @@ async function readHead($: EngineInterface): Promise<MadeCommit | undefined> {
   return undefined
 }
 
-/** A row built from Claude Code's events, as Claude Code's own go: stamped, through the rebuild, and copied. */
+/** A row built from Claude Code's events, as Claude Code's own go: stamped (its prompt's client among them), through the rebuild, and copied. */
 async function feedRow($: EngineInterface, row: RowIn): Promise<void> {
   entrypoint ??= readEntrypoint($)
   const ep = await entrypoint
   const e = { to: 'collector', event: row.event, attributes: row.attributes, loggedAt: new Date(row.atMs).toISOString() } as Frozen<TelemetryRecordEntry>
   const attributes = applyStamps(row.attributes, {
     'mainwave.plugin.name': PLUGIN_NAME, 'mainwave.plugin.version': VERSION, 'mainwave.plugin.entrypoint': ep, [BUILT_FROM_STAMP]: 'events',
+    ...(await clientStamp($, row.attributes, row.event)),
   })
   await copyRow($, e, attributes, true)
 }
