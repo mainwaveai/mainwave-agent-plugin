@@ -297,6 +297,20 @@ export function insertedText(text: string): boolean {
   return /^<[a-z][a-z0-9-]*>/.test(t) || t.startsWith('This session is being continued from a previous conversation')
 }
 
+/**
+ * The person's message the current turn began with, from the newest of the transcript's messages: walked back from the end past the
+ * messages Claude Code inserted after it (a background task's notification, a command's output), up to the model's message or a tool's
+ * results, so an earlier turn's prompt is never taken. '' where there is none.
+ */
+export function personPrompt(messages: readonly { role?: unknown; text?: unknown; toolResults?: readonly unknown[] }[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m?.role !== 'user' || (m.toolResults?.length ?? 0) > 0) return ''
+    if (typeof m.text === 'string' && m.text.trim() !== '' && !insertedText(m.text)) return m.text
+  }
+  return ''
+}
+
 /** The rules a settings layer's `permissions.allow` lists; none for a layer of another shape. */
 export function permissionRules(layer: unknown): string[] {
   const permissions = layer !== null && typeof layer === 'object' ? (layer as { permissions?: unknown }).permissions : undefined

@@ -44,11 +44,11 @@ import {
 } from './markers.ts'
 import { isCowork, isTruthy, parseResourceAttributes, type BuiltSpan, type CopiedRow } from './otlp.ts'
 import {
-  agentSpawned, callerCtx, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnStart, waits, type Emit, type Rebuild, type RowIn,
+  agentSpawned, callerCtx, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolStart, turnComplete, turnPrompted, turnStart, waits, type Emit, type Rebuild, type RowIn,
 } from './rebuild.ts'
 import {
   accountDeviceOf, costOf, decisionOf, decisionRow, headOf, hostIdentityOf, joinPath, madeCommit, newRowless, promptIdFrom, promptRow, providerOf, remoteSessionIdOf, repoAttributes, requestRow, responseRow,
-  insertedText, permissionRules, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, typedText, uuidOf, type HostFacts, type HostIdentityEnv, type MadeCommit, type Rowless, type Verdict,
+  permissionRules, personPrompt, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, typedText, uuidOf, type HostFacts, type HostIdentityEnv, type MadeCommit, type Rowless, type Verdict,
 } from './rowless.ts'
 import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsPending, settingsSummary, settingsUnavailable } from './orgsettings.ts'
 import { contentLimit } from './protect.ts'
@@ -174,6 +174,13 @@ let idleSubmitted: { text: string } | undefined
 let mainTurnOpen = false
 /** A main-loop turn has begun in this load. */
 let mainTurnSeen = false
+/**
+ * The load's first main-loop turn, begun with no text and none the transcript held yet: its prompt row is built at its first model
+ * request, whose messages the transcript holds by then, timed at the turn's start.
+ */
+let promptLater: { turnId: string; atMs: number } | undefined
+/** How many of the transcript's newest messages a turn begun with no text reads back for its prompt (`personPrompt`). */
+const TRANSCRIPT_WALK = 10
 /** When each tool call the plugin builds rows for began, by its id, until it ends. */
 let callStarts = new Map<string, number>()
 /** The permission check's verdict on each of those calls (`allow`, `deny` or `ask`), by its id, until it ends. */
@@ -1449,16 +1456,14 @@ function hostFactsOf($: EngineInterface): Promise<HostFacts> {
 }
 
 /**
- * The person's message the transcript ends on, as the text of a turn that began with none: what a host submitted before the plugin's
- * hooks were in place. '' where the transcript ends on anything else (a tool's results, the model's message, a message Claude Code
- * inserted itself) or can't be read.
+ * The person's message the transcript's newest turn began with (`personPrompt`), as the text of a turn that began with none: what a host
+ * submitted before the plugin's hooks were in place. '' where the newest messages hold none (a tool's results or the model's message
+ * come first, or only messages Claude Code inserted itself) or can't be read.
  */
 async function transcriptPrompt($: EngineInterface): Promise<string> {
   try {
-    const last = await ($ as unknown as Newer).session.messages({ last: 1 })
-    const message = Array.isArray(last) ? last.at(-1) : undefined
-    if (message?.role !== 'user' || (message.toolResults?.length ?? 0) > 0 || typeof message.text !== 'string') return ''
-    return insertedText(message.text) ? '' : message.text
+    const newest = await ($ as unknown as Newer).session.messages({ last: TRANSCRIPT_WALK })
+    return Array.isArray(newest) ? personPrompt(newest) : ''
   } catch {
     return ''
   }
@@ -1595,6 +1600,35 @@ export async function sessionStart($: SessionStartParams[0], e: SessionStartPara
   return next(e)
 }
 
+/** A main-loop turn's prompt row, built where none comes: what the session spent between turns (a compaction, a suggestion) goes first. */
+async function buildPromptRow($: EngineInterface, text: string, atMs: number): Promise<void> {
+  await flushOutsideCost($).catch(() => undefined)
+  await feedRow($, promptRow(rowlessState, await rowlessHead($), text, atMs, (await promptIdOf($)) ?? uuidOf(randomHex(32))))
+}
+
+/** The person's message as a main-loop turn takes it: in Cowork, without the blocks Cowork puts ahead of what the person typed. */
+async function turnText($: EngineInterface, text: string): Promise<string> {
+  return text !== '' && (await hostFactsOf($)).cowork === true ? typedText(text) : text
+}
+
+/**
+ * The first model request of the load's first turn, where that turn began with no prompt the transcript held: the request's messages
+ * are in the transcript now, the person's among them. Its prompt row goes before the request's rows, timed at the turn's start, and
+ * the turn's interaction takes its text.
+ */
+async function promptAtFirstStep($: EngineInterface, e: { turnId: string; agentId?: string }): Promise<void> {
+  const later = promptLater
+  if (later === undefined || e.agentId !== undefined || e.turnId !== later.turnId) return
+  promptLater = undefined
+  const r = await rebuildOf($)
+  if (r === null || !rowless) return
+  const text = await turnText($, await transcriptPrompt($))
+  if (text === '') return
+  if (isCopying()) capturePrompt(capture, text)
+  turnPrompted(r, e.turnId, text)
+  await buildPromptRow($, text, later.atMs)
+}
+
 /** A main-loop turn began: an interaction opens. */
 export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1], next: TurnStartParams[2]) {
   let out: Emit | null = null
@@ -1603,33 +1637,34 @@ export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1]
   if (e.agentId === undefined) {
     idleSubmitted = undefined
     mainTurnOpen = true
+    promptLater = undefined
   }
   try {
     // The turn's prompt: its own text, else (a host that starts the turn with none) the prompt submitted to start it, else, for the
-    // load's first turn, the person's message the transcript ends on (a host can submit it before the plugin's hooks are in place).
-    // In Cowork, without the blocks Cowork puts ahead of what the person typed, as Claude Code's own prompt rows go.
+    // load's first turn, the person's message the transcript's newest turn began with (a host can submit it before the plugin's hooks
+    // are in place). In Cowork, without the blocks Cowork puts ahead of what the person typed, as Claude Code's own prompt rows go.
     let text = e.text !== '' ? e.text : (submitted ?? '')
     const first = e.agentId === undefined && !mainTurnSeen
     if (e.agentId === undefined) mainTurnSeen = true
     if (e.agentId === undefined) await decideRowless($)
     if (text === '' && first && rowless) text = await transcriptPrompt($)
-    if (e.agentId === undefined && text !== '' && (await hostFactsOf($)).cowork === true) text = typedText(text)
+    if (e.agentId === undefined) text = await turnText($, text)
     if (e.agentId === undefined && isCopying()) capturePrompt(capture, text)
     // The repository the turn runs in, read again each turn: the session may have moved to another, or the remote changed.
     if (rowless && e.agentId === undefined) repoNow = readRepo($)
     const r = await rebuildOf($)
-    // The prompt row, built where none comes: before the turn, as Claude Code logs it.
-    // A turn no prompt began (a continuation) has no prompt row, as in Claude Code.
+    const nowMs = await $.clock.now()
+    // The prompt row, built where none comes: before the turn, as Claude Code logs it. A turn no prompt began (a continuation) has no
+    // prompt row, as in Claude Code. The load's first turn, whose prompt the transcript may not hold yet, looks again at its first
+    // model request.
     if (r !== null && rowless && e.agentId === undefined && text !== '') {
       try {
-        // What the session spent between turns (a compaction, a suggestion) is not this turn's.
-        await flushOutsideCost($).catch(() => undefined)
-        await feedRow($, promptRow(rowlessState, await rowlessHead($), text, await $.clock.now(), (await promptIdOf($)) ?? uuidOf(randomHex(32))))
+        await buildPromptRow($, text, nowMs)
       } catch {
         // The turn goes without its prompt row.
       }
-    }
-    if (r !== null) out = turnStart(r, { ...e, text }, await $.clock.now())
+    } else if (r !== null && rowless && first && text === '') promptLater = { turnId: e.turnId, atMs: nowMs }
+    if (r !== null) out = turnStart(r, { ...e, text }, nowMs)
   } catch {
     // The turn's interaction is not rebuilt.
   }
@@ -1701,6 +1736,8 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
   let startMs = 0
   // When the first piece of the response came, for a request row the plugin builds (its time to first token).
   let firstChunk: Promise<number | undefined> | undefined
+  // The prompt of the load's first turn, where its start found none: before the request's own rows.
+  await promptAtFirstStep($, e).catch(() => undefined)
   try {
     r = await rebuildOf($)
     if (r !== null) {
@@ -2185,6 +2222,7 @@ export const register: Register = on => {
   idleSubmitted = undefined
   mainTurnOpen = false
   mainTurnSeen = false
+  promptLater = undefined
   callStarts = new Map()
   verdicts = new Map()
   judgments = new Map()

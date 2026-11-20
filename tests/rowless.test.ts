@@ -5,7 +5,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { accountDeviceOf, costOf, decisionOf, insertedText, permissionRules, typedText, decisionSource, headOf, hostIdentityOf, joinPath, madeCommit, refusalKind, repoAttributes, promptIdFrom, responseTextOf, seedCost, newRowless, promptRow, providerOf, remoteSessionIdOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
+import { accountDeviceOf, costOf, decisionOf, insertedText, permissionRules, personPrompt, typedText, decisionSource, headOf, hostIdentityOf, joinPath, madeCommit, refusalKind, repoAttributes, promptIdFrom, responseTextOf, seedCost, newRowless, promptRow, providerOf, remoteSessionIdOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
 import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, infoCall, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, PROD, records, type Post, type Reply } from './rig.ts'
 
 const keyless = { options: {} }
@@ -21,7 +21,7 @@ const HOST_EMAIL = 'host@example.com'
 const BUILT = 'mainwave.telemetry.built_from'
 const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 300, cache_creation_input_tokens: 40, ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 40 }
 
-type World = { messages?: unknown[]; settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown> }
+type World = { messages?: unknown[] | (() => unknown[]); settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown> }
 
 function world(on: On, opts: World = {}) {
   const clock = mock.clock(on, { now: START })
@@ -55,7 +55,12 @@ function world(on: On, opts: World = {}) {
   })
   on('session.id', () => ({ value: 's-1' }) as never)
   on('session.cwd', () => ({ value: '/work/app' }) as never)
-  on('session.messages', () => ({ value: opts.messages ?? [] }) as never)
+  // The transcript's newest messages: `last` of them, as the engine cuts it; a function reads the transcript as it is at the call.
+  on('session.messages', (_$, e) => {
+    const all = (typeof opts.messages === 'function' ? opts.messages() : opts.messages) ?? []
+    const last = (e as unknown as { last?: number }).last
+    return { value: last === undefined ? all : all.slice(-last) } as never
+  })
   on('session.repo', () => ({ value: opts.repo === undefined || opts.repo === null ? null : { root: '/work/app', remote: opts.repo.remote, internal: false, name: null } }) as never)
   // The session's cost after each request, in turn; `spend` adds a cost outside any request of a turn.
   const costs = [...(opts.costs ?? [0.01, 0.03, 0.06, 0.1])]
@@ -745,6 +750,71 @@ describe('in Cowork', () => {
     await turn($, '')
     await w.clock.advance(5_000)
     expect(promptsOf(w)).toEqual([])
+  })
+
+  test("a first turn whose transcript ends on a notice Claude Code queued after the person's message takes the person's message", keyless, async ($, on) => {
+    const notice = { role: 'user', text: '<task-notification>\nmainwave: its telemetry.log hook was skipped.\n</task-notification>', toolUses: [] }
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', store: { dataPoints: { 'prompt.text': 'on' } }, messages: [{ role: 'user', text: REMINDER + typed, toolUses: [] }, notice, notice] })
+    await start($)
+    await turn($, '')
+    await w.clock.advance(5_000)
+    expect(promptsOf(w)).toEqual([[String(typed.length), typed]])
+  })
+
+  test("a first turn never takes an earlier turn's prompt: the model's message or a tool's results end the walk back", keyless, async ($, on) => {
+    const notice = { role: 'user', text: '<task-notification>\n<task-id>b1</task-id>\n</task-notification>', toolUses: [] }
+    const earlier = { role: 'user', text: 'an earlier prompt', toolUses: [] }
+    const results = { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'toolu_0', text: 'done', isError: false }] }
+    let messages: unknown[] = [earlier, { role: 'assistant', text: 'done', toolUses: [] }, notice]
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: () => messages })
+    await start($)
+    await turn($, '', 'toolu_1')
+    messages = [earlier, results, notice]
+    await turn($, '', 'toolu_2')
+    await w.clock.advance(5_000)
+    expect(promptsOf(w)).toEqual([])
+    expect(personPrompt([earlier, results, notice])).toBe('')
+    expect(personPrompt([earlier, { role: 'assistant', text: 'ok', toolUses: [] }, { role: 'user', text: 'now this', toolUses: [] }, notice])).toBe('now this')
+    expect(personPrompt([])).toBe('')
+  })
+
+  test("a first turn whose message reaches the transcript only after the turn began takes it at its first request: timed at the turn's start, before the request's rows, its interaction with it", keyless, async ($, on) => {
+    let messages: unknown[] = []
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', env: { CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: '1' }, store: { dataPoints: { 'prompt.text': 'on' } }, messages: () => messages })
+    await start($)
+    const startedMs = START
+    await $.turn.start({ turnId: 't1', text: '' } as never)
+    await w.clock.advance(40)
+    messages = [{ role: 'user', text: REMINDER + typed, toolUses: [] }, { role: 'user', text: '<task-notification>\nx\n</task-notification>', toolUses: [] }]
+    const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-haiku-5-5', messageCount: 2, effort: 'medium' } as never)
+    while (!(await stream.next()).done) {
+      // Read to its end, as the engine does.
+    }
+    // A later request of the turn looks no more.
+    const again = $.turn.step({ turnId: 't1', index: 1, model: 'claude-haiku-5-5', messageCount: 4, effort: 'medium' } as never)
+    while (!(await again.next()).done) {
+      // Read to its end.
+    }
+    await $.turn.complete({ turnId: 't1', answer: 'ok', durationMs: 200, isAborted: false, reason: 'answer' } as never)
+    await w.clock.advance(5_000)
+    await end($)
+    expect(promptsOf(w)).toEqual([[String(typed.length), typed]])
+    const rows = w.built().filter(r => r.attributes['event.name'] !== 'plugin_status')
+    const prompt = rows.find(r => r.attributes['event.name'] === 'user_prompt')!
+    expect(prompt.attributes['event.timestamp']).toBe(new Date(startedMs).toISOString())
+    expect(prompt.attributes['event.sequence']).toBe(0)
+    for (const r of rows.filter(r => r.attributes['event.name'] === 'api_request')) expect(r.attributes['prompt.id']).toBe(prompt.attributes['prompt.id'])
+    const interactions = spans(w.posts).filter(x => x.name === 'claude_code.interaction')
+    expect(interactions.map(x => [x.attrs['user_prompt_length'], x.attrs['user_prompt']])).toEqual([[typed.length, typed]])
+  })
+
+  test("a first turn whose transcript holds no message of the person's even at its first request builds no prompt row", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: [] })
+    await start($)
+    await turn($, '')
+    await w.clock.advance(5_000)
+    expect(promptsOf(w)).toEqual([])
+    expect(w.built().filter(r => r.attributes['event.name'] === 'api_request').length).toBe(1)
   })
 
   test('a first turn whose transcript ends on a tool\'s results builds no prompt row', keyless, async ($, on) => {
