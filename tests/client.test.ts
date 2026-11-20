@@ -22,10 +22,19 @@ describe('clientPlatformIn', () => {
     expect(clientPlatformIn(prompt('p-1', { clientPlatform: 'web_claude_ai' }), 'p-1')).toBe('web_claude_ai')
   })
 
-  test("a tool's results and a row Claude Code added are not the prompt's row, whatever client they name", () => {
-    const text = `${result('p-1', { clientPlatform: 'ios' })}${prompt('p-1', { isMeta: true, clientPlatform: 'claude_code_cli' })}${prompt('p-1', { clientPlatform: 'desktop_app' })}`
-    expect(clientPlatformIn(text, 'p-1')).toBe('desktop_app')
-    expect(clientPlatformIn(`${result('p-1', { clientPlatform: 'ios' })}`, 'p-1')).toBeNull()
+  test("a tool's results, an interrupted request's mark and a row Claude Code added are not the prompt's row, whatever client they name", () => {
+    const interrupted = (content: unknown) => line({ type: 'user', promptId: 'p-1', message: { role: 'user', content } })
+    const added = [
+      result('p-1', { clientPlatform: 'ios' }),
+      prompt('p-1', { isMeta: true, clientPlatform: 'claude_code_cli' }),
+      prompt('p-1', { isCompactSummary: true }),
+      prompt('p-1', { isVisibleInTranscriptOnly: true }),
+      interrupted('[Request interrupted by user]'),
+      interrupted([{ type: 'text', text: '[Request interrupted by user for tool use]' }]),
+    ]
+    expect(clientPlatformIn(`${added.join('')}${prompt('p-1', { clientPlatform: 'desktop_app' })}`, 'p-1')).toBe('desktop_app')
+    // Only rows of the prompt that are not its own: its own row is further back.
+    expect(clientPlatformIn(added.join(''), 'p-1')).toBeNull()
   })
 
   test('the first row of the prompt decides: one that names no client, or one not of its shape, gives none', () => {
@@ -35,10 +44,14 @@ describe('clientPlatformIn', () => {
     }
   })
 
-  test('no row of the prompt: null; a line cut where the read began, a row of another kind, or text that is not JSON, are skipped', () => {
+  test("another prompt's rows and none of this one's: false, as the newest prompt's row comes after every earlier one's", () => {
+    expect(clientPlatformIn(`${prompt('p-1', { clientPlatform: 'ios' })}${result('p-1')}`, 'p-2')).toBe(false)
+    expect(clientPlatformIn(`${prompt('p-1', { clientPlatform: 'ios' })}${result('p-2')}`, 'p-2')).toBeNull()
+    expect(clientPlatformIn(prompt('p-1', { clientPlatform: 'ios' }), '')).toBe(false)
+  })
+
+  test('no row of any prompt: null; a line cut where the read began, a row of another kind, or text that is not JSON, are skipped', () => {
     expect(clientPlatformIn('', 'p-1')).toBeNull()
-    expect(clientPlatformIn(prompt('p-1', { clientPlatform: 'ios' }), 'p-2')).toBeNull()
-    expect(clientPlatformIn(prompt('p-1', { clientPlatform: 'ios' }), '')).toBeNull()
     const cut = prompt('p-1', { clientPlatform: 'ios' }).slice(10)
     expect(clientPlatformIn(cut, 'p-1')).toBeNull()
     expect(clientPlatformIn(`${line({ type: 'assistant', promptId: 'p-1', clientPlatform: 'ios' })}not json p-1\n`, 'p-1')).toBeNull()

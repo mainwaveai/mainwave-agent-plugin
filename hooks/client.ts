@@ -9,32 +9,47 @@ import { CLIENT_PLATFORM } from './stamps.ts'
 
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v)
 
-/** Whether a user row's message is a tool's results rather than a prompt. */
-function toolResults(message: unknown): boolean {
+/** Whether a user row's message is a tool's results, or the mark an interrupted request leaves, rather than a prompt. */
+function notPrompt(message: unknown): boolean {
   const content = isObject(message) ? message['content'] : undefined
-  return Array.isArray(content) && content.some(b => isObject(b) && b['type'] === 'tool_result')
+  const blocks = Array.isArray(content) ? content : [content]
+  return blocks.some(b => (isObject(b) && b['type'] === 'tool_result') || (typeof b === 'string' && b.startsWith('[Request interrupted by user')) ||
+    (isObject(b) && b['type'] === 'text' && typeof b['text'] === 'string' && b['text'].startsWith('[Request interrupted by user')))
 }
 
 /**
- * The client the prompt `promptId` was sent from, from a stretch of transcript lines (JSON, one row a line; its end at least): the
- * `clientPlatform` of that prompt's own row, the first user row of the prompt that is neither a tool's results nor one Claude Code
- * added (`isMeta`). Undefined where that row names none, or one not of the stamp's shape (a prompt carried over from chat at a handover
- * names none); `null` where no row of that prompt is in the text (not written yet, or before where the read began). A line cut where
- * the read began is skipped.
+ * What a stretch of transcript lines (JSON, one row a line; its end) says of the client the prompt `promptId` was sent from:
+ *
+ * - the `clientPlatform` of that prompt's own row: the first user row of the prompt that is not a tool's results, the mark an
+ *   interrupted request leaves, or a row Claude Code added (`isMeta`, a compaction's summary, a row kept for the transcript alone);
+ * - undefined where that row names none, or one not of the stamp's shape (a prompt carried over from chat at a handover names none);
+ * - `null` where that row is not in the text and may be further back: the text holds rows of that prompt, or none of another's;
+ * - `false` where the text holds another prompt's rows and none of this one's: the newest prompt's row comes after every earlier
+ *   one's, so it is not written (yet), or the prompt has none.
+ *
+ * A line cut where the read began is skipped.
  */
-export function clientPlatformIn(text: string, promptId: string): string | undefined | null {
-  if (promptId === '') return null
+export function clientPlatformIn(text: string, promptId: string): string | undefined | null | false {
+  if (promptId === '') return false
+  let ours = false
+  let others = false
   for (const line of text.split('\n')) {
-    if (!line.includes(promptId)) continue
+    if (!line.includes('"promptId"')) continue
     let row: unknown
     try {
       row = JSON.parse(line)
     } catch {
       continue
     }
-    if (!isObject(row) || row['type'] !== 'user' || row['promptId'] !== promptId || row['isMeta'] === true || toolResults(row['message'])) continue
+    if (!isObject(row) || row['type'] !== 'user' || typeof row['promptId'] !== 'string') continue
+    if (row['promptId'] !== promptId) {
+      others = true
+      continue
+    }
+    ours = true
+    if (row['isMeta'] === true || row['isCompactSummary'] === true || row['isVisibleInTranscriptOnly'] === true || notPrompt(row['message'])) continue
     const client = row['clientPlatform']
     return typeof client === 'string' && CLIENT_PLATFORM.test(client) ? client : undefined
   }
-  return null
+  return others && !ours ? false : null
 }

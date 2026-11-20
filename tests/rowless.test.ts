@@ -1661,6 +1661,29 @@ describe('the client a remote Cowork prompt was sent from', () => {
     for (const r of w.built()) expect(r.attributes[CLIENT]).toBe('ios')
   })
 
+  test('a prompt whose own row is longer than the first read is found further back', keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', transcript: PROMPT_ROW('prompt-host', { clientPlatform: 'ios', pasted: 'x'.repeat(100_000) }) })
+    await start($)
+    await turn($)
+    await w.clock.advance(5_000)
+    expect(w.built().length).toBe(5)
+    for (const r of w.built()) expect(r.attributes[CLIENT]).toBe('ios')
+  })
+
+  test('a transcript read that fails leaves the stamp off and holds nothing; the next row of the prompt reads again', keyless, async ($, on) => {
+    // Every look at the file as the turn begins fails (the handover's among them); the looks after it don't.
+    let w: ReturnType<typeof world> | undefined
+    const transcript = () => {
+      if (w === undefined || w.clock.now() === START) throw new Error('EIO in test')
+      return PROMPT_ROW('prompt-host', { clientPlatform: 'desktop_app' })
+    }
+    w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', transcript })
+    await start($)
+    await turn($)
+    await w.clock.advance(5_000)
+    expect(clientsOf(w.built())).toEqual([['user_prompt', undefined], ['api_request', 'desktop_app'], ['assistant_response', 'desktop_app'], ['tool_decision', 'desktop_app'], ['tool_result', 'desktop_app']])
+  })
+
   test("Claude Code's own rows carry it too, on the exporter's row and the copy; a prompt's row logged before its transcript row is read again", keyless, async ($, on) => {
     let transcript = ''
     const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', transcript: () => transcript, promptId: 'p-1' })
