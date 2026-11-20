@@ -659,6 +659,15 @@ export function turnStart(r: Rebuild, e: { turnId: string; text: string; agentId
 }
 
 /**
+ * The prompt of a main-loop turn that began with no text, found after it began: the turn's interaction takes it, and the prompt row
+ * built from it next is the turn's.
+ */
+export function turnPrompted(r: Rebuild, turnId: string, text: string): void {
+  const it = r.interaction
+  if (it !== undefined && it.turnId === turnId && it.text === '' && !it.prompt) it.text = text
+}
+
+/**
  * A slash command began: an interaction opens, unless a model turn takes it over. One still waiting to be sent goes first; a prompt
  * row of a slash command seen just before is this command's.
  */

@@ -5,7 +5,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { accountDeviceOf, costOf, decisionOf, insertedText, permissionRules, typedText, decisionSource, headOf, hostIdentityOf, joinPath, madeCommit, refusalKind, repoAttributes, promptIdFrom, responseTextOf, seedCost, newRowless, promptRow, providerOf, remoteSessionIdOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
+import { accountDeviceOf, costOf, decisionOf, insertedText, permissionRules, personPrompt, typedText, decisionSource, headOf, hostIdentityOf, joinPath, madeCommit, refusalKind, repoAttributes, promptIdFrom, responseTextOf, seedCost, newRowless, promptRow, providerOf, remoteSessionIdOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
 import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, infoCall, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, PROD, records, type Post, type Reply } from './rig.ts'
 
 const keyless = { options: {} }
@@ -21,7 +21,7 @@ const HOST_EMAIL = 'host@example.com'
 const BUILT = 'mainwave.telemetry.built_from'
 const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 300, cache_creation_input_tokens: 40, ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 40 }
 
-type World = { messages?: unknown[]; settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown> }
+type World = { messages?: unknown[] | (() => unknown[]); settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown> }
 
 function world(on: On, opts: World = {}) {
   const clock = mock.clock(on, { now: START })
@@ -55,7 +55,12 @@ function world(on: On, opts: World = {}) {
   })
   on('session.id', () => ({ value: 's-1' }) as never)
   on('session.cwd', () => ({ value: '/work/app' }) as never)
-  on('session.messages', () => ({ value: opts.messages ?? [] }) as never)
+  // The transcript's newest messages: `last` of them, as the engine cuts it; a function reads the transcript as it is at the call.
+  on('session.messages', (_$, e) => {
+    const all = (typeof opts.messages === 'function' ? opts.messages() : opts.messages) ?? []
+    const last = (e as unknown as { last?: number }).last
+    return { value: last === undefined ? all : all.slice(-last) } as never
+  })
   on('session.repo', () => ({ value: opts.repo === undefined || opts.repo === null ? null : { root: '/work/app', remote: opts.repo.remote, internal: false, name: null } }) as never)
   // The session's cost after each request, in turn; `spend` adds a cost outside any request of a turn.
   const costs = [...(opts.costs ?? [0.01, 0.03, 0.06, 0.1])]
@@ -747,13 +752,129 @@ describe('in Cowork', () => {
     expect(promptsOf(w)).toEqual([])
   })
 
-  test('a first turn whose transcript ends on a tool\'s results builds no prompt row', keyless, async ($, on) => {
-    const results = { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'toolu_0', text: 'done', isError: false }] }
-    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: [results] })
+  test("a first turn whose transcript ends on a notice Claude Code queued after the person's message takes the person's message", keyless, async ($, on) => {
+    const notice = { role: 'user', text: '<task-notification>\nmainwave: its telemetry.log hook was skipped.\n</task-notification>', toolUses: [] }
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', store: { dataPoints: { 'prompt.text': 'on' } }, messages: [{ role: 'user', text: REMINDER + typed, toolUses: [] }, notice, notice] })
     await start($)
-    await turn($, '', 'toolu_1')
+    await turn($, '')
+    await w.clock.advance(5_000)
+    expect(promptsOf(w)).toEqual([[String(typed.length), typed]])
+  })
+
+  const NOTICE = { role: 'user', text: '<task-notification>\n<task-id>b1</task-id>\n</task-notification>', toolUses: [] }
+  const EARLIER = { role: 'user', text: 'an earlier prompt', toolUses: [] }
+  const RESULTS = { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'toolu_0', text: 'done', isError: false }] }
+  const FINAL = { role: 'assistant', text: 'done', toolUses: [] }
+  const SAID = { role: 'assistant', text: 'I will list the files now.', toolUses: [] }
+  const CALLED = (id: string) => ({ role: 'assistant', text: '', toolUses: [{ tool_use_id: id, tool: 'Bash', input: { command: 'ls' }, text: 'a.txt' }] })
+  const ANSWERED = (id: string, text = 'a.txt') => ({ role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: id, text, isError: false }] })
+  const ENDS: [string, unknown[]][] = [
+    ["the model's answer", [FINAL]],
+    ['an interrupted request', [CALLED('toolu_0'), ANSWERED('toolu_0', '[Request interrupted by user for tool use]')]],
+    ['the mark of an interrupted request', [{ role: 'user', text: '[Request interrupted by user]', toolUses: [] }]],
+    ["a compaction's summary", [{ role: 'user', text: 'This session is being continued from a previous conversation that ran out of context.', toolUses: [] }]],
+  ]
+  for (const [what, stop] of ENDS) {
+    test(`a load's first turn never takes an earlier turn's prompt: ${what} ends the walk back`, keyless, async ($, on) => {
+      const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: [EARLIER, ...stop, NOTICE] })
+      await start($)
+      await turn($, '')
+      await w.clock.advance(5_000)
+      expect(promptsOf(w)).toEqual([])
+    })
+  }
+
+  test("a load's first turn that is the rest of a turn begun before the plugin's hooks were in place (Cowork) takes that turn's prompt, back past its calls and their results", keyless, async ($, on) => {
+    const begun = [{ role: 'user', text: REMINDER + typed, toolUses: [] }, SAID, CALLED('toolu_a'), ANSWERED('toolu_a'), CALLED('toolu_b'), ANSWERED('toolu_b')]
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', store: { dataPoints: { 'prompt.text': 'on' } }, messages: [EARLIER, FINAL, ...begun] })
+    await start($)
+    await turn($, '', 'toolu_c')
+    await w.clock.advance(5_000)
+    expect(promptsOf(w)).toEqual([[String(typed.length), typed]])
+    const rows = w.built()
+    expect(rows.find(r => r.attributes['event.name'] === 'api_request')!.attributes['prompt.id']).toBe(rows.find(r => r.attributes['event.name'] === 'user_prompt')!.attributes['prompt.id'])
+  })
+
+  test("the walk back: past the turn's own calls, their results and the text Claude Code adds after them, to where an earlier turn ended", () => {
+    const reminderOnly = { role: 'user', text: REMINDER, toolUses: [] }
+    const person = { role: 'user', text: REMINDER + typed, toolUses: [] }
+    const skillBody = { role: 'user', text: 'Base directory for this skill: /skills/docx\n\n# Making documents', toolUses: [] }
+    const imageNote = { role: 'user', text: '[Image: original 1200x800, displayed at 600x400]', toolUses: [] }
+    const across = (ms: unknown[]) => personPrompt(ms as never, true)
+    expect(across([person, reminderOnly, NOTICE])).toBe(REMINDER + typed)
+    // A response's text, held apart from the calls that follow it, is the turn's own; an answer no call follows ends it.
+    expect(across([EARLIER, FINAL, person, SAID, CALLED('toolu_a'), ANSWERED('toolu_a'), NOTICE])).toBe(REMINDER + typed)
+    expect(across([EARLIER, SAID, CALLED('toolu_a'), ANSWERED('toolu_a')])).toBe('an earlier prompt')
+    expect(across([EARLIER, CALLED('toolu_a'), ANSWERED('toolu_a'), FINAL, NOTICE])).toBe('')
+    expect(across([EARLIER, FINAL, { role: 'user', text: 'now this', toolUses: [] }, NOTICE])).toBe('now this')
+    // A skill's body and an image's note come right after their call's result: the call's, not the person's.
+    expect(across([person, CALLED('toolu_a'), ANSWERED('toolu_a', 'Launching skill: docx'), skillBody, CALLED('toolu_b'), ANSWERED('toolu_b')])).toBe(REMINDER + typed)
+    expect(across([person, CALLED('toolu_a'), ANSWERED('toolu_a'), imageNote])).toBe(REMINDER + typed)
+    expect(across([EARLIER, { role: 'user', text: '[Request interrupted by user]', toolUses: [] }])).toBe('')
+    expect(across([ANSWERED('toolu_a')])).toBe('')
+    expect(across([reminderOnly])).toBe('')
+    expect(across([])).toBe('')
+    // Without acrossCalls (as a turn begins), only a prompt at the transcript's end, past inserted messages alone.
+    expect(personPrompt([EARLIER, FINAL, person, reminderOnly, NOTICE])).toBe(REMINDER + typed)
+    expect(personPrompt([person, CALLED('toolu_a'), ANSWERED('toolu_a')] as never)).toBe('')
+    expect(personPrompt([person, SAID] as never)).toBe('')
+    expect(personPrompt([person, CALLED('toolu_a'), ANSWERED('toolu_a'), skillBody] as never)).toBe('')
+  })
+
+  test("a load's first turn begun before the hooks were in place takes its prompt past a skill's body, and as its first request begins", keyless, async ($, on) => {
+    const skillBody = { role: 'user', text: 'Base directory for this skill: /skills/docx\n\n# Making documents', toolUses: [] }
+    const begun = [{ role: 'user', text: REMINDER + typed, toolUses: [] }, CALLED('toolu_a'), ANSWERED('toolu_a', 'Launching skill: docx'), skillBody]
+    let reads = 0
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', store: { dataPoints: { 'prompt.text': 'on' } }, messages: () => (reads++, begun) })
+    await start($)
+    await turn($, '', 'toolu_c')
+    await w.clock.advance(5_000)
+    expect(promptsOf(w)).toEqual([[String(typed.length), typed]])
+    // Read as the turn began (its end held no prompt), and again at its first request.
+    expect(reads).toBe(2)
+  })
+
+  const TRACES: [string, Record<string, string>][] = [['with the beta on', { CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: '1' }], ['where the plugin builds the trace', {}]]
+  for (const [how, env] of TRACES) {
+    test(`a first turn whose message reaches the transcript only after the turn began takes it at its first request (${how}): timed at the turn's start, before the request's rows, its interaction with it`, keyless, async ($, on) => {
+      let messages: unknown[] = []
+      const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', env, store: { dataPoints: { 'prompt.text': 'on' } }, messages: () => messages })
+      await start($)
+      await $.turn.start({ turnId: 't1', text: '' } as never)
+      await w.clock.advance(40)
+      messages = [{ role: 'user', text: REMINDER + typed, toolUses: [] }, NOTICE]
+      const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-haiku-5-5', messageCount: 2, effort: 'medium' } as never)
+      while (!(await stream.next()).done) {
+        // Read to its end, as the engine does.
+      }
+      // A later request of the turn looks no more.
+      const again = $.turn.step({ turnId: 't1', index: 1, model: 'claude-haiku-5-5', messageCount: 4, effort: 'medium' } as never)
+      while (!(await again.next()).done) {
+        // Read to its end.
+      }
+      await $.turn.complete({ turnId: 't1', answer: 'ok', durationMs: 200, isAborted: false, reason: 'answer' } as never)
+      await w.clock.advance(5_000)
+      await end($)
+      expect(promptsOf(w)).toEqual([[String(typed.length), typed]])
+      const rows = w.built().filter(r => r.attributes['event.name'] !== 'plugin_status')
+      const prompt = rows.find(r => r.attributes['event.name'] === 'user_prompt')!
+      expect(prompt.attributes['event.timestamp']).toBe(new Date(START).toISOString())
+      expect(prompt.attributes['event.sequence']).toBe(0)
+      const requests = rows.filter(r => r.attributes['event.name'] === 'api_request')
+      expect(requests.length).toBe(2)
+      for (const r of requests) expect(r.attributes['prompt.id']).toBe(prompt.attributes['prompt.id'])
+      const interactions = spans(w.posts).filter(x => x.name === 'claude_code.interaction')
+      expect(interactions.map(x => [x.attrs['user_prompt_length'], x.attrs['user_prompt']])).toEqual([[typed.length, typed]])
+    })
+  }
+
+  test("a first turn whose transcript holds no message of the person's even at its first request builds no prompt row", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: [] })
+    await start($)
+    await turn($, '')
     await w.clock.advance(5_000)
     expect(promptsOf(w)).toEqual([])
+    expect(w.built().filter(r => r.attributes['event.name'] === 'api_request').length).toBe(1)
   })
 
   test("a Cowork prompt's own text goes without the reminder, its length the text's, and its row filled", keyless, async ($, on) => {
@@ -865,6 +986,8 @@ describe('rowless.ts', () => {
   test("Cowork's reminders ahead of what the person typed are dropped; anything else is kept", () => {
     const reminder = "<system-reminder>The user's timezone is UTC.</system-reminder>"
     expect(typedText(`${reminder}\nhello`)).toBe('hello')
+    // A message of text blocks, as the transcript joins them: with nothing between.
+    expect(typedText(`${reminder}hello`)).toBe('hello')
     expect(typedText(`${reminder}\n${reminder}\n\nhello`)).toBe('hello')
     expect(typedText(`hello ${reminder}`)).toBe(`hello ${reminder}`)
     expect(typedText('hello')).toBe('hello')

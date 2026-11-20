@@ -290,11 +290,55 @@ function row(state: Rowless, head: Attrs, event: string, atMs: number, attribute
 
 /**
  * Whether a user message's text is one Claude Code inserted rather than one the person typed: a background task's notification, a
- * command's output or caveat, a compaction's summary.
+ * command's output or caveat, a compaction's summary, the mark an interrupted request leaves.
  */
 export function insertedText(text: string): boolean {
   const t = typedText(text).trimStart()
-  return /^<[a-z][a-z0-9-]*>/.test(t) || t.startsWith('This session is being continued from a previous conversation')
+  return /^<[a-z][a-z0-9-]*>/.test(t) || t.startsWith('This session is being continued from a previous conversation') || t.startsWith('[Request interrupted by user')
+}
+
+/** Whether a user message's text, or one of its tool results', is the mark an interrupted request leaves: the turn it was in ended. */
+function interrupted(m: { text?: unknown; toolResults?: readonly unknown[] }): boolean {
+  const marks = (t: unknown) => typeof t === 'string' && typedText(t).trimStart().startsWith('[Request interrupted by user')
+  return marks(m.text) || (m.toolResults ?? []).some(r => r !== null && typeof r === 'object' && marks((r as { text?: unknown }).text))
+}
+
+type WalkedMessage = { role?: unknown; text?: unknown; toolUses?: readonly unknown[]; toolResults?: readonly unknown[] }
+
+const hasResults = (m: WalkedMessage | undefined) => m?.role === 'user' && (m.toolResults?.length ?? 0) > 0
+
+/**
+ * The person's message the current turn began with, from the newest of the transcript's messages, or '' where there is none.
+ *
+ * The walk goes back from the end past the messages Claude Code inserted (a background task's notification, a command's output, a
+ * message of Cowork's reminders alone). With `acrossCalls`, for a turn known to be under way, it also goes past what the turn has done
+ * since its prompt: the model's tool calls and their results, a response's text (which the transcript holds apart from the calls that
+ * follow it), and the text Claude Code adds right after a call's result (a skill's body, an image's note). It stops where an earlier turn
+ * ended, so that turn's prompt is not taken: at the model's message with no tool calls that no message of the model's follows, at an
+ * interrupted request, at a compaction's summary. Without `acrossCalls` it stops at any message of the model's or any result.
+ */
+export function personPrompt(messages: readonly WalkedMessage[], acrossCalls = false): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m?.role === 'assistant') {
+      if (acrossCalls && ((m.toolUses?.length ?? 0) > 0 || messages[i + 1]?.role === 'assistant')) continue
+      return ''
+    }
+    if (m?.role !== 'user' || interrupted(m)) return ''
+    if (hasResults(m)) {
+      if (acrossCalls) continue
+      return ''
+    }
+    if (typeof m.text !== 'string') continue
+    if (typedText(m.text).trimStart().startsWith('This session is being continued from a previous conversation')) return ''
+    // A call's own text, right after its result: never a prompt, which follows no result in the turn it begins.
+    if (hasResults(messages[i - 1])) {
+      if (acrossCalls) continue
+      return ''
+    }
+    if (typedText(m.text).trim() !== '' && !insertedText(m.text)) return m.text
+  }
+  return ''
 }
 
 /** The rules a settings layer's `permissions.allow` lists; none for a layer of another shape. */
