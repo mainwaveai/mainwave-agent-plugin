@@ -947,6 +947,8 @@ describe('rowless.ts', () => {
   test("Cowork's reminders ahead of what the person typed are dropped; anything else is kept", () => {
     const reminder = "<system-reminder>The user's timezone is UTC.</system-reminder>"
     expect(typedText(`${reminder}\nhello`)).toBe('hello')
+    // A message of text blocks, as the transcript joins them: with nothing between.
+    expect(typedText(`${reminder}hello`)).toBe('hello')
     expect(typedText(`${reminder}\n${reminder}\n\nhello`)).toBe('hello')
     expect(typedText(`hello ${reminder}`)).toBe(`hello ${reminder}`)
     expect(typedText('hello')).toBe('hello')
