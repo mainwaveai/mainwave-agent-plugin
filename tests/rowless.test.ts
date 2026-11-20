@@ -1717,23 +1717,39 @@ describe("the request ID on the rows built from events", () => {
   const PROMPT_ROW = JSON.stringify({ type: 'user', uuid: 'u-0', message: { role: 'user', content: 'go' } })
   const SUB_TRANSCRIPT = '/home/dev/.claude/projects/-work-app/s-1/subagents/agent-a1.jsonl'
 
+  type TranscribedOpts = {
+    lagMs?: number; never?: boolean; transcript?: boolean; unwritten?: boolean; store?: Record<string, unknown>
+    /** Lines written in the step before its response rows, at once. */
+    before?: readonly string[]
+    /** Lines written after its response rows, each this long after the step's response. */
+    after?: readonly { line: string; delayMs: number }[]
+    /** The response rows are written half at first (a write under way), whole `halfMs` later. */
+    halfMs?: number
+  }
+
   /** The session's transcript as its lines stand, and the response rows the engine keeps in each step, written there `lagMs` later. */
-  function transcribed(on: On, $: Engine, blocks: (step: { turnId: string; index: number; agentId?: string }) => readonly [uuid: string, requestId: string | undefined][], opts: { lagMs?: number; never?: boolean; transcript?: boolean; unwritten?: boolean } = {}) {
-    const lines: { line: string; atMs: number; agentId?: string }[] = opts.unwritten ? [] : [{ line: PROMPT_ROW, atMs: 0 }]
-    // With `unwritten`, no file until its first line is written, as a new session's transcript.
+  function transcribed(on: On, $: Engine, blocks: (step: { turnId: string; index: number; agentId?: string }) => readonly [uuid: string, requestId: string | undefined][], opts: TranscribedOpts = {}) {
+    const lines: { line: string; atMs: number; wholeAtMs?: number; agentId?: string }[] = opts.unwritten ? [] : [{ line: PROMPT_ROW, atMs: 0 }]
+    // With `unwritten`, no file until its first line is written, as a new session's transcript. A line written half is cut in its middle.
     const file = (agentId: string | undefined) => () => {
-      const text = lines.filter(l => l.agentId === agentId && l.atMs <= w.clock.now()).map(l => `${l.line}\n`).join('')
+      const now = w.clock.now()
+      const text = lines.filter(l => l.agentId === agentId && l.atMs <= now).map(l => (l.wholeAtMs !== undefined && now < l.wholeAtMs ? l.line.slice(0, l.line.length >> 1) : `${l.line}\n`)).join('')
       if (text === '' && opts.unwritten) throw new Error('no such file in test')
       return text
     }
     const w = world(on, {
       accountFile: ACCOUNT_FILE,
+      ...(opts.store !== undefined ? { store: opts.store } : {}),
       ...(opts.transcript === false ? {} : { transcript: file(undefined), live: { [SUB_TRANSCRIPT]: file('a1') } }),
       duringStep: async step => {
+        const agent = step.agentId !== undefined ? { agentId: step.agentId } : {}
+        for (const line of opts.before ?? []) lines.push({ line, atMs: w.clock.now(), ...agent })
         for (const [uuid, requestId] of blocks(step)) {
-          await $.session.append({ message: { type: 'assistant', role: 'assistant', content: [{ type: 'text', text: 'ok' }] }, door: 'response', origin: { kind: 'model', model: 'claude-haiku-5-5' }, uuid, ...(step.agentId !== undefined ? { agentId: step.agentId } : {}) } as never)
-          if (!opts.never) lines.push({ line: answerRow(uuid, requestId), atMs: w.clock.now() + (opts.lagMs ?? 150), ...(step.agentId !== undefined ? { agentId: step.agentId } : {}) })
+          await $.session.append({ message: { type: 'assistant', role: 'assistant', content: [{ type: 'text', text: 'ok' }] }, door: 'response', origin: { kind: 'model', model: 'claude-haiku-5-5' }, uuid, ...agent } as never)
+          const atMs = w.clock.now() + (opts.lagMs ?? 150)
+          if (!opts.never) lines.push({ line: answerRow(uuid, requestId), atMs, ...(opts.halfMs !== undefined ? { wholeAtMs: atMs + opts.halfMs } : {}), ...agent })
         }
+        for (const a of opts.after ?? []) lines.push({ line: a.line, atMs: w.clock.now() + a.delayMs, ...agent })
       },
     })
     return w
@@ -1863,6 +1879,57 @@ describe("the request ID on the rows built from events", () => {
     await requests($, w, 't2', 1, 'again')
     await w.clock.advance(5_000)
     expect(ids(w, 'api_request')).toEqual(['req_011Same', 'step_t2_0'])
+  })
+
+  test("a turn's second request, its ID not looked for, goes after the first's, which waits for the transcript: in order", keyless, async ($, on) => {
+    const w = transcribed(on, $, step => (step.index === 0 ? [['u-1', 'req_011A']] : []), { lagMs: 450 })
+    await start($)
+    await requests($, w, 't1', 2)
+    await w.clock.advance(5_000)
+    expect(ids(w, 'api_request')).toEqual(['req_011A', 'step_t1_1'])
+    expect(w.built().filter(r => r.attributes['event.name'] === 'api_request').map(r => r.attributes['event.sequence'])).toEqual(
+      [...w.built().filter(r => r.attributes['event.name'] === 'api_request').map(r => r.attributes['event.sequence'])].sort((a, b) => Number(a) - Number(b)),
+    )
+  })
+
+  test('with response.text on, a response row that waits for its ID still carries its text, once', keyless, async ($, on) => {
+    const w = transcribed(on, $, () => [['u-1', 'req_011A']], { lagMs: 450, store: { dataPoints: { 'response.text': 'on' } } })
+    await start($)
+    await requests($, w, 't1')
+    await w.clock.advance(5_000)
+    const responses = w.built().filter(r => r.attributes['event.name'] === 'assistant_response').map(r => [r.attributes['response'], r.attributes['request_id']])
+    expect(responses).toEqual([['ok', 'req_011A']])
+  })
+
+  test('the row is found past what the transcript gained since the request began, read in order: a large row after it, a half-written line, characters of several bytes', keyless, async ($, on) => {
+    const big = JSON.stringify({ type: 'user', uuid: 'u-big', message: { role: 'user', content: [{ type: 'tool_result', content: 'x'.repeat(5 * 1024 * 1024) }] } })
+    const w = transcribed(on, $, () => [['u-1', 'req_011A']], {
+      before: [JSON.stringify({ type: 'user', uuid: 'u-mb', message: { role: 'user', content: 'héllo ✓ 日本語 🙂' } })],
+      // Half there at the second read, whole at the third, with a row of more than one read's length written right after it.
+      halfMs: 100,
+      after: [{ line: big, delayMs: 260 }],
+    })
+    await start($)
+    await requests($, w, 't1')
+    await w.clock.advance(5_000)
+    expect(ids(w, 'api_request')).toEqual(['req_011A'])
+  })
+
+  test("a subagent's request still waiting as the session ends: its rows go at once, after one more read, with the ID that stands for it", keyless, async ($, on) => {
+    const w = transcribed(on, $, () => [['u-1', 'req_011A']], { never: true })
+    await start($)
+    await $.turn.start({ turnId: 't1', text: 'go' } as never)
+    await $.turn.start({ turnId: 't2', text: 'sub', agentId: 'a1' } as never)
+    await ticking(w, (async () => {
+      const stream = $.turn.step({ turnId: 't2', index: 0, model: 'claude-haiku-5-5', messageCount: 1, agentId: 'a1' } as never)
+      while (!(await stream.next()).done) {
+        // Read to its end.
+      }
+    })())
+    const before = w.clock.now()
+    await ticking(w, end($))
+    expect(w.clock.now() - before).toBeLessThanOrEqual(3 * TRANSCRIPT_RETRY_MS)
+    expect(ids(w, 'api_request')).toEqual(['step_t2_0'])
   })
 
   test("the request ID in a transcript's lines: the row's own, where it is the model's and names one", () => {

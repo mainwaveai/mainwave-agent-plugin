@@ -165,6 +165,10 @@ let stepRows = new Map<string, StepRows>()
 /** The built rows of the requests whose ID is looked for in the transcript, sent in order as each is found: a turn's end waits for them. */
 let requestRows: Promise<void> = Promise.resolve()
 let requestRowsPending = 0
+/** The main loop's last built rows in that chain: a main-loop turn's end waits for these alone. */
+let mainRequestRows: Promise<void> = Promise.resolve()
+/** The session is ending: a request's rows still looking for their ID read the transcript once more, then go without it. */
+let requestIdsEnding = false
 /** The request IDs the built rows carried lately: a transcript's ID goes on one request alone. */
 let requestIdsUsed: string[] = []
 /** The grace found no row: the rows are built from the next main-loop turn on, never from the middle of one. */
@@ -1836,7 +1840,7 @@ export async function turnCompleteHook($: TurnCompleteParams[0], e: TurnComplete
     const endMs = await $.clock.now()
     // A main-loop turn's requests' rows still waiting for their ID go first: each sits in the interaction this closes, which keeps
     // the turn's own end. A subagent's sit in its Agent call's run, which stays.
-    if (e.agentId === undefined) await requestRowsSent()
+    if (e.agentId === undefined) await mainRequestRowsSent()
     const r = await rebuildOf($)
     // Calls that ran before the turn began and still wait (the turn made no request): theirs go before it closes.
     if (e.agentId === undefined && earlyCalls.length > 0) await releaseEarlyCalls($, r)
@@ -1881,7 +1885,7 @@ function watched<T, R>(inner: AsyncGenerator<T, R, unknown>, see: (chunk: T) => 
 }
 
 /** A model request streaming now whose rows the plugin builds: where its loop's transcript is, and the model's last row kept since. */
-type StepRows = { at: Promise<{ path: string; from: number } | undefined>; last?: string }
+type StepRows = { at: Promise<{ path: string; from: number } | undefined>; last?: string; overlapped?: boolean }
 
 /**
  * How many times, `TRANSCRIPT_RETRY_MS` apart, the transcript is read for a request's ID after the request ends: Claude Code writes
@@ -1911,29 +1915,42 @@ const utf8Length = (text: string) => new TextEncoder().encode(text).length
 
 /**
  * The ID of the API request that answered with the row `uuid` (`requestIdIn`), read from what the transcript has gained since the
- * request began, as it is written: each read takes up where the last one's whole lines ended. Undefined where the row names none, or is
- * not written within `REQUEST_ID_TRIES` reads, or the transcript can't be read.
+ * request began, in order, as it is written: each read takes up where the last one's whole lines ended, as much as one read takes, so
+ * a large row written after the request's (a tool's result) is read past, not over. Undefined where the row names none, or is not
+ * written within `REQUEST_ID_TRIES` reads (one more once the session is ending), or the transcript can't be read.
  */
 async function requestIdOf($: EngineInterface, at: StepRows['at'], uuid: string): Promise<string | undefined> {
   const where = await at
   if (where === undefined) return undefined
   let from = where.from
   for (let i = 0; i < REQUEST_ID_TRIES; i++) {
-    await $.clock.sleep(TRANSCRIPT_RETRY_MS)
+    const last = requestIdsEnding
+    if (!last) await $.clock.sleep(TRANSCRIPT_RETRY_MS)
     try {
-      const size = (await $.fs.stat(where.path)).size
-      // Written over (a session's transcript starts again elsewhere): not this request's.
-      if (size < from) return undefined
-      if (size === from) continue
-      const start = Math.max(from, size - MAX_READ_BYTES)
-      const text = await ($ as unknown as Newer).fs.read(where.path, { offset: start, length: size - start })
-      const found = requestIdIn(text, uuid)
-      if (found !== null) return found
-      const whole = text.lastIndexOf('\n')
-      if (whole >= 0) from = start + utf8Length(text.slice(0, whole + 1))
+      for (;;) {
+        const size = (await $.fs.stat(where.path)).size
+        // Written over (a session's transcript starts again elsewhere): not this request's.
+        if (size < from) return undefined
+        if (size === from) break
+        const length = Math.min(size - from, MAX_READ_BYTES)
+        const text = await ($ as unknown as Newer).fs.read(where.path, { offset: from, length })
+        const found = requestIdIn(text, uuid)
+        if (found !== null) return found
+        // On from the last whole line, counted back from the read's end: a character the read cut is never counted short.
+        const whole = text.lastIndexOf('\n')
+        if (whole < 0) {
+          if (length < MAX_READ_BYTES) break
+          // One line longer than a read: on past its first part, its row not this one's (`requestIdIn` matched no line).
+          from += length
+          continue
+        }
+        from = from + length - utf8Length(text.slice(whole + 1))
+        if (length < MAX_READ_BYTES) break
+      }
     } catch {
       // Not there yet, or not readable this time: read again.
     }
+    if (last) return undefined
   }
   return undefined
 }
@@ -1944,7 +1961,8 @@ async function requestIdOf($: EngineInterface, at: StepRows['at'], uuid: string)
  * end waits for them (`requestRowsSent`). Else they go now, with the ID that stands for the request's, unless rows still wait: then
  * after them. The transcript's ID goes on one request alone: one some request's rows carried lately is not taken again.
  */
-async function sendRequestRows($: EngineInterface, request: RowIn, response: { row: RowIn; fill: RowFill } | undefined, found: Promise<string | undefined> | undefined): Promise<void> {
+async function sendRequestRows($: EngineInterface, request: RowIn, response: { row: RowIn; fill: RowFill } | undefined, lookup: Promise<string | undefined> | undefined, main: boolean): Promise<void> {
+  const found = lookup?.catch(() => undefined)
   const send = async (read: string | undefined) => {
     const id = read !== undefined && !requestIdsUsed.includes(read) ? read : undefined
     if (id !== undefined) {
@@ -1958,21 +1976,34 @@ async function sendRequestRows($: EngineInterface, request: RowIn, response: { r
   }
   if (found === undefined && requestRowsPending === 0) return send(undefined)
   requestRowsPending += 1
-  const sent = requestRows.then(async () => send(await (found ?? Promise.resolve(undefined)).catch(() => undefined)))
+  const sent = requestRows.then(async () => send(await found))
   requestRows = sent.catch(() => undefined).finally(() => {
     requestRowsPending = Math.max(0, requestRowsPending - 1)
   })
+  if (main) mainRequestRows = requestRows
 }
 
 /** How many request IDs the built rows carried are kept, so none goes on a second request. */
 const REQUEST_IDS_KEPT = 256
 
 /**
- * The built rows of the requests waiting for their ID now, sent: before a main-loop turn's interaction closes, or the session ends.
- * Each waits `REQUEST_ID_TRIES` reads at most, from its request's end.
+ * The built rows of the main loop's requests waiting for their ID now, and those before them, sent: before a main-loop turn's
+ * interaction closes. Each waits `REQUEST_ID_TRIES` reads at most, from its request's end.
  */
+async function mainRequestRowsSent(): Promise<void> {
+  if (requestRowsPending > 0) await mainRequestRows
+}
+
+/** Every built row still waiting for its ID, sent as the session ends: each reads the transcript once more, then goes without it. */
 async function requestRowsSent(): Promise<void> {
-  if (requestRowsPending > 0) await requestRows
+  if (requestRowsPending === 0) return
+  requestIdsEnding = true
+  try {
+    await requestRows
+  } finally {
+    // After a /clear or a resume the process goes on: its next requests look for their IDs again.
+    requestIdsEnding = false
+  }
 }
 
 /**
@@ -2008,7 +2039,12 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
   // Where the request's rows will be written in the transcript, for its built rows' request ID: noted beside the request, never holding it.
   const loop = loopKey(e.agentId)
   const mine: StepRows | undefined = rowless ? { at: transcriptAt($, e.agentId) } : undefined
-  if (mine !== undefined) stepRows.set(loop, mine)
+  if (mine !== undefined) {
+    // A loop streams one request at a time. Were two of one loop to overlap, which response row is whose can't be told: neither looks.
+    const before = stepRows.get(loop)
+    if (before !== undefined) before.overlapped = mine.overlapped = true
+    stepRows.set(loop, mine)
+  }
   try {
     r = await rebuildOf($)
     if (r !== null) {
@@ -2068,7 +2104,8 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
           fill: { attributes: { response: text } },
         }
         dropStreamedText(capture, e.agentId)
-        await sendRequestRows($, request, response, mine?.last !== undefined ? requestIdOf($, mine.at, mine.last) : undefined)
+        const looked = mine?.last !== undefined && !mine.overlapped ? requestIdOf($, mine.at, mine.last) : undefined
+        await sendRequestRows($, request, response, looked, e.agentId === undefined)
       }
     } catch {
       // The request's span goes without its stop reason.
@@ -2571,6 +2608,8 @@ export const register: Register = on => {
   stepRows = new Map()
   requestRows = Promise.resolve()
   requestRowsPending = 0
+  mainRequestRows = Promise.resolve()
+  requestIdsEnding = false
   requestIdsUsed = []
   rowlessPending = false
   loadedAtMs = undefined
