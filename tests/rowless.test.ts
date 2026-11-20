@@ -23,7 +23,7 @@ const HOST_EMAIL = 'host@example.com'
 const BUILT = 'mainwave.telemetry.built_from'
 const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 300, cache_creation_input_tokens: 40, ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 40 }
 
-type World = { messages?: unknown[] | (() => unknown[]); settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown>; transcript?: string | (() => string); promptId?: string | (() => string); duringCall?: (id: string) => Promise<void>; duringStep?: (step: { turnId: string; index: number; agentId?: string }) => Promise<void>; beforeRun?: (id: string) => void; live?: Record<string, () => string>; stepTools?: (step: { agentId?: string }) => string[]; agents?: () => unknown[] }
+type World = { messages?: unknown[] | (() => unknown[]); settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown>; transcript?: string | (() => string); promptId?: string | (() => string); duringCall?: (id: string) => Promise<void>; duringStep?: (step: { turnId: string; index: number; agentId?: string }) => Promise<void>; beforeRun?: (id: string) => void; live?: Record<string, () => string>; stepTools?: (step: { agentId?: string }) => string[]; agents?: () => unknown[] | Promise<unknown[]> }
 
 function world(on: On, opts: World = {}) {
   const clock = mock.clock(on, { now: START })
@@ -109,7 +109,7 @@ function world(on: On, opts: World = {}) {
     return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses, stopReason: toolUses.length > 0 ? 'tool_use' : 'end_turn', usage: { ...USAGE, model: 'claude-haiku-5-5' } } as never
   })
   // The session's subagents, each with its ledger as `agents` says it is at the call.
-  if (opts.agents !== undefined) on('agent.list', () => ({ value: opts.agents!() }) as never)
+  if (opts.agents !== undefined) on('agent.list', async () => ({ value: await opts.agents!() }) as never)
   // The permission check: an ask for a command outside the working folder, and for one a settings hook on the permission request
   // answers (`touch /asked`); an allow for the rest. With `saved`, the answer was saved: the check allows the command outright.
   on('tool.check', (_$, e) => {
@@ -667,6 +667,39 @@ describe("a tool's own model request (WebFetch's, WebSearch's), in the rows buil
     await w.clock.advance(5_000)
     const costs = requests(w).map(r => [r['query_source'], r['cost_usd']])
     expect(costs).toEqual([['repl_main_thread', 0.01], ['web_fetch_apply', 0.008], ['repl_main_thread', 0.03]])
+  })
+
+  test("two of a subagent's calls on one model that end together: one row takes both requests' tokens, none counted twice", keyless, async ($, on) => {
+    let spend = (_usd: number) => 0
+    const haiku = { model: 'claude-haiku-5-5', input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    const w = world(on, {
+      accountFile: ACCOUNT_FILE, costs: [0.01, 0.03],
+      // A reading the engine takes a moment to answer, so the two calls' end readings overlap.
+      agents: async () => {
+        const usage = [{ ...haiku }]
+        await new Promise<void>(r => (globalThis as unknown as { setTimeout: (f: () => void, ms: number) => unknown }).setTimeout(r, 20))
+        return [{ id: 'a1', usage }]
+      },
+      duringCall: async id => {
+        if (!id.startsWith('toolu_q')) return
+        haiku.input_tokens += 900
+        haiku.output_tokens += 40
+        spend(0.002)
+      },
+    })
+    spend = w.spend
+    await start($)
+    await $.turn.start({ turnId: 't1', text: 'go' } as never)
+    await $.turn.start({ turnId: 't2', text: 'sub', agentId: 'a1' } as never)
+    await read($.turn.step({ turnId: 't2', index: 0, model: 'claude-haiku-5-5', messageCount: 1, agentId: 'a1' } as never))
+    await Promise.all(['toolu_q1', 'toolu_q2'].map(id => $.tool.call({ tool: 'WebSearch', query: id, agentId: 'a1', tool_use_id: id } as never)))
+    await read($.turn.step({ turnId: 't2', index: 1, model: 'claude-haiku-5-5', messageCount: 4, agentId: 'a1' } as never))
+    await w.clock.advance(5_000)
+    await end($)
+    const helpers = requests(w).filter(r => r['query_source'] === 'web_search_tool')
+    expect(helpers.map(r => [r['cost_usd'], r['input_tokens'], r['output_tokens']])).toEqual([[0.004, 1800, 80]])
+    const input = points(w.posts).filter(x => x.name === 'claude_code.token.usage' && x.attrs['query_source'] === 'auxiliary' && x.attrs['type'] === 'input')
+    expect(input.reduce((n, x) => n + x.value, 0)).toBe(1800)
   })
 
   test("a subagent's ledger: what grew between two readings, on one model alone", () => {

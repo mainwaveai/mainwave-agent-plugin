@@ -1494,13 +1494,15 @@ async function decideRowless($: EngineInterface): Promise<void> {
 /**
  * The cost the session added while no model request of a turn streamed (a session title, a compaction, a memory or a suggestion
  * after a turn), sent as Claude Code's exporter sends the cost of requests outside the main loop: in `cost.usage`, `query_source`
- * `auxiliary`. Its model and tokens no event says. Nothing while a request streams: its own row takes what the session added.
+ * `auxiliary`. Its model and tokens no event says. Nothing while a request streams, or a WebFetch or WebSearch call runs: its own row
+ * takes what the session added. With `ending`, as the session ends, past a call still running, whose request then has no row.
  */
-async function flushOutsideCost($: EngineInterface): Promise<void> {
-  if (!rowless || stepsInFlight > 0 || helperRuns.size > 0) return
+async function flushOutsideCost($: EngineInterface, ending = false): Promise<void> {
+  const busy = () => stepsInFlight > 0 || (!ending && helperRuns.size > 0)
+  if (!rowless || busy()) return
   const r = await rebuildOf($)
   if (r === null || Object.keys(r.common).length === 0) return
-  const usd = await takeCost($, ({ costUsd }) => (stepsInFlight > 0 || helperRuns.size > 0 ? undefined : costOf(rowlessState, costUsd)))
+  const usd = await takeCost($, ({ costUsd }) => (busy() ? undefined : costOf(rowlessState, costUsd)))
   if (usd === undefined || usd <= 0) return
   const attributes = { ...r.common, query_source: 'auxiliary' }
   await emit($, { spans: [], measures: [{ name: 'claude_code.cost.usage', value: usd, attributes, atMs: await $.clock.now() }] })
@@ -2169,18 +2171,25 @@ function noteLedger($: EngineInterface, agentId: string): void {
  */
 async function helperOf($: EngineInterface, call: { tool: string; id: string; agentId?: string }, runStartMs: number, endMs: number): Promise<HelperFacts | undefined> {
   if (!helperRuns.has(call.id)) return undefined
+  // The reading, once taken, is this request's whatever the timer says; one not taken by then never is, and its share stays.
   let late = false
-  const taken = takeCost($, ({ costUsd }) => (late ? undefined : runCostOf(rowlessState, costUsd))).catch(() => undefined)
-  const share = Promise.race([taken, $.clock.sleep(HEAD_READ_MS).then(() => ((late = true), undefined))])
+  let decided = false
+  const taken = takeCost($, ({ costUsd }) => {
+    if (late) return undefined
+    decided = true
+    return runCostOf(rowlessState, costUsd)
+  }).catch(() => undefined)
+  const share = Promise.race([taken, $.clock.sleep(HEAD_READ_MS).then(() => (decided ? taken : ((late = true), undefined)))])
   const agentId = call.agentId
-  const grown = (async (): Promise<ModelTokens | undefined> => {
-    const before = agentId !== undefined ? agentLedgers.get(agentId) : undefined
-    if (agentId === undefined || before === undefined) return undefined
-    const [was, now] = await Promise.all([before.catch(() => undefined), ledgerOf($, agentId)])
-    // The next call of the subagent still running counts from here.
-    if (now !== undefined) agentLedgers.set(agentId, Promise.resolve(now))
-    return was !== undefined && now !== undefined ? ledgerGrowth(was, now) : undefined
-  })()
+  // The subagent's next reading counts from this one at once, so two calls that end together never count the same tokens twice.
+  const before = agentId !== undefined ? agentLedgers.get(agentId) : undefined
+  let grown: Promise<ModelTokens | undefined> = Promise.resolve(undefined)
+  if (agentId !== undefined && before !== undefined) {
+    const was = before.catch(() => undefined)
+    const now = ledgerOf($, agentId)
+    agentLedgers.set(agentId, Promise.all([was, now]).then(([w, n]) => n ?? w))
+    grown = Promise.all([was, now]).then(([w, n]) => (w !== undefined && n !== undefined ? ledgerGrowth(w, n) : undefined))
+  }
   const [usd, usage] = await Promise.all([share, grown.catch(() => undefined)])
   if ((usd === undefined || usd <= 0) && usage === undefined) return undefined
   return {
@@ -2631,7 +2640,7 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
       // The settings as they stand now: what is queued goes through them as it is sent.
       await readOverrides($)
       await markersMade($)
-      await flushOutsideCost($).catch(() => undefined)
+      await flushOutsideCost($, true).catch(() => undefined)
       await requestRowsSent()
       // Calls that ran before a first turn that never came: theirs go, with no prompt.
       if (earlyCalls.length > 0) await releaseEarlyCalls($, await rebuildOf($)).catch(() => undefined)
