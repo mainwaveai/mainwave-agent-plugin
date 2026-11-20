@@ -175,12 +175,13 @@ let mainTurnOpen = false
 /** A main-loop turn has begun in this load. */
 let mainTurnSeen = false
 /**
- * The load's first main-loop turn, begun with no text and none the transcript held yet: its prompt row is built at its first model
- * request, whose messages the transcript holds by then, timed at the turn's start.
+ * The load's first main-loop turn, begun with no text and no prompt at the transcript's end: its prompt row is built at its first model
+ * request, whose messages the transcript holds by then, timed at the turn's start. The turn may be the rest of one begun before the
+ * plugin's hooks were in place (as in Cowork): there the prompt is read back past the turn's calls.
  */
 let promptLater: { turnId: string; atMs: number } | undefined
 /** How many of the transcript's newest messages a turn begun with no text reads back for its prompt (`personPrompt`). */
-const TRANSCRIPT_WALK = 40
+const TRANSCRIPT_WALK = 500
 /** When each tool call the plugin builds rows for began, by its id, until it ends. */
 let callStarts = new Map<string, number>()
 /** The permission check's verdict on each of those calls (`allow`, `deny` or `ask`), by its id, until it ends. */
@@ -1456,14 +1457,14 @@ function hostFactsOf($: EngineInterface): Promise<HostFacts> {
 }
 
 /**
- * The person's message the transcript's newest turn began with (`personPrompt`), as the text of a turn that began with none: what a host
- * submitted before the plugin's hooks were in place. '' where the newest messages hold none (a tool's results or the model's message
- * come first, or only messages Claude Code inserted itself) or can't be read.
+ * The person's message the transcript's newest turn began with (`personPrompt`, back past the turn's calls with `acrossCalls`), as the
+ * text of a turn that began with none: what a host submitted before the plugin's hooks were in place. '' where the newest messages hold
+ * none, or can't be read.
  */
-async function transcriptPrompt($: EngineInterface): Promise<string> {
+async function transcriptPrompt($: EngineInterface, acrossCalls: boolean): Promise<string> {
   try {
     const newest = await ($ as unknown as Newer).session.messages({ last: TRANSCRIPT_WALK })
-    return Array.isArray(newest) ? personPrompt(newest) : ''
+    return Array.isArray(newest) ? personPrompt(newest, acrossCalls) : ''
   } catch {
     return ''
   }
@@ -1612,9 +1613,10 @@ async function turnText($: EngineInterface, text: string): Promise<string> {
 }
 
 /**
- * The first model request of the load's first turn, where that turn began with no prompt the transcript held: the request's messages
- * are in the transcript now, the person's among them. Its prompt row goes before the request's rows, timed at the turn's start, and
- * the turn's interaction takes its text.
+ * The first model request of the load's first turn, where that turn began with no prompt at the transcript's end: the request's
+ * messages are in the transcript now, the person's among them, read back past what the turn has done (a turn begun before the plugin's
+ * hooks were in place). Its prompt row goes before the request's rows, timed at the turn's start, and the turn's interaction takes its
+ * text.
  */
 async function promptAtFirstStep($: EngineInterface, e: { turnId: string; agentId?: string }): Promise<void> {
   const later = promptLater
@@ -1622,7 +1624,7 @@ async function promptAtFirstStep($: EngineInterface, e: { turnId: string; agentI
   promptLater = undefined
   const r = await rebuildOf($)
   if (r === null || !rowless) return
-  const text = await turnText($, await transcriptPrompt($))
+  const text = await turnText($, await transcriptPrompt($, true))
   if (text === '') return
   if (isCopying()) capturePrompt(capture, text)
   turnPrompted(r, e.turnId, text)
@@ -1647,7 +1649,7 @@ export async function turnStartHook($: TurnStartParams[0], e: TurnStartParams[1]
     const first = e.agentId === undefined && !mainTurnSeen
     if (e.agentId === undefined) mainTurnSeen = true
     if (e.agentId === undefined) await decideRowless($)
-    if (text === '' && first && rowless) text = await transcriptPrompt($)
+    if (text === '' && first && rowless) text = await transcriptPrompt($, false)
     if (e.agentId === undefined) text = await turnText($, text)
     if (e.agentId === undefined && isCopying()) capturePrompt(capture, text)
     // The repository the turn runs in, read again each turn: the session may have moved to another, or the remote changed.

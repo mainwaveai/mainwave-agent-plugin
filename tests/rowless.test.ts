@@ -795,19 +795,43 @@ describe('in Cowork', () => {
     expect(rows.find(r => r.attributes['event.name'] === 'api_request')!.attributes['prompt.id']).toBe(rows.find(r => r.attributes['event.name'] === 'user_prompt')!.attributes['prompt.id'])
   })
 
-  test("the walk back: past the turn's own calls and results and the messages Claude Code inserted, to where an earlier turn ended", () => {
+  test("the walk back: past the turn's own calls, their results and the text Claude Code adds after them, to where an earlier turn ended", () => {
     const reminderOnly = { role: 'user', text: REMINDER, toolUses: [] }
     const person = { role: 'user', text: REMINDER + typed, toolUses: [] }
-    expect(personPrompt([person, reminderOnly, NOTICE])).toBe(REMINDER + typed)
+    const skillBody = { role: 'user', text: 'Base directory for this skill: /skills/docx\n\n# Making documents', toolUses: [] }
+    const imageNote = { role: 'user', text: '[Image: original 1200x800, displayed at 600x400]', toolUses: [] }
+    const across = (ms: unknown[]) => personPrompt(ms as never, true)
+    expect(across([person, reminderOnly, NOTICE])).toBe(REMINDER + typed)
     // A response's text, held apart from the calls that follow it, is the turn's own; an answer no call follows ends it.
-    expect(personPrompt([EARLIER, FINAL, person, SAID, CALLED('toolu_a'), ANSWERED('toolu_a'), NOTICE])).toBe(REMINDER + typed)
-    expect(personPrompt([EARLIER, SAID, CALLED('toolu_a'), ANSWERED('toolu_a')])).toBe('an earlier prompt')
-    expect(personPrompt([EARLIER, CALLED('toolu_a'), ANSWERED('toolu_a'), FINAL, NOTICE])).toBe('')
-    expect(personPrompt([EARLIER, FINAL, { role: 'user', text: 'now this', toolUses: [] }, NOTICE])).toBe('now this')
-    expect(personPrompt([EARLIER, { role: 'user', text: '[Request interrupted by user]', toolUses: [] }])).toBe('')
-    expect(personPrompt([ANSWERED('toolu_a')])).toBe('')
-    expect(personPrompt([reminderOnly])).toBe('')
-    expect(personPrompt([])).toBe('')
+    expect(across([EARLIER, FINAL, person, SAID, CALLED('toolu_a'), ANSWERED('toolu_a'), NOTICE])).toBe(REMINDER + typed)
+    expect(across([EARLIER, SAID, CALLED('toolu_a'), ANSWERED('toolu_a')])).toBe('an earlier prompt')
+    expect(across([EARLIER, CALLED('toolu_a'), ANSWERED('toolu_a'), FINAL, NOTICE])).toBe('')
+    expect(across([EARLIER, FINAL, { role: 'user', text: 'now this', toolUses: [] }, NOTICE])).toBe('now this')
+    // A skill's body and an image's note come right after their call's result: the call's, not the person's.
+    expect(across([person, CALLED('toolu_a'), ANSWERED('toolu_a', 'Launching skill: docx'), skillBody, CALLED('toolu_b'), ANSWERED('toolu_b')])).toBe(REMINDER + typed)
+    expect(across([person, CALLED('toolu_a'), ANSWERED('toolu_a'), imageNote])).toBe(REMINDER + typed)
+    expect(across([EARLIER, { role: 'user', text: '[Request interrupted by user]', toolUses: [] }])).toBe('')
+    expect(across([ANSWERED('toolu_a')])).toBe('')
+    expect(across([reminderOnly])).toBe('')
+    expect(across([])).toBe('')
+    // Without acrossCalls (as a turn begins), only a prompt at the transcript's end, past inserted messages alone.
+    expect(personPrompt([EARLIER, FINAL, person, reminderOnly, NOTICE])).toBe(REMINDER + typed)
+    expect(personPrompt([person, CALLED('toolu_a'), ANSWERED('toolu_a')] as never)).toBe('')
+    expect(personPrompt([person, SAID] as never)).toBe('')
+    expect(personPrompt([person, CALLED('toolu_a'), ANSWERED('toolu_a'), skillBody] as never)).toBe('')
+  })
+
+  test("a load's first turn begun before the hooks were in place takes its prompt past a skill's body, and as its first request begins", keyless, async ($, on) => {
+    const skillBody = { role: 'user', text: 'Base directory for this skill: /skills/docx\n\n# Making documents', toolUses: [] }
+    const begun = [{ role: 'user', text: REMINDER + typed, toolUses: [] }, CALLED('toolu_a'), ANSWERED('toolu_a', 'Launching skill: docx'), skillBody]
+    let reads = 0
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', store: { dataPoints: { 'prompt.text': 'on' } }, messages: () => (reads++, begun) })
+    await start($)
+    await turn($, '', 'toolu_c')
+    await w.clock.advance(5_000)
+    expect(promptsOf(w)).toEqual([[String(typed.length), typed]])
+    // Read as the turn began (its end held no prompt), and again at its first request.
+    expect(reads).toBe(2)
   })
 
   const TRACES: [string, Record<string, string>][] = [['with the beta on', { CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: '1' }], ['where the plugin builds the trace', {}]]
