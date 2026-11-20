@@ -23,7 +23,7 @@ const HOST_EMAIL = 'host@example.com'
 const BUILT = 'mainwave.telemetry.built_from'
 const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 300, cache_creation_input_tokens: 40, ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 40 }
 
-type World = { messages?: unknown[] | (() => unknown[]); settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown>; transcript?: string | (() => string); promptId?: string | (() => string); duringCall?: (id: string) => Promise<void>; duringStep?: (step: { turnId: string; index: number; agentId?: string }) => Promise<void>; live?: Record<string, () => string>; stepTools?: (step: { agentId?: string }) => string[]; agents?: () => unknown[] }
+type World = { messages?: unknown[] | (() => unknown[]); settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown>; transcript?: string | (() => string); promptId?: string | (() => string); duringCall?: (id: string) => Promise<void>; duringStep?: (step: { turnId: string; index: number; agentId?: string }) => Promise<void>; beforeRun?: (id: string) => void; live?: Record<string, () => string>; stepTools?: (step: { agentId?: string }) => string[]; agents?: () => unknown[] }
 
 function world(on: On, opts: World = {}) {
   const clock = mock.clock(on, { now: START })
@@ -113,6 +113,8 @@ function world(on: On, opts: World = {}) {
   // The permission check: an ask for a command outside the working folder, and for one a settings hook on the permission request
   // answers (`touch /asked`); an allow for the rest. With `saved`, the answer was saved: the check allows the command outright.
   on('tool.check', (_$, e) => {
+    // What the session spends before a call runs (a classifier asked about it).
+    opts.beforeRun?.((e as { tool_use_id?: string }).tool_use_id ?? '')
     const command = (e as { input?: { command?: string } }).input?.command
     if (command === 'touch /outside') return { decision: 'ask', reason: 'needs approval' } as never
     if (command?.startsWith('touch /asked')) return (opts.saved ? { decision: 'allow', rule: 'Bash(touch:*)' } : { decision: 'ask', reason: 'needs approval' }) as never
@@ -571,7 +573,11 @@ describe("a tool's own model request (WebFetch's, WebSearch's), in the rows buil
 
   test("a WebFetch call's request in the main loop: a row and span of its own, its cost its own and not the next request's", keyless, async ($, on) => {
     let spend = (_usd: number) => 0
-    const w = world(on, { accountFile: ACCOUNT_FILE, env: { CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: '1' }, costs: [0.01, 0.03], duringCall: async id => void (id === 'toolu_w' && spend(0.004)) })
+    // What the session spends before the call's run (a classifier's request about it) goes with the next request, as before.
+    const w = world(on, {
+      accountFile: ACCOUNT_FILE, env: { CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: '1' }, costs: [0.01, 0.03],
+      beforeRun: id => void (id === 'toolu_w' && spend(0.001)), duringCall: async id => void (id === 'toolu_w' && spend(0.004)),
+    })
     spend = w.spend
     await start($)
     await callTurn($, { tool: 'WebFetch', url: 'https://example.com/a', prompt: 'Summarize', tool_use_id: 'toolu_w' })
@@ -579,7 +585,7 @@ describe("a tool's own model request (WebFetch's, WebSearch's), in the rows buil
     await end($)
     // Between the call's decision and its result, as Claude Code logs it.
     expect(w.built().map(event)).toEqual(['user_prompt', 'api_request', 'assistant_response', 'tool_decision', 'api_request', 'tool_result', 'api_request', 'assistant_response'])
-    expect(requests(w).map(r => r['cost_usd'])).toEqual([0.01, 0.004, 0.03])
+    expect(requests(w).map(r => r['cost_usd'])).toEqual([0.01, 0.004, 0.031])
     const helper = requests(w)[1]!
     expect(helper).toEqual(expect.objectContaining({ query_source: 'web_fetch_apply', request_id: 'helper_toolu_w', cost_usd: 0.004, cost_usd_micros: 4000, duration_ms: 25 }))
     // No event of the main loop's says the request's model or tokens.
@@ -598,7 +604,7 @@ describe("a tool's own model request (WebFetch's, WebSearch's), in the rows buil
     // Its cost counts as Claude Code's exporter counts a request outside the main loop and its subagents'.
     const cost = points(w.posts).filter(x => x.name === 'claude_code.cost.usage')
     expect(cost.find(x => x.attrs['query_source'] === 'auxiliary')?.value).toBe(0.004)
-    expect(Math.abs(cost.reduce((n, x) => n + x.value, 0) - 0.044)).toBeLessThan(1e-9)
+    expect(Math.abs(cost.reduce((n, x) => n + x.value, 0) - 0.045)).toBeLessThan(1e-9)
   })
 
   test("a WebSearch call's request in a subagent: its model and tokens, what the subagent's ledger grew by over the call", keyless, async ($, on) => {
@@ -634,7 +640,10 @@ describe("a tool's own model request (WebFetch's, WebSearch's), in the rows buil
 
   test('a call that made no request, or failed, builds none: what the session spent meanwhile stays with the next reading', keyless, async ($, on) => {
     let spend = (_usd: number) => 0
-    const w = world(on, { accountFile: ACCOUNT_FILE, costs: [0.01, 0.03, 0.05, 0.07], duringCall: async id => void (id === 'toolu_bad' && spend(0.004)) })
+    const w = world(on, {
+      accountFile: ACCOUNT_FILE, costs: [0.01, 0.03, 0.05, 0.07],
+      duringCall: async id => void (id === 'toolu_bad' && spend(0.004)),
+    })
     spend = w.spend
     await start($)
     // Nothing grew while it ran (a page it answered without asking the model).
@@ -644,6 +653,20 @@ describe("a tool's own model request (WebFetch's, WebSearch's), in the rows buil
     await w.clock.advance(5_000)
     expect(requests(w).map(r => r['query_source'])).toEqual(['repl_main_thread', 'repl_main_thread', 'repl_main_thread', 'repl_main_thread'])
     expect(requests(w).map(r => r['cost_usd'])).toEqual([0.01, 0.03, 0.05, 0.074])
+  })
+
+  test('two calls whose requests both end before either call does: the first to end takes both shares, the other has no row, the total stands', keyless, async ($, on) => {
+    let spend = (_usd: number) => 0
+    const w = world(on, { accountFile: ACCOUNT_FILE, costs: [0.01, 0.03], duringCall: async id => void (id.startsWith('toolu_p') && spend(0.004)) })
+    spend = w.spend
+    await start($)
+    await $.turn.start({ turnId: 't1', text: 'go' } as never)
+    await read($.turn.step({ turnId: 't1', index: 0, model: 'claude-haiku-5-5', messageCount: 1 } as never))
+    await Promise.all(['toolu_p1', 'toolu_p2'].map(id => $.tool.call({ tool: 'WebFetch', url: `https://example.com/${id}`, prompt: 'x', tool_use_id: id } as never)))
+    await read($.turn.step({ turnId: 't1', index: 1, model: 'claude-haiku-5-5', messageCount: 4 } as never))
+    await w.clock.advance(5_000)
+    const costs = requests(w).map(r => [r['query_source'], r['cost_usd']])
+    expect(costs).toEqual([['repl_main_thread', 0.01], ['web_fetch_apply', 0.008], ['repl_main_thread', 0.03]])
   })
 
   test("a subagent's ledger: what grew between two readings, on one model alone", () => {
@@ -660,6 +683,7 @@ describe("a tool's own model request (WebFetch's, WebSearch's), in the rows buil
     expect(ledgerGrowth([u('m1', 100)], [u('m1', 100)])).toBeUndefined()
     expect(ledgerGrowth([u('m1', 100)], [u('m1', 120), u('m2', 50)])).toBeUndefined()
     expect(ledgerGrowth([u('m1', 100)], [u('m1', 40)])).toBeUndefined()
+    expect(ledgerGrowth([u('m1', 100), u('m2', 10)], [u('m1', 120)])).toBeUndefined()
   })
 
   test("a tool's own request's row: its source by the tool, an ID of the call's that is never an API request's, and only what is known", () => {

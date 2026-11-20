@@ -567,7 +567,9 @@ function namedRun(r: Rebuild, row: RowIn): void {
   const ctx = validCtx(row.span)
   const call = ctx ? helperCallOf(r, row) : undefined
   const tool = call !== undefined ? r.tools.get(call) : undefined
-  if (ctx && tool && !tool.sent && tool.execId === undefined) tool.execId = respan(r, ctx.spanId)
+  // Never a span another row named (an interaction, a decision): only one no other span of the plugin's has taken.
+  if (!ctx || !tool || tool.sent || tool.execId !== undefined || r.knownIds.has(ctx.spanId) || r.interactionIds.has(ctx.spanId)) return
+  tool.execId = respan(r, ctx.spanId)
 }
 
 /**

@@ -256,8 +256,11 @@ export function madeCommit(reported: readonly string[], head: MadeCommit | undef
   return head !== undefined && reported.some(short => head.commitId.startsWith(short)) ? head : undefined
 }
 
-/** The state the rows are built with, one per load: their sequence, the turn's prompt id, and the session's cost at the last request. */
-export type Rowless = { sequence: number; promptId?: string; costUsd?: number }
+/**
+ * The state the rows are built with, one per load: their sequence, the turn's prompt id, the session's cost at the last reading, and
+ * what it grew by before a tool's run that no request has taken yet (`holdCost`).
+ */
+export type Rowless = { sequence: number; promptId?: string; costUsd?: number; heldUsd?: number }
 
 export const newRowless = (): Rowless => ({ sequence: 0 })
 
@@ -538,11 +541,36 @@ const whole = (n: unknown): number | undefined => (typeof n === 'number' && Numb
  * A reading below the last means the session's cost started over (a /clear): all of it is new. Undefined where it could not be read.
  */
 export function costOf(state: Rowless, sessionCostUsd: number | undefined): number | undefined {
+  const grown = growth(state, sessionCostUsd)
+  if (grown === undefined) return undefined
+  const held = state.heldUsd ?? 0
+  delete state.heldUsd
+  return round(grown + held)
+}
+
+/**
+ * A reading taken as a tool's run begins (`runCostOf` takes the run's own at its end): what the session's cost grew by before it is
+ * held for the next request's share, as it would have gone without the reading.
+ */
+export function holdCost(state: Rowless, sessionCostUsd: number | undefined): void {
+  const grown = growth(state, sessionCostUsd)
+  if (grown !== undefined && grown > 0) state.heldUsd = round((state.heldUsd ?? 0) + grown)
+}
+
+/** What the session's cost grew by since the last reading, as a tool's run ends: the run's own, whatever is held stays held. */
+export function runCostOf(state: Rowless, sessionCostUsd: number | undefined): number | undefined {
+  return growth(state, sessionCostUsd)
+}
+
+const round = (usd: number) => Math.round(usd * 1e10) / 1e10
+
+/** The growth since the last reading, which moves the baseline; a reading below it, a cost started over, is all new. */
+function growth(state: Rowless, sessionCostUsd: number | undefined): number | undefined {
   if (sessionCostUsd === undefined || !Number.isFinite(sessionCostUsd) || sessionCostUsd < 0) return undefined
   const before = state.costUsd ?? 0
   state.costUsd = sessionCostUsd
   if (sessionCostUsd < before) return sessionCostUsd
-  return Math.round((sessionCostUsd - before) * 1e10) / 1e10
+  return round(sessionCostUsd - before)
 }
 
 /**
@@ -643,10 +671,13 @@ const TOKEN_KEYS = ['input_tokens', 'output_tokens', 'cache_read_input_tokens', 
 
 /**
  * What a subagent's ledger grew by between two readings: the one model whose counts grew, and by how much. Undefined where none grew,
- * where more than one did (which counts went to which request no reading says), or where a count went down (the ledger started over).
+ * where more than one did (which counts went to which request no reading says), or where a count went down or a model left it (the
+ * ledger started over).
  */
 export function ledgerGrowth(before: readonly ModelTokens[], after: readonly ModelTokens[]): ModelTokens | undefined {
   const was = new Map(before.map(u => [u.model, u]))
+  // A model the ledger had and has no longer: it started over.
+  if (before.some(b => !after.some(u => u.model === b.model))) return undefined
   const grown: ModelTokens[] = []
   for (const u of after) {
     const b = was.get(u.model)
@@ -665,7 +696,7 @@ export function ledgerGrowth(before: readonly ModelTokens[], after: readonly Mod
 
 /**
  * What one tool's own model request (`HELPER_SOURCES`) is known by: the call it was made in, the run it fits in, its cost (what the
- * session's grew by over the run, `costOf`), and, in a subagent, its model and tokens (what the subagent's ledger grew by over the run,
+ * session's grew by over the run, `runCostOf`), and, in a subagent, its model and tokens (what the subagent's ledger grew by over the run,
  * `ledgerGrowth`). The main loop has no ledger of its own a plugin can read, so there its model and tokens go unsaid.
  */
 export type HelperFacts = {

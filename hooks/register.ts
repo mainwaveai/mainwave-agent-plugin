@@ -48,7 +48,7 @@ import {
   agentSpawned, callerCtx, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolJoinsTurn, toolStart, turnComplete, turnPrompted, turnStart, waits, type Emit, type Rebuild, type RowIn,
 } from './rebuild.ts'
 import {
-  accountDeviceOf, agentLedgerOf, agentTranscriptPath, costOf, decisionOf, decisionRow, headOf, hostIdentityOf, joinPath, madeCommit, newRowless, promptIdFrom, promptRow, providerOf, remoteSessionIdOf, repoAttributes, requestIdIn, requestRow, responseRow,
+  accountDeviceOf, agentLedgerOf, agentTranscriptPath, costOf, holdCost, runCostOf, decisionOf, decisionRow, headOf, hostIdentityOf, joinPath, madeCommit, newRowless, promptIdFrom, promptRow, providerOf, remoteSessionIdOf, repoAttributes, requestIdIn, requestRow, responseRow,
   handoffPrompt, handoverIn, helperRow, hostContinue, ledgerGrowth, permissionRules, personPrompt, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, stepRequestId, typedText, uuidOf, type Handover, type HostFacts, type HostIdentityEnv, type HelperFacts, type MadeCommit, type ModelTokens, type Rowless, type Verdict,
 } from './rowless.ts'
 import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsPending, settingsSummary, settingsUnavailable } from './orgsettings.ts'
@@ -163,11 +163,17 @@ let stepsInFlight = 0
  */
 let stepRows = new Map<string, StepRows>()
 /**
- * Each subagent's ledger (`$.agent.list()`'s tokens by model) as last read, while the plugin builds the rows: read as a step of its
- * ends that called a tool which makes a model request of its own (`HELPER_SOURCES`), and again as each such call ends, so what the
- * ledger grew by over the run is that request's (`ledgerGrowth`).
+ * The WebFetch and WebSearch calls running now whose rows the plugin builds, by call, with the loop each runs in: each makes a model
+ * request of its own in its run (`HELPER_SOURCES`), whose share of the session's cost is read from its run's start to its end.
+ */
+let helperRuns = new Map<string, { agentId?: string }>()
+/**
+ * Each subagent's ledger (`$.agent.list()`'s tokens by model) as last read while such a call of its runs: as the first of them begins
+ * to run, and again as each ends, so what the ledger grew by is the requests' of the calls that ran (`ledgerGrowth`).
  */
 let agentLedgers = new Map<string, Promise<ModelTokens[] | undefined>>()
+/** The subagents whose ledger is read once the step streaming now in their loop ends: a call it asked for began to run before it did. */
+let ledgerWaits = new Set<string>()
 /** The built rows of the requests whose ID is looked for in the transcript, sent in order as each is found: a turn's end waits for them. */
 let requestRows: Promise<void> = Promise.resolve()
 let requestRowsPending = 0
@@ -1302,6 +1308,10 @@ async function nextSession($: EngineInterface): Promise<void> {
   // sent already, a /clear starts over or carries on. What the ended session spent last went as it ended.
   seedSince = { atMs: await $.clock.now(), ...(rowlessState.costUsd !== undefined ? { previous: rowlessState.costUsd } : {}) }
   rowlessState = newRowless()
+  // The readings of a tool's run start over with the session's: a call still running has no row of its request.
+  helperRuns = new Map()
+  agentLedgers = new Map()
+  ledgerWaits = new Set()
   await startServers($)
 }
 
@@ -1487,10 +1497,10 @@ async function decideRowless($: EngineInterface): Promise<void> {
  * `auxiliary`. Its model and tokens no event says. Nothing while a request streams: its own row takes what the session added.
  */
 async function flushOutsideCost($: EngineInterface): Promise<void> {
-  if (!rowless || stepsInFlight > 0) return
+  if (!rowless || stepsInFlight > 0 || helperRuns.size > 0) return
   const r = await rebuildOf($)
   if (r === null || Object.keys(r.common).length === 0) return
-  const usd = await takeCost($, ({ costUsd }) => (stepsInFlight > 0 ? undefined : costOf(rowlessState, costUsd)))
+  const usd = await takeCost($, ({ costUsd }) => (stepsInFlight > 0 || helperRuns.size > 0 ? undefined : costOf(rowlessState, costUsd)))
   if (usd === undefined || usd <= 0) return
   const attributes = { ...r.common, query_source: 'auxiliary' }
   await emit($, { spans: [], measures: [{ name: 'claude_code.cost.usage', value: usd, attributes, atMs: await $.clock.now() }] })
@@ -2079,6 +2089,8 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
   } finally {
     stepsInFlight = Math.max(0, stepsInFlight - 1)
     if (stepRows.get(loop) === mine) stepRows.delete(loop)
+    // A call of a subagent's that began to run while this step streamed: the ledger is read now, the step's own tokens in it.
+    if (e.agentId !== undefined && ledgerWaits.delete(e.agentId)) noteLedger($, e.agentId)
   }
   try {
     firstStepAtMs ??= await $.clock.now()
@@ -2114,8 +2126,6 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
         const looked = mine?.last !== undefined && !mine.overlapped ? requestIdOf($, mine.at, mine.last) : undefined
         await sendRequestRows($, request, response, looked, e.agentId === undefined)
       }
-      // A subagent's step that called a tool which makes a request of its own: its ledger as the step ended, before that request.
-      if (rowless && e.agentId !== undefined && result?.toolUses?.some(t => HELPER_SOURCES[t.name] !== undefined)) noteLedger($, e.agentId)
     } catch {
       // The request's span goes without its stop reason.
     }
@@ -2123,16 +2133,28 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
   return result
 }
 
-/** A subagent's ledger as `$.agent.list()` answers it now; undefined where it can't be read. */
+/** A subagent's ledger as `$.agent.list()` answers it now; undefined where it can't be read, or not within half a second. */
 async function ledgerOf($: EngineInterface, agentId: string): Promise<ModelTokens[] | undefined> {
-  try {
-    return agentLedgerOf(await ($ as unknown as { agent: { list: () => Promise<unknown> } }).agent.list(), agentId)
-  } catch {
-    return undefined
-  }
+  const read = ($ as unknown as { agent: { list: () => Promise<unknown> } }).agent.list().then(list => agentLedgerOf(list, agentId), () => undefined)
+  return Promise.race([read, $.clock.sleep(HEAD_READ_MS).then(() => undefined)]).catch(() => undefined)
 }
 
-/** Reads a subagent's ledger now, as the reading its next tool's own request is counted from. */
+/**
+ * A WebFetch or WebSearch call begins to run, its rows built: the reading its request's share starts from. As the first such call
+ * begins, what the session's cost grew by before it is held for the next request (`holdCost`), and its subagent's ledger is read. The
+ * run waits for the cost's reading, half a second at most: one that comes later is taken where it falls.
+ */
+async function helperStarts($: EngineInterface, id: string, agentId: string | undefined): Promise<void> {
+  const first = helperRuns.size === 0
+  const agentFirst = agentId !== undefined && ![...helperRuns.values()].some(h => h.agentId === agentId)
+  helperRuns.set(id, agentId !== undefined ? { agentId } : {})
+  // A tool may begin to run while the step that asked for it still streams: its ledger is read once that step has ended.
+  if (agentFirst && stepRows.has(loopKey(agentId))) ledgerWaits.add(agentId)
+  else if (agentFirst) noteLedger($, agentId)
+  if (first) await Promise.race([takeCost($, ({ costUsd }) => holdCost(rowlessState, costUsd)).catch(() => undefined), $.clock.sleep(HEAD_READ_MS)])
+}
+
+/** Reads a subagent's ledger now: the reading its running calls' requests are counted from. */
 function noteLedger($: EngineInterface, agentId: string): void {
   agentLedgers.delete(agentId)
   agentLedgers.set(agentId, ledgerOf($, agentId))
@@ -2141,27 +2163,41 @@ function noteLedger($: EngineInterface, agentId: string): void {
 
 /**
  * What the request a WebFetch or WebSearch call made in its run cost, read as the call ends: what the session's cost grew by since the
- * last reading (`costOf`), so it is this request's, not the next one's; and in a subagent, its model and tokens, what the subagent's
- * ledger grew by since it was last read. Undefined where the call made none (nothing grew) or none of it could be read.
+ * last reading, the run's (`runCostOf`), so it is this request's, not the next one's; and in a subagent, its model and tokens, what the
+ * subagent's ledger grew by since it was last read (`ledgerGrowth`). Undefined where the call made none (nothing grew) or none of it
+ * could be read. It waits half a second at most for a reading: one that comes later is not taken, and its share goes to the next.
  */
 async function helperOf($: EngineInterface, call: { tool: string; id: string; agentId?: string }, runStartMs: number, endMs: number): Promise<HelperFacts | undefined> {
-  return takeCost($, async ({ costUsd }) => {
-    const share = costOf(rowlessState, costUsd)
-    let usage: ModelTokens | undefined
-    const agentId = call.agentId
+  if (!helperRuns.has(call.id)) return undefined
+  let late = false
+  const taken = takeCost($, ({ costUsd }) => (late ? undefined : runCostOf(rowlessState, costUsd))).catch(() => undefined)
+  const share = Promise.race([taken, $.clock.sleep(HEAD_READ_MS).then(() => ((late = true), undefined))])
+  const agentId = call.agentId
+  const grown = (async (): Promise<ModelTokens | undefined> => {
     const before = agentId !== undefined ? agentLedgers.get(agentId) : undefined
-    if (agentId !== undefined && before !== undefined) {
-      const was = await before.catch(() => undefined)
-      const now = await ledgerOf($, agentId)
-      if (now !== undefined) agentLedgers.set(agentId, Promise.resolve(now))
-      if (was !== undefined && now !== undefined) usage = ledgerGrowth(was, now)
-    }
-    if ((share === undefined || share <= 0) && usage === undefined) return undefined
-    return {
-      tool: call.tool, toolUseId: call.id, ...(agentId !== undefined ? { agentId } : {}), runStartMs, endMs,
-      ...(share !== undefined ? { costUsd: share } : {}), ...(usage !== undefined ? { usage } : {}),
-    }
-  })
+    if (agentId === undefined || before === undefined) return undefined
+    const [was, now] = await Promise.all([before.catch(() => undefined), ledgerOf($, agentId)])
+    // The next call of the subagent still running counts from here.
+    if (now !== undefined) agentLedgers.set(agentId, Promise.resolve(now))
+    return was !== undefined && now !== undefined ? ledgerGrowth(was, now) : undefined
+  })()
+  const [usd, usage] = await Promise.all([share, grown.catch(() => undefined)])
+  if ((usd === undefined || usd <= 0) && usage === undefined) return undefined
+  return {
+    tool: call.tool, toolUseId: call.id, ...(agentId !== undefined ? { agentId } : {}), runStartMs, endMs,
+    ...(usd !== undefined ? { costUsd: usd } : {}), ...(usage !== undefined ? { usage } : {}),
+  }
+}
+
+/** A WebFetch or WebSearch call ended, however: it no longer runs, and its subagent's ledger is let go once none of its calls does. */
+function helperEnds(id: string): void {
+  const run = helperRuns.get(id)
+  if (run === undefined) return
+  helperRuns.delete(id)
+  if (run.agentId !== undefined && ![...helperRuns.values()].some(h => h.agentId === run.agentId)) {
+    agentLedgers.delete(run.agentId)
+    ledgerWaits.delete(run.agentId)
+  }
 }
 
 /** The call's own arguments, and who made it: what the engine adds beside the arguments is not the tool's input. */
@@ -2271,7 +2307,10 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
   try {
     result = await next(e)
   } catch (err) {
-    if (id !== undefined) earlyRunning.delete(id)
+    if (id !== undefined) {
+      earlyRunning.delete(id)
+      helperEnds(id)
+    }
     throw err
   } finally {
     if (withArgs) argsInFlight -= 1
@@ -2342,8 +2381,11 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
       // The call's spans go with what the rows say.
     }
   }
-  // Held by now where it waits, or sent: no longer running before the first turn.
-  if (id !== undefined) earlyRunning.delete(id)
+  // Held by now where it waits, or sent: no longer running before the first turn; its request's reading, if any, taken.
+  if (id !== undefined) {
+    earlyRunning.delete(id)
+    helperEnds(id)
+  }
   // A refused or failed call makes no marker.
   try {
     if (ended !== undefined && result.deny === undefined && result.isError !== true && isCopying() && mayMark(ended)) {
@@ -2403,13 +2445,16 @@ export async function toolJudgeHook($: ToolJudgeParams[0], e: ToolJudgeParams[1]
 /**
  * A call was allowed and is about to run, while the plugin builds the rows: when, which ends the wait for its permission
  * (`claude_code.tool.blocked_on_user`) and starts its run. After an ask someone answered, the check is asked again, beside the call,
- * whether it now allows the call outright: the answer was saved. The call runs untouched, and nothing here holds it.
+ * whether it now allows the call outright: the answer was saved. The call runs untouched; nothing here holds it but a WebFetch or
+ * WebSearch call's, for the reading of the session's cost its request's share starts from (`helperStarts`), half a second at most.
  */
 export async function toolRunHook($: ToolRunParams[0], e: ToolRunParams[1], next: ToolRunParams[2]) {
   try {
     const id = e.tool_use_id
     if (typeof id === 'string' && callStarts.has(id)) {
       runs.set(id, await $.clock.now())
+      // A WebFetch or WebSearch call, its rows built: its request's share is read from here.
+      if (rowless && HELPER_SOURCES[e.tool] !== undefined) await helperStarts($, id, typeof e.agentId === 'string' && e.agentId !== '' ? e.agentId : undefined)
       if (runs.size > MAX_VERDICTS) runs.delete(runs.keys().next().value!)
       const v = verdicts.get(id)
       if (v?.decision === 'ask' && (v.approver === 'person' || v.approver === 'host') && judgments.get(id) !== 'allow') {
@@ -2663,7 +2708,9 @@ export const register: Register = on => {
   rowsAtLoad = null
   stepsInFlight = 0
   stepRows = new Map()
+  helperRuns = new Map()
   agentLedgers = new Map()
+  ledgerWaits = new Set()
   requestRows = Promise.resolve()
   requestRowsPending = 0
   mainRequestRows = Promise.resolve()

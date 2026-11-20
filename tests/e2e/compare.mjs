@@ -965,6 +965,8 @@ function traceShape(spans, subagents = true) {
         const tool = HELPER_TOOL[s.attrs.query_source_safe?.v]
         if (tool !== undefined) {
           if (parent?.name !== 'claude_code.tool.execution' || callOf.get(parent.attrs.tool_use_id?.v)?.attrs.tool_name?.v !== tool) note(`a request of ${tool}'s own not under its call's run`, s)
+          // A built one names its call (`helper_<call>`): it must sit in that call's run, not another's.
+          else if (String(s.attrs.request_id?.v).startsWith('helper_') && s.attrs.request_id.v !== `helper_${parent.attrs.tool_use_id?.v}`) note(`a request of ${tool}'s own under another call's run`, s)
         } else if (s.attrs['llm_request.context']?.v === 'standalone') {
           if (s.parentSpanId) note('a standalone request with a parent', s)
         } else if (agent === undefined ? parent?.name !== 'claude_code.interaction' : parent?.name !== 'claude_code.tool.execution' || callOf.get(parent.attrs.tool_use_id?.v)?.attrs.tool_name?.v !== 'Agent') {
@@ -1272,11 +1274,16 @@ function checkRowless(pass, { captured, run }, reference) {
   const points = pointsOf(captured.plugin.metrics)
   const theirPoints = pointsOf(captured.exporter.metrics)
   const total = (list, name, type) => list.filter(p => p.name === name && (type === undefined || p.attrs.type?.v === type)).reduce((n, p) => n + p.value, 0)
-  // The main loop's tools' own requests' tokens, as this session's exporter's spans of them count them: no event says them.
-  const unsaidSpans = spansOf(captured.exporter.traces).filter(s => s.name === 'claude_code.llm_request' && helperSource(s.attrs.query_source_safe?.v) && s.attrs.agent_id === undefined)
+  // The main loop's tools' own requests' tokens, as this session's exporter's spans of them count them: no event says them; nor any
+  // other request outside a conversation (a title, a summary), which the exporter counts as auxiliary too.
+  const unsaidSpans = spansOf(captured.exporter.traces).filter(s => {
+    if (s.name !== 'claude_code.llm_request') return false
+    const qs = s.attrs.query_source_safe?.v
+    return helperSource(qs) ? s.attrs.agent_id === undefined : !stepSource(String(qs ?? '').replaceAll('.', ':'))
+  })
   for (const [type, key] of [['input', 'input_tokens'], ['output', 'output_tokens'], ['cacheRead', 'cache_read_tokens'], ['cacheCreation', 'cache_creation_tokens']]) {
     const [got, want] = [total(points, 'claude_code.token.usage', type), total(theirPoints, 'claude_code.token.usage', type) - unsaidSpans.reduce((n, s) => n + Number(s.attrs[key]?.v ?? 0), 0)]
-    if (got !== want) problems.push(`metrics: token.usage ${type} sums to ${got}, the exporter's to ${want} (the main loop's tools' own requests aside)`)
+    if (got !== want) problems.push(`metrics: token.usage ${type} sums to ${got}, the exporter's to ${want} (the main loop's tools' own requests, and requests outside a conversation, aside)`)
   }
   const [metricCost, metricCostWant] = [total(points, 'claude_code.cost.usage'), total(theirPoints, 'claude_code.cost.usage')]
   if (Math.abs(metricCost - metricCostWant) > 0.001 * Math.max(metricCostWant, 1e-6)) problems.push(`metrics: cost.usage sums to ${metricCost}, the exporter's to ${metricCostWant}`)
