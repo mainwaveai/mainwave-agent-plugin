@@ -30,6 +30,12 @@
 // its turn ends on an API error, and the plugin must send one failure marker carrying the kind the session's transcript records (from
 // 2.1.326; on 2.1.325 and earlier, which give a plugin no `$.session.info`, none), though `claude -p` exits as the turn ends.
 //
+// The last session is Cowork's handoff, as near as `claude -p` comes to it: a conversation begun in chat moves to Cowork, which
+// writes the chat's rows into the transcript (the person's prompt, a call and its result, a call cut off) and has Claude Code take
+// the turn over, begun with no text. The session resumes such a transcript with the cut-off turn taken up, in Cowork, no row of
+// Claude Code's reaching the plugin, the content on; a test-only plugin records how the turn began. The plugin's one prompt row must
+// carry what the person typed, without Cowork's reminder, found behind the chat's calls, and every row of the turn its prompt's id.
+//
 // The plugin asks Mainwave for its organization's data collection settings once the rows name the organization and email, on the API
 // beside the collector the copy goes to. In the keyless pass that is production's API, which the test-only hooks send here too, and
 // the receiver answers as Mainwave's settings API would, with settings that turn a metadata data point off (`file.kind`) and add a
@@ -57,8 +63,8 @@
 // organization's settings reach it but the explicit settings above.
 
 import { execFileSync, spawn } from 'node:child_process'
-import { createHash } from 'node:crypto'
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash, randomUUID } from 'node:crypto'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
@@ -163,6 +169,11 @@ function modelReply(req) {
   const tools = (req.tools ?? []).map(t => t?.name)
   const results = (req.messages ?? []).flatMap(m => (Array.isArray(m.content) ? m.content.filter(b => b?.type === 'tool_result') : []))
   const call = (name, input) => ({ type: 'tool_use', id: `toolu_e2e_${messageId}`, name, input })
+  // The handoff's turn: the chat's calls came before it; the model makes a call of its own, then answers.
+  if (tools.includes('Bash') && first.includes('E2E_HANDOFFTASK')) {
+    const own = (req.messages ?? []).some(m => Array.isArray(m.content) && m.content.some(b => b?.type === 'tool_use' && String(b.id).startsWith('toolu_e2e_')))
+    return own ? { id, blocks: [{ type: 'text', text: 'ok' }], stop: 'end_turn', usage } : { id, blocks: [call('Bash', { command: 'echo e2e', description: 'Print e2e' })], stop: 'tool_use', usage }
+  }
   let script = []
   if (tools.includes('Bash') && first.includes('E2E_SUBTASK')) script = [call('Bash', { command: 'echo sub', description: 'Print sub' })]
   else if (tools.includes('Bash') && first.includes('E2E_MAINTASK')) {
@@ -270,8 +281,9 @@ function testPlugin(name, source, description) {
 }
 const redirect = testPlugin('redirect', 'redirect.ts', "Test only: sends the mainwave plugin's requests to Mainwave's production collector to the local receiver the end-to-end comparison runs.")
 const skip = testPlugin('skip', 'skip.ts', "Test only: keeps Claude Code's collector rows from the mainwave plugin, as Claude Code's security default does.")
+const observe = testPlugin('observe', 'observe.ts', 'Test only: records how each main-loop turn began, and each prompt submitted, for the end-to-end comparison.')
 // Removed however the run ends: a session that throws, or an interrupt, leaves nothing behind.
-process.on('exit', () => [redirect, skip].forEach(d => rmSync(d, { recursive: true, force: true })))
+process.on('exit', () => [redirect, skip, observe].forEach(d => rmSync(d, { recursive: true, force: true })))
 process.on('SIGINT', () => process.exit(130))
 
 const server = createServer(async (req, res) => {
@@ -331,12 +343,52 @@ const base = `http://127.0.0.1:${server.address().port}`
 
 // ── The session ──────────────────────────────────────────────────────────────
 
+/** What the person typed in the chat the handoff took over, and the reminder Cowork puts ahead of it, in a block of its own. */
+const HANDOFF_PROMPT = 'E2E_HANDOFFTASK: look for a notes file, print e2e, then say ok.'
+const HANDOFF_REMINDER = "<system-reminder>The user's timezone is UTC (UTC+00:00). Message sent at Thu 2026-11-19 12:00 local time.</system-reminder>"
+/** The ids of the chat's calls: the Glob it ran, and the Bash call cut off at the handoff. */
+const CHAT_GLOB = 'toolu_chat_glob_01'
+const CHAT_BASH = 'toolu_chat_bash_01'
+
+/**
+ * The transcript a chat leaves when the conversation moves to Cowork, as Cowork writes it into the container's before Claude Code takes
+ * the turn over, in the config folder's `projects/<cwd, each character not a letter or digit as ->/<session id>.jsonl`: the person's
+ * prompt (the reminder, then the typed text), the model's text and a Glob call, the Glob's result, a Bash call with no result (cut off
+ * at the handoff), and the relay marker. Answers the session's id. Cowork runs the cut-off call before the turn begins; resumed here,
+ * Claude Code drops it, and the mock's model makes the call again inside the turn.
+ */
+function seedHandoff(config, cwd) {
+  const sessionId = randomUUID()
+  const dir = join(config, 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'))
+  mkdirSync(dir, { recursive: true })
+  const start = Date.now() - 60_000
+  const rows = []
+  let parentUuid = null
+  const add = (type, fields) => {
+    const uuid = randomUUID()
+    rows.push({ parentUuid, isSidechain: false, userType: 'external', cwd, sessionId, version: CLAUDE_VERSION, entrypoint: 'remote_cowork', type, uuid, timestamp: new Date(start + rows.length * 1_000).toISOString(), ...fields })
+    parentUuid = uuid
+    return uuid
+  }
+  const assistant = (n, content) => ({
+    message: { id: `msg_chat_0${n}`, type: 'message', role: 'assistant', model: 'claude-haiku-5-5', content, stop_reason: 'tool_use' },
+  })
+  const prompt = add('user', { message: { role: 'user', content: [{ type: 'text', text: HANDOFF_REMINDER }, { type: 'text', text: HANDOFF_PROMPT }] } })
+  add('assistant', assistant(1, [{ type: 'text', text: 'Let me look for it first.' }, { type: 'tool_use', id: CHAT_GLOB, name: 'Glob', input: { pattern: '**/notes*' } }]))
+  add('user', { message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: CHAT_GLOB, content: [{ type: 'text', text: 'No files found' }] }] } })
+  add('assistant', assistant(2, [{ type: 'tool_use', id: CHAT_BASH, name: 'Bash', input: { command: 'echo e2e', description: 'Print e2e' } }]))
+  add('system', { subtype: 'upgrade_relay_marker', level: 'info', isMeta: false, content: JSON.stringify({ schema_version: 1, conversation_uuid: randomUUID(), anchor_line_uuid: prompt, anthropic_version: '2023-06-01' }) })
+  writeFileSync(join(dir, `${sessionId}.jsonl`), rows.map(r => JSON.stringify(r)).join('\n') + '\n')
+  return sessionId
+}
+
 /**
  * One session, its telemetry captured. `details` turns prompt and tool-detail logging on; `envBlock` false runs it without Mainwave's
  * env block, the plugin sending keyless; `auto` runs it in auto mode; `rowless` loads skip.ts ahead of the plugin, so no row of Claude
- * Code's reaches it; `fail` gives it a prompt the model refuses as rate limited instead, with Claude Code's retries off.
+ * Code's reaches it; `fail` gives it a prompt the model refuses as rate limited instead, with Claude Code's retries off; `handoff`
+ * resumes a transcript a chat left instead, as Cowork's handoff does (seedHandoff), with no prompt of its own.
  */
-async function session(details, envBlock, auto, rowless = false, fail = false) {
+async function session(details, envBlock, auto, rowless = false, fail = false, handoff = false) {
   refusing = fail
   captured = { exporter: { logs: [], traces: [], metrics: [] }, plugin: { logs: [], traces: [], metrics: [] }, settings: [], other: [] }
   messageId = 0
@@ -362,6 +414,7 @@ async function session(details, envBlock, auto, rowless = false, fail = false) {
     const content = rowless ? Object.fromEntries(ROWLESS_CONTENT.map(id => [id, 'on'])) : {}
     writeFileSync(storeFile(config), JSON.stringify({ dataPoints: { ...Object.fromEntries(CAPTURED_DATA_POINTS.map(id => [id, details ? 'on' : 'claude'])), ...content } }))
   }
+  const resumed = handoff ? seedHandoff(config, realpathSync(work)) : undefined
 
   const env = {
     PATH: process.env.PATH,
@@ -374,6 +427,10 @@ async function session(details, envBlock, auto, rowless = false, fail = false) {
     ANTHROPIC_BASE_URL: base,
     DISABLE_AUTOUPDATER: '1',
     ...(fail ? { CLAUDE_CODE_MAX_RETRIES: '0' } : {}),
+    // Cowork, by the variable rather than its entry point (`remote_cowork` holds a folder's plugins back until the organization's managed
+    // settings are read, which a session on an API key never does); the turn the chat left cut off, taken up as the session resumes; and
+    // the file observe.ts writes what it sees to.
+    ...(handoff ? { CLAUDE_CODE_IS_COWORK: '1', CLAUDE_CODE_RESUME_INTERRUPTED_TURN: '1', MW_E2E_OBSERVE: join(config, 'observed.jsonl') } : {}),
     MW_E2E_RECEIVER: `${base}/prod`,
   }
   // Without the env block: no telemetry settings at all. The organization and email reach the rows as a login would put them there.
@@ -397,9 +454,12 @@ async function session(details, envBlock, auto, rowless = false, fail = false) {
   })
 
   const args = [
-    '-p', fail ? 'E2E_FAILTASK: say ok.' : 'E2E_MAINTASK: run the steps, then say ok.',
-    // Ahead of the plugin, so its hooks run first, as the security default's do.
+    // The handoff gives no prompt: the transcript it resumes holds the person's, and its input (stdin, closed) adds none.
+    ...(handoff ? ['-p', '--resume', resumed, '--input-format', 'stream-json', '--output-format', 'stream-json', '--verbose']
+      : ['-p', fail ? 'E2E_FAILTASK: say ok.' : 'E2E_MAINTASK: run the steps, then say ok.']),
+    // Ahead of the plugin, so their hooks run first, as the security default's do: observe.ts sees what Claude Code gives a plugin.
     ...(rowless ? ['--plugin-dir', skip] : []),
+    ...(handoff ? ['--plugin-dir', observe] : []),
     '--plugin-dir', root,
     '--plugin-dir', redirect,
     '--allowedTools', 'Bash(echo e2e),Bash(echo sub),Bash(git -c user.name=e2e -c user.email=e2e@example.com commit:*),Bash(ls e2e-missing-file),Write,Edit,Agent',
@@ -848,9 +908,9 @@ function compare(pass, details, auto, { captured, run, work }) {
 /**
  * What is out of place in a set of spans the plugin built the trace of: each interaction a root of a trace of its own, the main loop's
  * requests and calls its children, each call's decision and run the call's, and a subagent's requests and calls under its Agent call's
- * run. Answers the problems found.
+ * run (a session with `subagents` false starts none). Answers the problems found.
  */
-function traceShape(spans) {
+function traceShape(spans, subagents = true) {
   const out = []
   const byId = new Map(spans.map(s => [s.spanId, s]))
   const name = s => s.name.replace('claude_code.', '')
@@ -888,8 +948,8 @@ function traceShape(spans) {
     }
   }
   for (const [what, list] of bad) out.push(`traces: ${what} (${list.length}, e.g. ${list[0]})`)
-  if (!spans.some(s => s.name === 'claude_code.llm_request' && s.attrs.agent_id !== undefined)) out.push("no subagent's request was sent")
-  if (!spans.some(s => s.name === 'claude_code.tool' && s.attrs.agent_id !== undefined)) out.push("no subagent's call was sent")
+  if (subagents && !spans.some(s => s.name === 'claude_code.llm_request' && s.attrs.agent_id !== undefined)) out.push("no subagent's request was sent")
+  if (subagents && !spans.some(s => s.name === 'claude_code.tool' && s.attrs.agent_id !== undefined)) out.push("no subagent's call was sent")
   const interactions = spans.filter(s => s.name === 'claude_code.interaction')
   if (new Set(interactions.map(s => s.traceId)).size !== interactions.length) out.push('two interactions share a trace')
   return out
@@ -1123,6 +1183,55 @@ function checkRowless(pass, { captured, run }, reference) {
 }
 
 /**
+ * The handoff pass: the session began its one turn as Cowork's handoff does (observe.ts: no text, only a prompt Claude Code inserted
+ * submitted; the first request's messages: the person's prompt, then the chat's calls and their results), and the plugin's rows of it
+ * carry the person's typed text as the turn's prompt, its length the text's, and that prompt's id on every row of the turn, which ends.
+ */
+function checkHandoff({ captured, run, config }) {
+  const before = problems.length
+  if (run.code !== 0) problems.push(`claude exited ${run.code}:\n${run.out.slice(-2000)}`)
+  const outcome = run.out.split('\n').flatMap(l => { try { const o = JSON.parse(l); return o?.type === 'result' ? [o] : [] } catch { return [] } })
+  if (outcome.length !== 1 || outcome[0].is_error !== false || outcome[0].subtype !== 'success') problems.push(`the session's result is ${JSON.stringify(outcome.map(o => ({ subtype: o.subtype, is_error: o.is_error })))}, not one success`)
+  for (const s of SIGNALS) for (const p of captured.plugin[s]) if (p.status !== 200) problems.push(`keyless ingest refused a ${s} request (${p.status}): ${p.error}`)
+  // What the session gave a plugin: the shape the pass reproduces, without which it would not cover a turn begun without its prompt.
+  const observedFile = join(config, 'observed.jsonl')
+  const observed = existsSync(observedFile) ? readFileSync(observedFile, 'utf8').split('\n').filter(Boolean).map(l => JSON.parse(l)) : []
+  const starts = observed.filter(o => o.event === 'turn.start')
+  if (starts.length !== 1 || starts[0].text !== '') problems.push(`the session's turns began with ${JSON.stringify(starts.map(o => o.text))}, not one turn with no text: the pass no longer reproduces the handoff`)
+  for (const o of observed) if (o.event === 'prompt.submit' && !o.isMeta) problems.push(`a prompt submitted that Claude Code did not insert itself: ${JSON.stringify(o.text)}`)
+  // At the turn's start and its first request, the person's message is in the transcript, behind a call of the chat's and its result.
+  for (const name of ['turn.start', 'turn.step']) {
+    const messages = observed.find(o => o.event === name)?.messages
+    const at = Array.isArray(messages) ? messages.findIndex(m => m.role === 'user' && String(m.text).includes(HANDOFF_PROMPT)) : -1
+    const after = at < 0 ? [] : messages.slice(at + 1)
+    if (!after.some(m => m.role === 'assistant' && m.toolUses > 0) || !after.some(m => m.role === 'user' && m.toolResults > 0)) problems.push(`at ${name}, the transcript's newest messages are not the person's prompt, then a call and its result: ${JSON.stringify(messages)?.slice(0, 1500)}`)
+  }
+
+  const ev = r => r.attributes['event.name']?.v
+  const rows = checkStatus(logRecordsOf(captured.plugin.logs), ['rows_skipped', 'exporter_elsewhere']).filter(r => !OWN_ROWS.has(ev(r)))
+  const prompts = rows.filter(r => ev(r) === 'user_prompt')
+  const prompt = prompts[0]
+  if (prompts.length !== 1) problems.push(`${prompts.length} prompt rows built, not 1`)
+  if (prompt?.attributes.prompt?.v !== HANDOFF_PROMPT) problems.push(`the prompt row carries ${JSON.stringify(prompt?.attributes.prompt?.v)}, not what the person typed`)
+  if (prompt?.attributes.prompt_length?.v !== String(HANDOFF_PROMPT.length)) problems.push(`the prompt row's length is ${JSON.stringify(prompt?.attributes.prompt_length?.v)}, not ${HANDOFF_PROMPT.length}`)
+  const id = prompt?.attributes['prompt.id']?.v
+  const turn = rows.filter(r => ev(r) !== 'user_prompt')
+  for (const r of turn) if (id === undefined || r.attributes['prompt.id']?.v !== id) problems.push(`a ${ev(r)} row of the turn carries prompt id ${JSON.stringify(r.attributes['prompt.id']?.v)}, not its prompt's ${JSON.stringify(id)}`)
+  const bash = name => turn.filter(r => ev(r) === name && r.attributes.tool_name?.v === 'Bash')
+  for (const name of ['api_request', 'assistant_response']) if (!turn.some(r => ev(r) === name)) problems.push(`no ${name} row built for the turn`)
+  for (const name of ['tool_decision', 'tool_result']) if (bash(name).length !== 1) problems.push(`${bash(name).length} ${name} rows built for the turn's Bash call, not 1`)
+  // The turn starts no subagent.
+  const spans = spansOf(captured.plugin.traces)
+  for (const p of traceShape(spans, false)) problems.push(p)
+  const interactions = spans.filter(s => s.name === 'claude_code.interaction')
+  if (interactions.length !== 1) problems.push(`${interactions.length} interactions, not the turn's 1`)
+  const markers = spans.filter(s => MARKER_SPANS.has(s.name))
+  if (markers.length) problems.push(`markers: ${markers.map(s => s.name).join(', ')}, where the turn makes none`)
+  console.log(`  turns began with ${JSON.stringify(starts.map(o => o.text))}; prompt row ${JSON.stringify(prompt?.attributes.prompt?.v)} (${prompt?.attributes.prompt_length?.v}); rows ${rows.map(ev).join(', ')}`)
+  for (let i = before; i < problems.length; i++) problems[i] = `a turn handed over from a chat: ${problems[i]}`
+}
+
+/**
  * What the copy with Claude Code's rows has that the copy built without them lacks: the plugin's own output in the reference pass (the
  * same scripted session, with rows) against the rowless pass's, field by field. Each event the plugin builds, paired call by call and
  * request by request; each span by its kind; each metric series by its sum. A difference that is not a known one fails, so the README's
@@ -1249,6 +1358,18 @@ for (const [pass, details, envBlock, auto, rowless] of passes) {
   console.log(`  failure markers: ${stops.length}${stops.length ? ` (${stops.map(s => s.attrs['mainwave.claude_code.stop_failure.error']?.v).join(', ')})` : ''}`)
   for (let i = before; i < problems.length; i++) problems[i] = `a turn that ends on an API error: ${problems[i]}`
 }
+
+// The turn Cowork hands Claude Code after a conversation moves from chat to Cowork: the chat's prompt and calls already in the
+// transcript, the turn begun with no text. A local `claude -p` comes closest by resuming such a transcript with the cut-off turn taken
+// up (CLAUDE_CODE_RESUME_INTERRUPTED_TURN): the turn begins with no text, after a prompt Claude Code inserts itself (`isMeta`), and its
+// first request's messages end with the cut-off call's result. Rowless, as behind the security default, with the content on: the
+// plugin's prompt row must carry what the person typed, found back past the chat's calls, and every row of the turn its prompt's id.
+{
+  console.log('\na turn handed over from a chat, built from events:')
+  const result = await session(false, true, false, true, false, true)
+  results.push(result)
+  checkHandoff(result)
+}
 server.close()
 
 if (problems.length) {
@@ -1277,4 +1398,4 @@ for (const { captured, run, config, work } of results) {
 }
 
 if (problems.length) process.exit(1)
-console.log('the copy matches the exporter, without the env block it goes keyless in coherent traces, and with no row it builds the rows from events')
+console.log('the copy matches the exporter, without the env block it goes keyless in coherent traces, with no row it builds the rows from events, and a turn handed over from a chat keeps its prompt')
