@@ -22,7 +22,7 @@ const HOST_EMAIL = 'host@example.com'
 const BUILT = 'mainwave.telemetry.built_from'
 const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 300, cache_creation_input_tokens: 40, ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 40 }
 
-type World = { messages?: unknown[] | (() => unknown[]); settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown>; transcript?: string }
+type World = { messages?: unknown[] | (() => unknown[]); settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown>; transcript?: string; duringCall?: (id: string) => Promise<void> }
 
 function world(on: On, opts: World = {}) {
   const clock = mock.clock(on, { now: START })
@@ -113,6 +113,7 @@ function world(on: On, opts: World = {}) {
   })
   // The tool itself, once the call is allowed and has begun to run.
   on('tool.call', async (_$, e) => {
+    await opts.duringCall?.((e as unknown as { tool_use_id: string }).tool_use_id)
     await clock.advance(25)
     const input = e as unknown as { command?: string }
     if (input.command === 'rm -rf x') return { deny: 'refused in test' } as never
@@ -907,7 +908,10 @@ describe('in Cowork', () => {
   const handedOver = (done: boolean) => [
     { role: 'user', text: REMINDER + typed, toolUses: [] }, CALLED('toolu_glob'), ANSWERED('toolu_glob'), CALLED('toolu_early'), ...(done ? [ANSWERED('toolu_early', 'hi')] : []),
   ]
-  const CUT_OFF = `${PERSON_ROW(HANDED_OFF)}${MARKER}${CALL_ROW('toolu_glob')}${RESULT_ROW('toolu_glob', 'a.txt')}${CALL_ROW('toolu_early')}${RESULT_ROW('toolu_early', 'hi')}`
+  const AFTER_MARKER = `${CALL_ROW('toolu_glob')}${RESULT_ROW('toolu_glob', 'a.txt')}${CALL_ROW('toolu_early')}${RESULT_ROW('toolu_early', 'hi')}`
+  const CUT_OFF = `${PERSON_ROW(HANDED_OFF)}${MARKER}${AFTER_MARKER}`
+  // The handover's row, but none of the host's fields on the person's message.
+  const CUT_OFF_BARE = `${PERSON_ROW({ origin: { kind: 'human' } })}${MARKER}${AFTER_MARKER}`
   async function earlyCallThenTurn($: Engine, w: ReturnType<typeof world>, ran: () => void) {
     await start($)
     await w.clock.advance(1_000)
@@ -926,13 +930,13 @@ describe('in Cowork', () => {
 
   // With the host's fields, the person's message carried over is the prompt as the turn begins, and the messages are never walked;
   // without them, it is read back through the messages, as the turn begins and again at its first request.
-  const FIELDS: [string, string | undefined, number][] = [["by the host's fields", CUT_OFF, 0], ['without them', undefined, 2]]
+  const FIELDS: [string, string, number][] = [["by the host's fields", CUT_OFF, 0], ['without them', CUT_OFF_BARE, 2]]
   for (const [how, env] of TRACES) {
     for (const [found, transcript, walks] of FIELDS) {
       test(`a call Claude Code runs before the load's first turn starts has its rows under that turn's prompt, timed as it ran, its spans under the turn's interaction (${how}; the prompt ${found})`, keyless, async ($, on) => {
         let done = false
         let reads = 0
-        const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', env, store: { dataPoints: { 'prompt.text': 'on' } }, messages: () => (reads++, handedOver(done)), ...(transcript !== undefined ? { transcript } : {}) })
+        const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', env, store: { dataPoints: { 'prompt.text': 'on' } }, messages: () => (reads++, handedOver(done)), transcript })
         await earlyCallThenTurn($, w, () => (done = true))
         expect(promptsOf(w)).toEqual([[String(typed.length), typed]])
         expect(reads).toBe(walks)
@@ -960,7 +964,7 @@ describe('in Cowork', () => {
   }
 
   test("a call before the load's first turn whose turn makes no request has its rows as the turn ends", keyless, async ($, on) => {
-    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: handedOver(true) })
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: handedOver(true), transcript: CUT_OFF_BARE })
     await start($)
     await $.tool.call({ tool: 'Bash', command: 'echo hi', description: 'x', tool_use_id: 'toolu_early' } as never)
     await w.clock.advance(200)
@@ -968,6 +972,88 @@ describe('in Cowork', () => {
     await $.turn.complete({ turnId: 't1', answer: '', durationMs: 10, isAborted: true, reason: 'aborted' } as never)
     await w.clock.advance(5_000)
     expect(w.built().filter(r => r.attributes['event.name'] !== 'plugin_status').map(r => [r.attributes['event.name'], r.attributes['tool_use_id']])).toEqual([['tool_decision', 'toolu_early'], ['tool_result', 'toolu_early']])
+  })
+
+  for (const [how, opts] of [['the transcript shows no handover', { transcript: `${PERSON_ROW()}${AFTER_MARKER}` }], ['there is no transcript to read', {}]] as const) {
+    test(`a call before the load's first turn in Cowork is not held where ${how}: rows never start inside a turn the load did not see begin`, keyless, async ($, on) => {
+      let done = false
+      const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: () => handedOver(done), ...opts })
+      await earlyCallThenTurn($, w, () => (done = true))
+      expect(w.built().filter(r => r.attributes['tool_use_id'] === 'toolu_early')).toEqual([])
+    })
+  }
+
+  for (const [found, transcript] of FIELDS) {
+    test(`a call before the first turn that ends after the turn began has its rows after the turn's prompt, under its interaction (the prompt ${found})`, keyless, async ($, on) => {
+      let done = false
+      const w = world(on, {
+        accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', store: { dataPoints: { 'prompt.text': 'on' } }, messages: () => handedOver(done), transcript,
+        // The turn begins while the call still runs.
+        duringCall: async id => {
+          if (id === 'toolu_early') await $.turn.start({ turnId: 't1', text: '' } as never)
+        },
+      })
+      await start($)
+      await $.tool.call({ tool: 'Bash', command: 'echo hi', description: 'x', tool_use_id: 'toolu_early' } as never)
+      done = true
+      const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-haiku-5-5', messageCount: 6, effort: 'medium' } as never)
+      while (!(await stream.next()).done) {
+        // Read to its end.
+      }
+      await $.tool.call({ tool: 'Bash', command: 'echo later', description: 'x', tool_use_id: 'toolu_later' } as never)
+      await $.turn.complete({ turnId: 't1', answer: 'ok', durationMs: 400, isAborted: false, reason: 'answer' } as never)
+      await w.clock.advance(5_000)
+      await end($)
+      expect(promptsOf(w)).toEqual([[String(typed.length), typed]])
+      const rows = w.built().filter(r => r.attributes['event.name'] !== 'plugin_status')
+      expect(rows.map(r => [r.attributes['event.name'], r.attributes['tool_use_id']])).toEqual([
+        ['user_prompt', undefined], ['tool_decision', 'toolu_early'], ['tool_result', 'toolu_early'], ['api_request', undefined], ['assistant_response', undefined],
+        ['tool_decision', 'toolu_later'], ['tool_result', 'toolu_later'],
+      ])
+      for (const r of rows) expect(r.attributes['prompt.id']).toBe(rows[0]!.attributes['prompt.id'])
+      const all = spans(w.posts)
+      const interaction = all.find(x => x.name === 'claude_code.interaction')!
+      const tool = all.find(x => x.name === 'claude_code.tool' && x.attrs['tool_use_id'] === 'toolu_early')!
+      expect([tool.traceId, tool.parentSpanId]).toEqual([interaction.traceId, interaction.spanId])
+    })
+  }
+
+  test("a call before the first turn keeps what its permission check said: an ask answered, with its wait; an ask refused, nobody there to ask", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: [...handedOver(true), CALLED('toolu_ask'), ANSWERED('toolu_ask'), CALLED('toolu_no'), ANSWERED('toolu_no', 'refused')], transcript: CUT_OFF })
+    await start($)
+    await w.clock.advance(1_000)
+    // The check and the run happen inside the call, before the plugin knows whether it builds the rows.
+    await $.tool.call({ tool: 'Bash', command: 'touch /asked', description: 'x', tool_use_id: 'toolu_ask' } as never)
+    await $.tool.call({ tool: 'Bash', command: 'touch /outside', description: 'x', tool_use_id: 'toolu_no' } as never)
+    await w.clock.advance(200)
+    await turn($, '', 'toolu_c')
+    await w.clock.advance(5_000)
+    await end($)
+    const of = (id: string) => w.built().filter(r => r.attributes['tool_use_id'] === id).map(r => r.attributes)
+    const [decision, result] = of('toolu_ask')
+    expect(decision).toEqual(expect.objectContaining({ 'event.name': 'tool_decision', decision: 'accept', source: 'config', 'event.timestamp': new Date(START + 1_000 + ANSWER_MS).toISOString() }))
+    expect(result).toEqual(expect.objectContaining({ 'event.name': 'tool_result', success: 'true', duration_ms: '25' }))
+    expect(of('toolu_no').map(r => [r['event.name'], r['decision'], r['source']])).toEqual([['tool_decision', 'reject', 'config']])
+    const blocked = spans(w.posts).filter(s => s.name === 'claude_code.tool.blocked_on_user')
+    expect(blocked.map(s => [s.attrs['decision'], s.attrs['duration_ms']])).toEqual(expect.arrayContaining([['accept', ANSWER_MS]]))
+    const prompt = w.built().find(r => r.attributes['event.name'] === 'user_prompt')!
+    for (const id of ['toolu_ask', 'toolu_no']) for (const r of of(id)) expect(r['prompt.id']).toBe(prompt.attributes['prompt.id'])
+  })
+
+  test("a later load's first turn begun with no text never takes the person's message a past handover carried over: no call ran before it", keyless, async ($, on) => {
+    let messages: unknown[] = [...handedOver(true), FINAL]
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', store: { dataPoints: { 'prompt.text': 'on' } }, messages: () => messages, transcript: `${CUT_OFF}${ANSWER_ROW('done')}` })
+    await start($)
+    await $.turn.start({ turnId: 't1', text: '' } as never)
+    // The new message reaches the transcript only after the turn began.
+    messages = [...messages, { role: 'user', text: REMINDER + 'now the logs', toolUses: [] }]
+    const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-haiku-5-5', messageCount: 8, effort: 'medium' } as never)
+    while (!(await stream.next()).done) {
+      // Read to its end.
+    }
+    await $.turn.complete({ turnId: 't1', answer: 'ok', durationMs: 200, isAborted: false, reason: 'answer' } as never)
+    await w.clock.advance(5_000)
+    expect(promptsOf(w)).toEqual([['12', 'now the logs']])
   })
 
   test("outside Cowork, a call before the load's first turn is not held for it", keyless, async ($, on) => {
@@ -1104,12 +1190,13 @@ describe('in Cowork', () => {
   })
 
   test("the handover in the transcript's rows: the handover's row, the host's message, the person's message carried over", () => {
-    expect(handoverIn(MARKED)).toEqual({ relay: true, hostWritten: true, handedOff: false, newest: CONTINUE, person: REMINDER + typed })
-    expect(handoverIn(BARE)).toEqual({ relay: true, hostWritten: false, handedOff: false, newest: CONTINUE, person: REMINDER + typed })
-    expect(handoverIn(UNMARKED)).toEqual({ relay: false, hostWritten: false, handedOff: false, newest: CONTINUE })
-    expect(handoverIn(CUT_OFF)).toEqual({ relay: true, hostWritten: false, handedOff: true, newest: REMINDER + typed, person: REMINDER + typed })
+    expect(handoverIn(MARKED)).toEqual({ relay: true, hostWritten: true, carried: false, handedOff: false, newest: CONTINUE, person: REMINDER + typed })
+    expect(handoverIn(BARE)).toEqual({ relay: true, hostWritten: false, carried: false, handedOff: false, newest: CONTINUE, person: REMINDER + typed })
+    expect(handoverIn(UNMARKED)).toEqual({ relay: false, hostWritten: false, carried: false, handedOff: false, newest: CONTINUE })
+    expect(handoverIn(CUT_OFF)).toEqual({ relay: true, hostWritten: false, carried: true, handedOff: true, newest: REMINDER + typed, person: REMINDER + typed })
     // The person's message carried over, then a newer one typed after the handover: no longer the turn's.
-    expect(handoverIn(`${CUT_OFF}${HOST_ROW('deploy it', {})}`)).toMatchObject({ handedOff: false, newest: 'deploy it' })
+    expect(handoverIn(CUT_OFF_BARE)).toMatchObject({ carried: true, handedOff: false, person: REMINDER + typed })
+    expect(handoverIn(`${CUT_OFF}${HOST_ROW('deploy it', {})}`)).toMatchObject({ carried: false, handedOff: false, newest: 'deploy it' })
     // A host-written row from before the handover's row is not this handover's.
     expect(handoverIn(`${CHAT}${HOST_ROW(CONTINUE)}${MARKER}`)).toMatchObject({ relay: true, hostWritten: false })
     // Not prompts: a tool's results, a message Claude Code inserted, a meta row, an empty message.
@@ -1118,7 +1205,7 @@ describe('in Cowork', () => {
     // Cut where the read began, the first line is no row; the words alone, in another row's text, are not the handover's row.
     expect(handoverIn(MARKED.slice(MARKED.indexOf(MARKER) + 10)).relay).toBe(false)
     expect(handoverIn(line({ type: 'user', message: { role: 'user', content: 'what is "upgrade_relay_marker"?' } })).relay).toBe(false)
-    expect(handoverIn('')).toEqual({ relay: false, hostWritten: false, handedOff: false })
+    expect(handoverIn('')).toEqual({ relay: false, hostWritten: false, carried: false, handedOff: false })
   })
 
   test("a Cowork prompt's own text goes without the reminder, its length the text's, and its row filled", keyless, async ($, on) => {

@@ -74,7 +74,7 @@ export type Emit = { spans: BuiltSpan[]; measures: Measure[] }
 /** A prompt row: its span, or, where it names none, the ids the plugin gives the interaction it starts (`own`). */
 type Prompt = { ctx?: Ctx; own?: Ctx; text: TelemetryAttribute; length: number; atMs: number }
 /** A main-loop turn. `rebuilt`: the beta is on, but its prompt row named no span, so the plugin builds its trace. */
-type Interaction = { turnId: string; sequence: number; prompt?: Prompt; ctx?: Ctx; text: string; rebuilt?: true }
+type Interaction = { turnId: string; sequence: number; prompt?: Prompt; ctx?: Ctx; text: string; rebuilt?: true; fromMs?: number }
 /**
  * A slash command that runs without a model turn (`/plugins`, `/cost`): an interaction of its own, as Claude Code counts it. In
  * coherent mode, `ctx` is the interaction's, made as the command starts.
@@ -746,7 +746,7 @@ export function turnComplete(r: Rebuild, e: { turnId: string; durationMs: number
   // A prompt row nothing claimed by the turn's end belongs to no later interaction.
   r.heldPrompt = undefined
   const durationMs = Math.max(0, Math.round(e.durationMs))
-  return interactionSpan(r, { ctx: it.prompt?.ctx ?? it.ctx, prompt: it.prompt, text: it.text, sequence: it.sequence, startMs: nowMs - durationMs, endMs: nowMs, durationMs })
+  return interactionSpan(r, { ctx: it.prompt?.ctx ?? it.ctx, prompt: it.prompt, text: it.text, sequence: it.sequence, startMs: Math.min(nowMs - durationMs, it.fromMs ?? Infinity), endMs: nowMs, durationMs })
 }
 
 /**
@@ -812,18 +812,19 @@ export function toolStart(r: Rebuild, e: { tool: string; tool_use_id?: string; a
 
 /**
  * A main-loop call that ran before the turn it belongs to began, joining that turn as its rows are built: it sits under the turn's
- * interaction, as a call made in the turn does. Nothing for a call that has ended in the rebuild already, or with no interaction open.
+ * interaction, as a call made in the turn does, and the interaction's span starts no later than it. Nothing for a call that has ended
+ * in the rebuild already, or with no interaction open.
  */
 export function toolJoinsTurn(r: Rebuild, id: string): void {
   const tool = r.tools.get(id)
   const it = r.interaction
   if (tool === undefined || tool.agentId !== undefined || tool.endedAtMs !== undefined || it?.ctx === undefined) return
   const home = { traceId: it.ctx.traceId, parentId: it.ctx.spanId }
-  if (isCoherent(r)) tool.home = home
-  else if (it.rebuilt) {
-    tool.home = home
-    tool.rebuilt = true
-  }
+  if (!isCoherent(r) && !it.rebuilt) return
+  tool.home = home
+  if (!isCoherent(r)) tool.rebuilt = true
+  // The interaction's span starts no later than the call it holds.
+  it.fromMs = Math.min(it.fromMs ?? tool.startMs, tool.startMs)
 }
 
 /** A coherent-mode call's trace and parent, settled the first time its spans or its subagent need them; undefined in any other mode. */

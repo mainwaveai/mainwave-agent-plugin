@@ -189,6 +189,8 @@ const TRANSCRIPT_WALK = 500
  */
 let earlyCalls: CallRows[] = []
 const MAX_EARLY_CALLS = 50
+/** A main-loop call began before the load's first turn, in Cowork: a handover's first turn may take the person's carried-over message. */
+let earlySeen = false
 /** When each tool call the plugin builds rows for began, by its id, until it ends. */
 let callStarts = new Map<string, number>()
 /** The permission check's verdict on each of those calls (`allow`, `deny` or `ask`), by its id, until it ends. */
@@ -1513,7 +1515,9 @@ async function handoffWalk($: EngineInterface, host?: string): Promise<string | 
  * - a turn whose text is the newest prompt row, one the host wrote after the handover (`textNotTyped`: its message asking to run the
  *   chat's last call, not run): the person's last message in chat, from the transcript, else read back through the session's messages
  *   past the host's; '' where neither finds one, as the host's text is never the person's;
- * - a turn begun with no text, whose newest prompt row is the person's message carried over (`handedOff`): that message.
+ * - a turn begun with no text, whose newest prompt row is the person's message carried over (`handedOff`), after a call began before
+ *   it (the cut-off call Claude Code runs as it takes the conversation over): that message. A later load's first turn, with no such
+ *   call, never takes it, though the rows of a past handover still end the transcript until the person's next message is written.
  *
  * Without them: a turn whose text is the host's message by its words (`hostContinue`), after the call's not-run result, with the
  * handover's row in the transcript.
@@ -1522,7 +1526,7 @@ async function handoverPrompt($: EngineInterface, text: string): Promise<string 
   const t = await handoverOf($)
   if (t === undefined || !t.relay) return undefined
   if (text !== '' && t.hostWritten && t.newest !== undefined && typedText(t.newest).trim() === typedText(text).trim()) return t.person ?? (await handoffWalk($, text)) ?? ''
-  if (text === '' && t.handedOff && t.person !== undefined) return t.person
+  if (text === '' && t.handedOff && t.person !== undefined && earlySeen) return t.person
   if (text !== '' && hostContinue(text)) return handoffWalk($)
   return undefined
 }
@@ -1949,6 +1953,7 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
     r = await rebuildOf($)
     if (r !== null) {
       early = e.agentId === undefined && !mainTurnSeen && !mainTurnOpen && !rowSeen && typeof e.tool_use_id === 'string' && e.tool_use_id !== '' && (await hostFactsOf($)).cowork === true
+      if (early) earlySeen = true
       if (ended !== undefined) captureTool(capture, ended.toolUseId, ended.tool, ended.input)
       const startMs = await $.clock.now()
       toolStart(r, e as never, startMs)
@@ -1979,10 +1984,14 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
   if (r !== null) {
     try {
       const endMs = await $.clock.now()
-      // Before the first turn: the plugin builds the rows from here on where no row of Claude Code's reaches it, and this call's wait for
-      // that turn's prompt.
-      if (early) await decideRowless($).catch(() => undefined)
-      const hold = early && rowless && earlyCalls.length < MAX_EARLY_CALLS
+      // Begun before the first turn, in a handover from chat (the transcript's newest prompt is the person's message carried over, from
+      // before the handover's row): the plugin builds the rows from here on where no row of Claude Code's reaches it, as that turn's start
+      // would decide. Their rows wait for the turn's prompt row while it is still to come; where the turn has begun and has it, they go
+      // now, under its interaction.
+      const handed = early && (await handoverOf($))?.carried === true
+      if (handed) await decideRowless($).catch(() => undefined)
+      const hold = handed && rowless && (!mainTurnSeen || promptLater !== undefined) && earlyCalls.length < MAX_EARLY_CALLS
+      const joins = handed && rowless && !hold
       const verdict = id !== undefined ? verdicts.get(id) : undefined
       const judged = id !== undefined ? judgments.get(id) : undefined
       const ranAtMs = id !== undefined ? runs.get(id) : undefined
@@ -2025,7 +2034,10 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
         id, call, result, startMs: startMs ?? endMs, endMs, ...(built ? { decision: { refused, ...(decision.source !== undefined ? { source: decision.source } : {}), atMs: decision.atMs } } : {}), ...(ran !== undefined ? { ran } : {}),
       }
       if (hold && built) earlyCalls.push(rows)
-      else await sendCall($, r, rows)
+      else {
+        if (joins && id !== undefined) toolJoinsTurn(r, id)
+        await sendCall($, r, rows)
+      }
     } catch {
       // The call's spans go with what the rows say.
     }
@@ -2273,6 +2285,8 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
       await readOverrides($)
       await markersMade($)
       await flushOutsideCost($).catch(() => undefined)
+      // Calls that ran before a first turn that never came: theirs go, with no prompt.
+      if (earlyCalls.length > 0) await releaseEarlyCalls($, await rebuildOf($)).catch(() => undefined)
       await sweepNow($, true)
       // What waits for the settings' first answer goes now, before the meter collects for the last time.
       await flushHeldCopies()
@@ -2355,6 +2369,7 @@ export const register: Register = on => {
   mainTurnSeen = false
   promptLater = undefined
   earlyCalls = []
+  earlySeen = false
   callStarts = new Map()
   verdicts = new Map()
   judgments = new Map()
