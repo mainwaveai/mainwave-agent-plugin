@@ -29,11 +29,11 @@ import { atom, read, update } from 'claude-code'
 import type { CatchHandler, EngineInterface, Frozen, Hook, Next, Register, StreamHook, TelemetryAttribute, TelemetryLogResult, TelemetryRecordEntry, Timer, TurnStepResult } from 'claude-code'
 
 import type { RowIdentity } from '../types'
-import { captureCommit, capturePrompt, captureTool, dropStreamedText, newCapture, rowFill, setStreamedText, streamChunk, streamedText, streamedThinking, streamStart, type Capture } from './capture.ts'
+import { captureCommit, capturePrompt, captureTool, dropStreamedText, loopKey, newCapture, rowFill, streamChunk, streamedText, streamedThinking, streamStart, type Capture } from './capture.ts'
 import { MCP_SERVER_ROW, PLUGIN_STATUS_ROW, SKILL_PROMPT_ROW, type Switch } from './catalog.ts'
 import { clientPlatformIn } from './client.ts'
 import { mcpParts } from './derive.ts'
-import { allows, configureGate, currentGate, gateAttributes, gateMarker, gateRow, gateSpan, metricAllowed, openGate, resetPacks, setOptIn, setOverrides } from './gate.ts'
+import { allows, configureGate, currentGate, gateAttributes, gateMarker, gateRow, gateSpan, metricAllowed, openGate, resetPacks, setOptIn, setOverrides, type RowFill } from './gate.ts'
 import { classifyGlab, glabConfigDir, glabHosts, glabTexts, instanceOf, mrAttributes, mrFromApi, mrLookup, mrUrlOf, parseMrJson, repositoryIdOf, sameUrl, stripDraft, type MrDetails, type MrRef } from './glab.ts'
 import { endSession } from './http.ts'
 import { identityOf, isOrgId, mergeIdentity } from './identity.ts'
@@ -48,8 +48,8 @@ import {
   agentSpawned, callerCtx, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolJoinsTurn, toolStart, turnComplete, turnPrompted, turnStart, waits, type Emit, type Rebuild, type RowIn,
 } from './rebuild.ts'
 import {
-  accountDeviceOf, costOf, decisionOf, decisionRow, headOf, hostIdentityOf, joinPath, madeCommit, newRowless, promptIdFrom, promptRow, providerOf, remoteSessionIdOf, repoAttributes, requestRow, responseRow,
-  handoffPrompt, handoverIn, hostContinue, permissionRules, personPrompt, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, typedText, uuidOf, type Handover, type HostFacts, type HostIdentityEnv, type MadeCommit, type Rowless, type Verdict,
+  accountDeviceOf, agentTranscriptPath, costOf, decisionOf, decisionRow, headOf, hostIdentityOf, joinPath, madeCommit, newRowless, promptIdFrom, promptRow, providerOf, remoteSessionIdOf, repoAttributes, requestIdIn, requestRow, responseRow,
+  handoffPrompt, handoverIn, hostContinue, permissionRules, personPrompt, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, stepRequestId, typedText, uuidOf, type Handover, type HostFacts, type HostIdentityEnv, type MadeCommit, type Rowless, type Verdict,
 } from './rowless.ts'
 import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsPending, settingsSummary, settingsUnavailable } from './orgsettings.ts'
 import { contentLimit } from './protect.ts'
@@ -90,6 +90,8 @@ type SpawnParams = Parameters<Hook<'agent.spawn'>>
 type SpawnCatchParams = Parameters<CatchHandler<Hook<'agent.spawn'>>>
 type SkillParams = Parameters<Hook<'skill.prompt'>>
 type SkillCatchParams = Parameters<CatchHandler<Hook<'skill.prompt'>>>
+type AppendParams = Parameters<Hook<'session.append'>>
+type AppendCatchParams = Parameters<CatchHandler<Hook<'session.append'>>>
 
 /**
  * The calls on `$` the floor's declarations (2.1.326) may not type as the latest Claude Code declares them: `$.session.info()`, a range of a file, the
@@ -155,6 +157,20 @@ let rowlessState: Rowless = newRowless()
 let rowsAtLoad: Promise<boolean> | null = null
 /** Model requests streaming now, the main loop's and subagents': a cost the session adds while none is belongs to none of them. */
 let stepsInFlight = 0
+/**
+ * The model request streaming now in each loop whose rows the plugin builds, by loop (`loopKey`): where its transcript is and how long
+ * it was as the request began, and the ID of the last row of the model's the loop's conversation kept since (`session.append`).
+ */
+let stepRows = new Map<string, StepRows>()
+/** The built rows of the requests whose ID is looked for in the transcript, sent in order as each is found: a turn's end waits for them. */
+let requestRows: Promise<void> = Promise.resolve()
+let requestRowsPending = 0
+/** The main loop's last built rows in that chain: a main-loop turn's end waits for these alone. */
+let mainRequestRows: Promise<void> = Promise.resolve()
+/** The session is ending: a request's rows still looking for their ID read the transcript once more, then go without it. */
+let requestIdsEnding = false
+/** The request IDs the built rows carried lately: a transcript's ID goes on one request alone. */
+let requestIdsUsed: string[] = []
 /** The grace found no row: the rows are built from the next main-loop turn on, never from the middle of one. */
 let rowlessPending = false
 /** When this load first ran a hook, in `$.clock.now()`'s milliseconds: a session that began well before has its cost sent already. */
@@ -1338,7 +1354,7 @@ export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams
  * is the plugin's own: a fault in either never holds the exporter's row, and a fault in the rebuild never holds the copy. The row's
  * copy is queued before what the row completes, as the row came first.
  */
-async function copyRow($: EngineInterface, e: Frozen<TelemetryRecordEntry>, attributes: Record<string, TelemetryAttribute>, built = false): Promise<void> {
+async function copyRow($: EngineInterface, e: Frozen<TelemetryRecordEntry>, attributes: Record<string, TelemetryAttribute>, built = false, given?: RowFill): Promise<void> {
   let out: Awaited<ReturnType<typeof observe>> = null
   try {
     out = await observe($, e)
@@ -1353,9 +1369,10 @@ async function copyRow($: EngineInterface, e: Frozen<TelemetryRecordEntry>, attr
   }
   try {
     // The copy goes through the gate: what it holds back removed, what the plugin read and it allows added, the protections applied.
-    // What the plugin read is taken now, for this row alone. Where the organization's settings have yet to first answer and nothing
-    // of theirs applies, the copy waits for them beside the row, a few seconds at most: the row goes on at once.
-    const fill = rowFill(capture, e.event, e.attributes)
+    // What the plugin read is taken now, for this row alone (a built row may bring its own). Where the organization's settings have
+    // yet to first answer and nothing of theirs applies, the copy waits for them beside the row, a few seconds at most: the row goes on
+    // at once.
+    const fill = given ?? rowFill(capture, e.event, e.attributes)
     const copy = async () => {
       const gate = await gateOf($)
       // A row the plugin built carries the repository only where it may go on what the plugin builds.
@@ -1620,7 +1637,7 @@ async function readHead($: EngineInterface): Promise<MadeCommit | undefined> {
 }
 
 /** A row built from Claude Code's events, as Claude Code's own go: stamped (its prompt's client among them), through the rebuild, and copied. */
-async function feedRow($: EngineInterface, row: RowIn): Promise<void> {
+async function feedRow($: EngineInterface, row: RowIn, fill?: RowFill): Promise<void> {
   entrypoint ??= readEntrypoint($)
   const ep = await entrypoint
   const e = { to: 'collector', event: row.event, attributes: row.attributes, loggedAt: new Date(row.atMs).toISOString() } as Frozen<TelemetryRecordEntry>
@@ -1629,7 +1646,7 @@ async function feedRow($: EngineInterface, row: RowIn): Promise<void> {
     // Built at the turn's start or later, when the prompt's row in the transcript is written.
     ...(await clientStamp($, row.attributes, true)),
   })
-  await copyRow($, e, attributes, true)
+  await copyRow($, e, attributes, true, fill)
 }
 
 /** Claude Code's id of the prompt the session is on, so the rows built of its turn carry the one its own records do; undefined where it can't be read. */
@@ -1820,10 +1837,14 @@ export async function turnCompleteHook($: TurnCompleteParams[0], e: TurnComplete
     failedAt = undefined
   }
   try {
+    const endMs = await $.clock.now()
+    // A main-loop turn's requests' rows still waiting for their ID go first: each sits in the interaction this closes, which keeps
+    // the turn's own end. A subagent's sit in its Agent call's run, which stays.
+    if (e.agentId === undefined) await mainRequestRowsSent()
     const r = await rebuildOf($)
     // Calls that ran before the turn began and still wait (the turn made no request): theirs go before it closes.
     if (e.agentId === undefined && earlyCalls.length > 0) await releaseEarlyCalls($, r)
-    if (r !== null) out = turnComplete(r, e, await $.clock.now())
+    if (r !== null) out = turnComplete(r, e, endMs)
   } catch {
     // The turn's interaction is not rebuilt.
   }
@@ -1863,6 +1884,147 @@ function watched<T, R>(inner: AsyncGenerator<T, R, unknown>, see: (chunk: T) => 
   return it
 }
 
+/** A model request streaming now whose rows the plugin builds: where its loop's transcript is, and the model's last row kept since. */
+type StepRows = { at: Promise<{ path: string; from: number } | undefined>; last?: string; overlapped?: boolean }
+
+/**
+ * How many times, `TRANSCRIPT_RETRY_MS` apart, the transcript is read for a request's ID after the request ends: Claude Code writes
+ * the rows it keeps a moment after keeping them, a tenth of a second or so.
+ */
+export const REQUEST_ID_TRIES = 10
+
+/**
+ * The transcript a loop's rows are written to (the main one, or a subagent's under it), and its length now, as a request begins: the
+ * request's rows are written after. One not written yet (a new session's first request, a subagent's) is empty. Undefined where the
+ * session keeps no transcript.
+ */
+async function transcriptAt($: EngineInterface, agentId: string | undefined): Promise<{ path: string; from: number } | undefined> {
+  try {
+    const { transcriptPath } = await infoOf($)
+    if (transcriptPath === undefined) return undefined
+    const path = agentId === undefined ? transcriptPath : agentTranscriptPath(transcriptPath, agentId)
+    if (path === undefined) return undefined
+    const from = await $.fs.stat(path).then(st => st.size, () => 0)
+    return { path, from }
+  } catch {
+    return undefined
+  }
+}
+
+const utf8Length = (text: string) => new TextEncoder().encode(text).length
+
+/**
+ * The ID of the API request that answered with the row `uuid` (`requestIdIn`), read from what the transcript has gained since the
+ * request began, in order, as it is written: each read takes up where the last one's whole lines ended, as much as one read takes, so
+ * a large row written after the request's (a tool's result) is read past, not over. Undefined where the row names none, or is not
+ * written within `REQUEST_ID_TRIES` reads (one more once the session is ending), or the transcript can't be read.
+ */
+async function requestIdOf($: EngineInterface, at: StepRows['at'], uuid: string): Promise<string | undefined> {
+  const where = await at
+  if (where === undefined) return undefined
+  let from = where.from
+  for (let i = 0; i < REQUEST_ID_TRIES; i++) {
+    const last = requestIdsEnding
+    if (!last) await $.clock.sleep(TRANSCRIPT_RETRY_MS)
+    try {
+      for (;;) {
+        const size = (await $.fs.stat(where.path)).size
+        // Written over (a session's transcript starts again elsewhere): not this request's.
+        if (size < from) return undefined
+        if (size === from) break
+        const length = Math.min(size - from, MAX_READ_BYTES)
+        const text = await ($ as unknown as Newer).fs.read(where.path, { offset: from, length })
+        const found = requestIdIn(text, uuid)
+        if (found !== null) return found
+        // On from the last whole line, counted back from the read's end: a character the read cut is never counted short.
+        const whole = text.lastIndexOf('\n')
+        if (whole < 0) {
+          if (length < MAX_READ_BYTES) break
+          // One line longer than a read: on past its first part, its row not this one's (`requestIdIn` matched no line).
+          from += length
+          continue
+        }
+        from = from + length - utf8Length(text.slice(whole + 1))
+        if (length < MAX_READ_BYTES) break
+      }
+    } catch {
+      // Not there yet, or not readable this time: read again.
+    }
+    if (last) return undefined
+  }
+  return undefined
+}
+
+/**
+ * A request's built rows, its request row and its response row if any, sent with its ID. Where the transcript's is looked for
+ * (`found`), they wait for it beside the request, which goes on at once, and go after the rows waiting before them; a main-loop turn's
+ * end waits for them (`requestRowsSent`). Else they go now, with the ID that stands for the request's, unless rows still wait: then
+ * after them. The transcript's ID goes on one request alone: one some request's rows carried lately is not taken again.
+ */
+async function sendRequestRows($: EngineInterface, request: RowIn, response: { row: RowIn; fill: RowFill } | undefined, lookup: Promise<string | undefined> | undefined, main: boolean): Promise<void> {
+  const found = lookup?.catch(() => undefined)
+  const send = async (read: string | undefined) => {
+    const id = read !== undefined && !requestIdsUsed.includes(read) ? read : undefined
+    if (id !== undefined) {
+      requestIdsUsed.push(id)
+      if (requestIdsUsed.length > REQUEST_IDS_KEPT) requestIdsUsed.shift()
+    }
+    // The ID in the place of the one that stood for it, among the rows' attributes.
+    const withId = (row: RowIn): RowIn => (id === undefined ? row : { ...row, attributes: { ...row.attributes, request_id: id } })
+    await feedRow($, withId(request))
+    if (response !== undefined) await feedRow($, withId(response.row), response.fill)
+  }
+  if (found === undefined && requestRowsPending === 0) return send(undefined)
+  requestRowsPending += 1
+  const sent = requestRows.then(async () => send(await found))
+  requestRows = sent.catch(() => undefined).finally(() => {
+    requestRowsPending = Math.max(0, requestRowsPending - 1)
+  })
+  if (main) mainRequestRows = requestRows
+}
+
+/** How many request IDs the built rows carried are kept, so none goes on a second request. */
+const REQUEST_IDS_KEPT = 256
+
+/**
+ * The built rows of the main loop's requests waiting for their ID now, and those before them, sent: before a main-loop turn's
+ * interaction closes. Each waits `REQUEST_ID_TRIES` reads at most, from its request's end.
+ */
+async function mainRequestRowsSent(): Promise<void> {
+  if (requestRowsPending > 0) await mainRequestRows
+}
+
+/** Every built row still waiting for its ID, sent as the session ends: each reads the transcript once more, then goes without it. */
+async function requestRowsSent(): Promise<void> {
+  if (requestRowsPending === 0) return
+  requestIdsEnding = true
+  try {
+    await requestRows
+  } finally {
+    // After a /clear or a resume the process goes on: its next requests look for their IDs again.
+    requestIdsEnding = false
+  }
+}
+
+/**
+ * A row of the model's response a conversation keeps (door `response`): while a request of the loop streams, the last one's ID is
+ * noted, so its built rows carry the ID of the API request it came from. The row goes on unchanged.
+ */
+export async function appendHook($: AppendParams[0], e: AppendParams[1], next: AppendParams[2]) {
+  try {
+    const mine = stepRows.get(loopKey(e.agentId))
+    if (mine !== undefined && e.origin?.kind === 'model' && typeof e.uuid === 'string' && e.uuid !== '') mine.last = e.uuid
+  } catch {
+    // The request's rows carry the ID that stands for its own.
+  }
+  return next(e)
+}
+
+/** A fault in the append hook: the row goes on as it came. */
+export function appendCatch($: AppendCatchParams[0], e: AppendCatchParams[1], next: AppendCatchParams[2]) {
+  return next(e)
+}
+
 /**
  * One model request: its start, and its stop reason and usage once it is whole; the text and thinking it streams are read for its
  * rows. The stream passes through untouched.
@@ -1874,6 +2036,15 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
   let firstChunk: Promise<number | undefined> | undefined
   // The prompt of the load's first turn, where its start found none: before the request's own rows.
   await promptAtFirstStep($, e).catch(() => undefined)
+  // Where the request's rows will be written in the transcript, for its built rows' request ID: noted beside the request, never holding it.
+  const loop = loopKey(e.agentId)
+  const mine: StepRows | undefined = rowless ? { at: transcriptAt($, e.agentId) } : undefined
+  if (mine !== undefined) {
+    // A loop streams one request at a time. Were two of one loop to overlap, which response row is whose can't be told: neither looks.
+    const before = stepRows.get(loop)
+    if (before !== undefined) before.overlapped = mine.overlapped = true
+    stepRows.set(loop, mine)
+  }
   try {
     r = await rebuildOf($)
     if (r !== null) {
@@ -1900,6 +2071,7 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
     if (rowless && r !== null && result?.usage) costTaken = takeCost($, ({ costUsd }) => costOf(rowlessState, costUsd)).catch(() => undefined)
   } finally {
     stepsInFlight = Math.max(0, stepsInFlight - 1)
+    if (stepRows.get(loop) === mine) stepRows.delete(loop)
   }
   try {
     firstStepAtMs ??= await $.clock.now()
@@ -1915,21 +2087,25 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
       if (rowless && result?.usage) {
         const [head, costUsd, firstChunkMs, ep] = await Promise.all([rowlessHead($), costTaken ?? takeCost($, ({ costUsd }) => costOf(rowlessState, costUsd)), firstChunk, (entrypoint ??= readEntrypoint($))])
         const agent = e.agentId !== undefined ? agentTypes.get(e.agentId) : undefined
-        await feedRow($, requestRow(rowlessState, head, {
+        // Built now, in order, with the ID that stands for the request's where the transcript's isn't found (`stepRequestId`).
+        const requestId = stepRequestId(e.turnId, e.index)
+        const request = requestRow(rowlessState, head, {
           model: e.model, usage: result.usage, ...(e.effort !== undefined ? { effort: e.effort } : {}), ...(e.agentId !== undefined ? { agentId: e.agentId } : {}), ...(agent ? { agent } : {}),
-          startMs, endMs, ...(firstChunkMs !== undefined ? { firstChunkMs } : {}), ...(costUsd !== undefined ? { costUsd } : {}), sdk: ep.startsWith('sdk'),
-        }))
+          startMs, endMs, ...(firstChunkMs !== undefined ? { firstChunkMs } : {}), ...(costUsd !== undefined ? { costUsd } : {}), sdk: ep.startsWith('sdk'), requestId,
+        })
         // Its response row, where it answered with text: the gate adds the text where `response.text` is on. The text is the step's
-        // own answer, not the stream's pieces, which a retry inside the step may have sent twice. The stream's text is let go after,
-        // so a row of Claude Code's that comes later fills nothing twice.
+        // own answer, not the stream's pieces, which a retry inside the step may have sent twice. The row carries it; the stream's text
+        // is let go now, so a row of Claude Code's that comes later fills nothing twice.
         const text = responseTextOf(result.answer, streamedText(capture, e.agentId))
-        if (text !== undefined) {
-          setStreamedText(capture, e.agentId, text)
-          await feedRow($, responseRow(rowlessState, head, {
-            length: text.length, model: result.usage.model ?? e.model, ...(e.agentId !== undefined ? { agentId: e.agentId } : {}), ...(agent ? { agent } : {}), sdk: ep.startsWith('sdk'), atMs: endMs,
-          }))
-          dropStreamedText(capture, e.agentId)
+        const response = text === undefined ? undefined : {
+          row: responseRow(rowlessState, head, {
+            length: text.length, model: result.usage.model ?? e.model, ...(e.agentId !== undefined ? { agentId: e.agentId } : {}), ...(agent ? { agent } : {}), sdk: ep.startsWith('sdk'), atMs: endMs, requestId,
+          }),
+          fill: { attributes: { response: text } },
         }
+        dropStreamedText(capture, e.agentId)
+        const looked = mine?.last !== undefined && !mine.overlapped ? requestIdOf($, mine.at, mine.last) : undefined
+        await sendRequestRows($, request, response, looked, e.agentId === undefined)
       }
     } catch {
       // The request's span goes without its stop reason.
@@ -2354,6 +2530,7 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
       await readOverrides($)
       await markersMade($)
       await flushOutsideCost($).catch(() => undefined)
+      await requestRowsSent()
       // Calls that ran before a first turn that never came: theirs go, with no prompt.
       if (earlyCalls.length > 0) await releaseEarlyCalls($, await rebuildOf($)).catch(() => undefined)
       await sweepNow($, true)
@@ -2428,6 +2605,12 @@ export const register: Register = on => {
   rowlessState = newRowless()
   rowsAtLoad = null
   stepsInFlight = 0
+  stepRows = new Map()
+  requestRows = Promise.resolve()
+  requestRowsPending = 0
+  mainRequestRows = Promise.resolve()
+  requestIdsEnding = false
+  requestIdsUsed = []
   rowlessPending = false
   loadedAtMs = undefined
   costChain = Promise.resolve()
@@ -2472,6 +2655,7 @@ export const register: Register = on => {
   on('prompt.submit', promptHook).catch(promptCatch)
   on('agent.spawn', spawnHook).catch(spawnCatch)
   on('skill.prompt', skillHook).catch(skillCatch)
+  on('session.append', { door: 'response' }, appendHook).catch(appendCatch)
 
   on('session.end', sessionEnd)
 }
