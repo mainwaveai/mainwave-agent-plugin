@@ -1166,6 +1166,14 @@ function checkRowless(pass, { captured, run }, reference) {
   if (interactions !== theirInteractions) problems.push(`traces: ${interactions} interactions, where the exporter sent ${theirInteractions}`)
   const llm = spans.filter(s => s.name === 'claude_code.llm_request').length
   if (llm !== requests.exporter.length) problems.push(`traces: ${llm} llm_request spans, where the exporter logged ${requests.exporter.length} requests of the main loop and subagents`)
+  // Each built request carries the ID Claude Code gave it, from the transcript, as the exporter's span of the request names it; its own
+  // span carries the same, and no two requests share one.
+  const theirIds = new Set(spansOf(captured.exporter.traces).filter(s => s.name === 'claude_code.llm_request').map(s => s.attrs.request_id?.v))
+  const builtIds = requests.plugin.map(r => r.attributes.request_id?.v)
+  for (const id of builtIds) if (!theirIds.has(id)) problems.push(`logs: a built api_request row carries request_id ${JSON.stringify(id)}, which no request span of the exporter's names`)
+  if (new Set(builtIds).size !== builtIds.length) problems.push(`logs: built api_request rows share a request_id: ${builtIds.join(', ')}`)
+  const spanIds = spans.filter(s => s.name === 'claude_code.llm_request').map(s => s.attrs.request_id?.v)
+  if (JSON.stringify([...spanIds].sort()) !== JSON.stringify([...builtIds].sort())) problems.push(`traces: the built llm_request spans carry request_id ${spanIds.join(', ')}, the built rows ${builtIds.join(', ')}`)
 
   const points = pointsOf(captured.plugin.metrics)
   const theirPoints = pointsOf(captured.exporter.metrics).filter(p => p.attrs.query_source?.v !== 'auxiliary')
@@ -1245,17 +1253,16 @@ const KEYS_ADD = {
   rows: ['subagent_completed', 'retention_sweep', 'plugin_loaded'],
   attributes: {
     user_prompt: ['message.uuid'],
-    assistant_response: ['request_id', 'message.uuid'],
-    api_request: ['request_id', 'speed'],
+    assistant_response: ['message.uuid'],
+    api_request: ['speed'],
     tool_decision: ['permission_mode', 'request_id'],
     tool_result: ['error_type', 'request_id'],
-    'claude_code.llm_request': ['gen_ai.response.id', 'request_id'],
     // The error's text goes where the call's output does (`tool.result`, on in the rowless pass); its class never.
     'claude_code.tool.execution': ['error', 'error_class'],
   },
 }
 /** Values that differ between any two sessions (ids, times, sequences), or by a session's own paths; never compared. */
-const PER_SESSION = new Set(['session.id', 'prompt.id', 'user.id', 'agent_id', 'message.uuid', 'event.timestamp', 'event.sequence', 'duration_ms', 'ttft_ms', 'tool_result_size_bytes', 'tool_parameters', 'tool_input', 'cost_usd', 'mainwave.telemetry.built_from'])
+const PER_SESSION = new Set(['session.id', 'prompt.id', 'request_id', 'user.id', 'agent_id', 'message.uuid', 'event.timestamp', 'event.sequence', 'duration_ms', 'ttft_ms', 'tool_result_size_bytes', 'tool_parameters', 'tool_input', 'cost_usd', 'mainwave.telemetry.built_from'])
 function keysAdd(withRows, built) {
   const found = []
   const rowsWith = checkStatusQuiet(logRecordsOf(withRows.logs))

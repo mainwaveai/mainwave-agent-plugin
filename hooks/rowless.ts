@@ -14,7 +14,8 @@
 //
 //   user_prompt     a main-loop turn began: its prompt's length (the text itself is the gate's to add, as for Claude Code's row); the
 //                   turn's own text, or the prompt submitted while idle where the host starts the turn with none (register.ts)
-//   api_request     a model request answered: its model, tokens, effort, duration, time to first token and cost
+//   api_request     a model request answered: its model, tokens, effort, duration, time to first token and cost, and its request ID
+//                   (the transcript's, else one that stands for it), which its response row and its span carry too
 //   assistant_response  a model request answered with text: its length (the text itself is the gate's to add, as for Claude
 //                   Code's row), after its request row
 //   tool_decision   a tool call settled: refused (its permission check refused it, or asked and the call never ran) or accepted,
@@ -476,6 +477,47 @@ export type RequestFacts = {
   costUsd?: number
   /** Whether the session is a print or SDK session: its main loop's requests' `query_source` is `sdk` there. */
   sdk: boolean
+  /** The request's ID (`requestIdIn`, else `stepRequestId`): on its row and its response row, so a backend pairs the row with its span. */
+  requestId?: string
+}
+
+/**
+ * The ID a built request's rows carry where Claude Code's own can't be read from the transcript: the turn's ID and the step's index in
+ * it, which name one request each (a request Claude Code retries is one step), the same on the record and its span. It starts `step_`,
+ * so it is never taken for an API request's ID (`req_`).
+ */
+export const stepRequestId = (turnId: string, index: number): string => `step_${turnId}_${index}`
+
+/** An API request's ID as a transcript row names it (`req_…` first party; another provider's of its own shape). */
+const REQUEST_ID = /^[0-9A-Za-z._:-]{1,128}$/
+
+/**
+ * The ID of the API request that answered with the transcript row `uuid`: the row's `requestId`, which Claude Code writes on each row
+ * of a response (one row per block), from a stretch of transcript lines. `null` while no line of that row is there (not written yet);
+ * undefined for a row that names no ID, or one of another shape, or Claude Code's stand-in for a failed response.
+ */
+export function requestIdIn(text: string, uuid: string): string | undefined | null {
+  for (const line of text.split('\n')) {
+    if (!line.includes(uuid)) continue
+    let row: unknown
+    try {
+      row = JSON.parse(line)
+    } catch {
+      continue
+    }
+    if (row === null || typeof row !== 'object') continue
+    const r = row as Record<string, unknown>
+    if (r['uuid'] !== uuid) continue
+    const id = r['requestId']
+    return r['type'] === 'assistant' && r['isApiErrorMessage'] !== true && typeof id === 'string' && REQUEST_ID.test(id) ? id : undefined
+  }
+  return null
+}
+
+/** Where a subagent's transcript is: under the folder named for the main one, in `subagents/` (`$.session.info()`). */
+export function agentTranscriptPath(mainPath: string, agentId: string): string | undefined {
+  if (!mainPath.endsWith('.jsonl') || !/^[0-9A-Za-z_-]{1,128}$/.test(agentId)) return undefined
+  return `${mainPath.slice(0, -'.jsonl'.length)}/subagents/agent-${agentId}.jsonl`
 }
 
 const whole = (n: unknown): number | undefined => (typeof n === 'number' && Number.isFinite(n) && n >= 0 ? Math.round(n) : undefined)
@@ -546,6 +588,7 @@ export function requestRow(state: Rowless, head: Attrs, f: RequestFacts): RowIn 
     ['cost_usd_micros', cost === undefined ? undefined : Math.round(cost * 1e6)],
     ['duration_ms', Math.max(0, Math.round(f.endMs - f.startMs))],
     ['ttft_ms', f.firstChunkMs === undefined ? undefined : Math.max(0, Math.round(f.firstChunkMs - f.startMs))],
+    ['request_id', f.requestId],
     // A subagent's requests by its type, from its spawn; `agent:custom` where none was seen, which still reads as a subagent's.
     ['query_source', source],
     ['effort', effort],
@@ -558,11 +601,16 @@ export function requestRow(state: Rowless, head: Attrs, f: RequestFacts): RowIn 
  * A model request that answered with text: its `assistant_response` row, after its request row, as Claude Code logs one. The length
  * is the text's as the stream gave it; the text, redacted here, is the gate's to add where `response.text` is on.
  */
-export function responseRow(state: Rowless, head: Attrs, r: { length: number; model: string; agentId?: string; agent?: { type: string; builtIn: boolean }; sdk: boolean; atMs: number }): RowIn {
+export function responseRow(
+  state: Rowless,
+  head: Attrs,
+  r: { length: number; model: string; agentId?: string; agent?: { type: string; builtIn: boolean }; sdk: boolean; atMs: number; requestId?: string },
+): RowIn {
   return row(state, head, 'assistant_response', r.atMs, [
     ['response_length', r.length],
     ['response', '<REDACTED>'],
     ['model', r.model],
+    ['request_id', r.requestId],
     ['query_source', querySourceOf(r.agentId, r.agent, r.sdk)],
     ['agent_id', r.agentId],
   ])

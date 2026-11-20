@@ -5,7 +5,8 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { accountDeviceOf, costOf, decisionOf, handoffPrompt, hostContinue, insertedText, permissionRules, personPrompt, handoverIn, typedText, decisionSource, headOf, hostIdentityOf, joinPath, madeCommit, refusalKind, repoAttributes, promptIdFrom, responseTextOf, seedCost, newRowless, promptRow, providerOf, remoteSessionIdOf, requestRow, resultRow, rowHead, sessionIdentityOf, uuidOf } from '../hooks/rowless.ts'
+import { accountDeviceOf, agentTranscriptPath, costOf, decisionOf, handoffPrompt, hostContinue, insertedText, permissionRules, personPrompt, handoverIn, typedText, decisionSource, headOf, hostIdentityOf, joinPath, madeCommit, refusalKind, repoAttributes, promptIdFrom, responseTextOf, seedCost, newRowless, promptRow, providerOf, remoteSessionIdOf, requestIdIn, requestRow, resultRow, rowHead, sessionIdentityOf, stepRequestId, uuidOf } from '../hooks/rowless.ts'
+import { REQUEST_ID_TRIES, TRANSCRIPT_RETRY_MS } from '../hooks/register.ts'
 import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, infoCall, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, PROD, records, type Post, type Reply } from './rig.ts'
 
 const keyless = { options: {} }
@@ -22,7 +23,7 @@ const HOST_EMAIL = 'host@example.com'
 const BUILT = 'mainwave.telemetry.built_from'
 const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 300, cache_creation_input_tokens: 40, ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 40 }
 
-type World = { messages?: unknown[] | (() => unknown[]); settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown>; transcript?: string | (() => string); promptId?: string | (() => string); duringCall?: (id: string) => Promise<void> }
+type World = { messages?: unknown[] | (() => unknown[]); settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown>; transcript?: string | (() => string); promptId?: string | (() => string); duringCall?: (id: string) => Promise<void>; duringStep?: (step: { turnId: string; index: number; agentId?: string }) => Promise<void>; live?: Record<string, () => string> }
 
 function world(on: On, opts: World = {}) {
   const clock = mock.clock(on, { now: START })
@@ -53,15 +54,21 @@ function world(on: On, opts: World = {}) {
   // that call. A read may take a stretch of it.
   const transcript = opts.transcript === undefined ? undefined : typeof opts.transcript === 'function' ? opts.transcript : () => opts.transcript as string
   const promptNow = () => (typeof opts.promptId === 'function' ? opts.promptId() : opts.promptId ?? 'prompt-host')
+  // `live`: more files read as they are at each call (a subagent's transcript), each there from the start.
+  const liveFile = (path: string) => (path === TRANSCRIPT ? transcript : opts.live?.[path])
   if (transcript !== undefined) {
     on('session.*', (_$, e, next) => ((next.event as string) === 'session.info' ? ({ value: { transcriptPath: TRANSCRIPT, promptId: promptNow(), platform: 'linux', isHosted: true } } as never) : next(e)))
-    on('fs.stat', (_$, e, next) => ((e as unknown as { path: string }).path === TRANSCRIPT ? ({ value: { kind: 'file', size: new TextEncoder().encode(transcript()).length, mtimeMs: START, isLink: false } } as never) : next(e)))
+    on('fs.stat', (_$, e, next) => {
+      const file = liveFile((e as unknown as { path: string }).path)
+      return file !== undefined ? ({ value: { kind: 'file', size: new TextEncoder().encode(file()).length, mtimeMs: START, isLink: false } } as never) : next(e)
+    })
   }
   on('fs.read', (_$, e) => {
     const path = (e as unknown as { path: string }).path
-    if (path === TRANSCRIPT && transcript !== undefined) {
+    const file = liveFile(path)
+    if (file !== undefined) {
       const { offset = 0, length } = e as unknown as { offset?: number; length?: number }
-      return { value: new TextDecoder().decode(new TextEncoder().encode(transcript()).subarray(offset, length === undefined ? undefined : offset + length)) } as never
+      return { value: new TextDecoder().decode(new TextEncoder().encode(file()).subarray(offset, length === undefined ? undefined : offset + length)) } as never
     }
     if (path === `${HOME}/.claude.json` && opts.accountFile !== undefined) return { value: JSON.stringify(opts.accountFile) } as never
     if (opts.files?.[path] !== undefined) return { value: opts.files[path] } as never
@@ -95,6 +102,8 @@ function world(on: On, opts: World = {}) {
     await clock.advance(30)
     yield { kind: 'text', index: 0, text: 'ok' } as never
     await clock.advance(70)
+    // The rows of the response the conversation keeps, as the engine keeps them while the request streams (`session.append`).
+    await opts.duringStep?.({ turnId: e.turnId, index: e.index, ...(e.agentId !== undefined ? { agentId: e.agentId } : {}) })
     cost = Math.round(((costs.shift() ?? 0) + cost) * 1e9) / 1e9
     return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: { ...USAGE, model: 'claude-haiku-5-5' } } as never
   })
@@ -1698,5 +1707,181 @@ describe('the client a remote Cowork prompt was sent from', () => {
     expect(clientsOf(w.rig.rows)).toEqual([['user_prompt', undefined], ['api_request', 'web_claude_ai'], ['plugin_loaded', undefined]])
     expect(clientsOf(w.logs().filter(r => r.attributes['mainwave.telemetry.route'] === 'plugin'))).toEqual(expect.arrayContaining([['user_prompt', undefined], ['api_request', 'web_claude_ai'], ['plugin_loaded', undefined]]))
     for (const r of w.rig.rows) expect(contractViolations(r.attributes)).toEqual([])
+  })
+})
+
+describe("the request ID on the rows built from events", () => {
+  /** A transcript row of the model's response: one block, under the request it came from. */
+  const answerRow = (uuid: string, requestId: string | undefined, block: Record<string, unknown> = { type: 'text', text: 'ok' }) =>
+    JSON.stringify({ type: 'assistant', uuid, ...(requestId !== undefined ? { requestId } : {}), message: { id: `msg_${uuid}`, role: 'assistant', content: [block] } })
+  const PROMPT_ROW = JSON.stringify({ type: 'user', uuid: 'u-0', message: { role: 'user', content: 'go' } })
+  const SUB_TRANSCRIPT = '/home/dev/.claude/projects/-work-app/s-1/subagents/agent-a1.jsonl'
+
+  /** The session's transcript as its lines stand, and the response rows the engine keeps in each step, written there `lagMs` later. */
+  function transcribed(on: On, $: Engine, blocks: (step: { turnId: string; index: number; agentId?: string }) => readonly [uuid: string, requestId: string | undefined][], opts: { lagMs?: number; never?: boolean; transcript?: boolean; unwritten?: boolean } = {}) {
+    const lines: { line: string; atMs: number; agentId?: string }[] = opts.unwritten ? [] : [{ line: PROMPT_ROW, atMs: 0 }]
+    // With `unwritten`, no file until its first line is written, as a new session's transcript.
+    const file = (agentId: string | undefined) => () => {
+      const text = lines.filter(l => l.agentId === agentId && l.atMs <= w.clock.now()).map(l => `${l.line}\n`).join('')
+      if (text === '' && opts.unwritten) throw new Error('no such file in test')
+      return text
+    }
+    const w = world(on, {
+      accountFile: ACCOUNT_FILE,
+      ...(opts.transcript === false ? {} : { transcript: file(undefined), live: { [SUB_TRANSCRIPT]: file('a1') } }),
+      duringStep: async step => {
+        for (const [uuid, requestId] of blocks(step)) {
+          await $.session.append({ message: { type: 'assistant', role: 'assistant', content: [{ type: 'text', text: 'ok' }] }, door: 'response', origin: { kind: 'model', model: 'claude-haiku-5-5' }, uuid, ...(step.agentId !== undefined ? { agentId: step.agentId } : {}) } as never)
+          if (!opts.never) lines.push({ line: answerRow(uuid, requestId), atMs: w.clock.now() + (opts.lagMs ?? 150), ...(step.agentId !== undefined ? { agentId: step.agentId } : {}) })
+        }
+      },
+    })
+    return w
+  }
+
+  /** Waits for `run` while the clock moves on a tenth of a second at a time, as the engine's does. */
+  async function ticking(w: ReturnType<typeof world>, run: Promise<unknown>, ms = 5_000) {
+    let done = false
+    const settled = run.finally(() => (done = true))
+    for (let t = 0; t < ms && !done; t += 100) await w.clock.advance(100)
+    await settled
+  }
+
+  /** A main-loop turn of `steps` model requests and no call; the step returns without the clock moving past it. */
+  async function requests($: Engine, w: ReturnType<typeof world>, turnId: string, steps = 1, text = 'go') {
+    await $.turn.start({ turnId, text } as never)
+    for (let index = 0; index < steps; index++) {
+      await ticking(w, (async () => {
+        const stream = $.turn.step({ turnId, index, model: 'claude-haiku-5-5', messageCount: 1 } as never)
+        while (!(await stream.next()).done) {
+          // Read to its end, as the engine does.
+        }
+      })())
+    }
+    await ticking(w, $.turn.complete({ turnId, answer: 'ok', durationMs: 200, isAborted: false, reason: 'answer' } as never))
+  }
+
+  const ids = (w: ReturnType<typeof world>, event: string) => w.built().filter(r => r.attributes['event.name'] === event).map(r => r.attributes['request_id'])
+  const spanIds = (w: ReturnType<typeof world>) => spans(w.posts).filter(s => s.name === 'claude_code.llm_request').map(s => [s.attrs['request_id'], s.attrs['gen_ai.response.id']])
+
+  test("a request's rows and its span carry Claude Code's request ID: the transcript's, on the row of its response's last block", keyless, async ($, on) => {
+    const w = transcribed(on, $, () => [['u-1', 'req_011A'], ['u-2', 'req_011A']])
+    await start($)
+    await requests($, w, 't1')
+    await w.clock.advance(5_000)
+    await end($)
+    expect(ids(w, 'api_request')).toEqual(['req_011A'])
+    expect(ids(w, 'assistant_response')).toEqual(['req_011A'])
+    expect(spanIds(w)).toEqual([['req_011A', 'req_011A']])
+    for (const r of w.built()) expect(contractViolations(r.attributes)).toEqual([])
+  })
+
+  test('the request goes on as it ends: its rows wait beside it for the transcript, which Claude Code writes a moment later, and the turn ends after them', keyless, async ($, on) => {
+    const w = transcribed(on, $, () => [['u-1', 'req_011A']], { lagMs: 450 })
+    await start($)
+    await $.turn.start({ turnId: 't1', text: 'go' } as never)
+    const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-haiku-5-5', messageCount: 1 } as never)
+    // Read to its end with the clock moved only by the step itself: a step that waited on the clock would never end.
+    let steps = 0
+    const read = (async () => {
+      while (!(await stream.next()).done) steps++
+    })()
+    await w.clock.advance(100)
+    await read
+    const endedAt = w.clock.now()
+    await ticking(w, $.turn.complete({ turnId: 't1', answer: 'ok', durationMs: 200, isAborted: false, reason: 'answer' } as never))
+    expect(w.clock.now()).toBeGreaterThanOrEqual(endedAt + 300)
+    await w.clock.advance(5_000)
+    await end($)
+    expect(ids(w, 'api_request')).toEqual(['req_011A'])
+    expect(spanIds(w)).toEqual([['req_011A', 'req_011A']])
+    // The span sits in the turn's interaction, which closed after it.
+    const sent = spans(w.posts)
+    expect(sent.find(s => s.name === 'claude_code.llm_request')!.parentSpanId).toBe(sent.find(s => s.name === 'claude_code.interaction')!.spanId)
+  })
+
+  test("a new session's first request, begun before its transcript is written at all, takes the transcript's ID too", keyless, async ($, on) => {
+    const w = transcribed(on, $, () => [['u-1', 'req_011A']], { unwritten: true })
+    await start($)
+    await requests($, w, 't1')
+    await w.clock.advance(5_000)
+    expect(ids(w, 'api_request')).toEqual(['req_011A'])
+  })
+
+  test("a request Claude Code retried after part of a response: the rows take the ID of the last block's request, the one that answered", keyless, async ($, on) => {
+    const w = transcribed(on, $, () => [['u-1', 'req_011First'], ['u-2', 'req_011Retry']])
+    await start($)
+    await requests($, w, 't1')
+    await w.clock.advance(5_000)
+    expect(ids(w, 'api_request')).toEqual(['req_011Retry'])
+  })
+
+  test("a subagent's request takes its ID from the subagent's own transcript", keyless, async ($, on) => {
+    const w = transcribed(on, $, step => [[`u-${step.agentId ?? 'main'}`, step.agentId === undefined ? 'req_011Main' : 'req_011Sub']])
+    await start($)
+    await $.turn.start({ turnId: 't1', text: 'go' } as never)
+    await $.turn.start({ turnId: 't2', text: 'sub', agentId: 'a1' } as never)
+    await ticking(w, (async () => {
+      const stream = $.turn.step({ turnId: 't2', index: 0, model: 'claude-haiku-5-5', messageCount: 1, agentId: 'a1' } as never)
+      while (!(await stream.next()).done) {
+        // Read to its end.
+      }
+    })())
+    await ticking(w, $.turn.complete({ turnId: 't2', answer: 'ok', durationMs: 200, isAborted: false, reason: 'answer', agentId: 'a1' } as never))
+    await w.clock.advance(5_000)
+    const req = w.built().find(r => r.attributes['event.name'] === 'api_request')!.attributes
+    expect([req['agent_id'], req['request_id']]).toEqual(['a1', 'req_011Sub'])
+  })
+
+  test('where the transcript never gets the row, the rows go after the last read with the ID that stands for the request, and the turn ends then', keyless, async ($, on) => {
+    const w = transcribed(on, $, () => [['u-1', 'req_011A']], { never: true })
+    await start($)
+    const before = w.clock.now()
+    await requests($, w, 't1')
+    expect(w.clock.now() - before).toBeLessThanOrEqual(REQUEST_ID_TRIES * TRANSCRIPT_RETRY_MS + 1_000)
+    await w.clock.advance(5_000)
+    await end($)
+    expect(ids(w, 'api_request')).toEqual(['step_t1_0'])
+    expect(ids(w, 'assistant_response')).toEqual(['step_t1_0'])
+    expect(spanIds(w)).toEqual([['step_t1_0', 'step_t1_0']])
+  })
+
+  test('with no transcript, or no row of the response seen kept, the rows go at once, with the ID that stands for each request', keyless, async ($, on) => {
+    const w = transcribed(on, $, step => (step.index === 0 ? [['u-1', 'req_011A']] : []), { transcript: false })
+    await start($)
+    await requests($, w, 't1', 2)
+    await w.clock.advance(5_000)
+    await end($)
+    expect(ids(w, 'api_request')).toEqual(['step_t1_0', 'step_t1_1'])
+    expect(spanIds(w).map(([id]) => id).sort()).toEqual(['step_t1_0', 'step_t1_1'])
+  })
+
+  test('an ID the transcript gives two requests goes on the first alone: the second carries the ID that stands for it', keyless, async ($, on) => {
+    const w = transcribed(on, $, step => [[`u-${step.turnId}-${step.index}`, 'req_011Same']])
+    await start($)
+    await requests($, w, 't1')
+    await requests($, w, 't2', 1, 'again')
+    await w.clock.advance(5_000)
+    expect(ids(w, 'api_request')).toEqual(['req_011Same', 'step_t2_0'])
+  })
+
+  test("the request ID in a transcript's lines: the row's own, where it is the model's and names one", () => {
+    const text = [PROMPT_ROW, answerRow('u-1', 'req_011A'), answerRow('u-2', undefined), JSON.stringify({ type: 'assistant', uuid: 'u-3', requestId: 'req_011C', isApiErrorMessage: true }), answerRow('u-4', 'not an id!'), '{"cut'].join('\n')
+    expect(requestIdIn(text, 'u-1')).toBe('req_011A')
+    expect(requestIdIn(text, 'u-2')).toBeUndefined()
+    expect(requestIdIn(text, 'u-3')).toBeUndefined()
+    expect(requestIdIn(text, 'u-4')).toBeUndefined()
+    expect(requestIdIn(text, 'u-0')).toBeUndefined()
+    expect(requestIdIn(text, 'u-9')).toBeNull()
+    // A row that names the uuid in its text alone is not that row.
+    expect(requestIdIn(JSON.stringify({ type: 'assistant', uuid: 'u-5', requestId: 'req_011E', message: { content: 'see u-1' } }), 'u-1')).toBeNull()
+  })
+
+  test('the ID that stands for a request, and where a subagent writes its transcript', () => {
+    expect(stepRequestId('t1', 0)).toBe('step_t1_0')
+    expect(stepRequestId('t1', 0)).not.toMatch(/^req_/)
+    expect(agentTranscriptPath('/p/s-1.jsonl', 'a1')).toBe('/p/s-1/subagents/agent-a1.jsonl')
+    expect(agentTranscriptPath('/p/s-1.jsonl', '../x')).toBeUndefined()
+    expect(agentTranscriptPath('/p/s-1', 'a1')).toBeUndefined()
   })
 })
