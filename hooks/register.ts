@@ -32,7 +32,7 @@ import type { RowIdentity } from '../types'
 import { captureCommit, capturePrompt, captureTool, dropStreamedText, loopKey, newCapture, rowFill, streamChunk, streamedText, streamedThinking, streamStart, type Capture } from './capture.ts'
 import { MCP_SERVER_ROW, PLUGIN_STATUS_ROW, SKILL_PROMPT_ROW, type Switch } from './catalog.ts'
 import { clientPlatformIn } from './client.ts'
-import { mcpParts } from './derive.ts'
+import { HELPER_SOURCES, mcpParts } from './derive.ts'
 import { allows, configureGate, currentGate, gateAttributes, gateMarker, gateRow, gateSpan, metricAllowed, openGate, resetPacks, setOptIn, setOverrides, type RowFill } from './gate.ts'
 import { classifyGlab, glabConfigDir, glabHosts, glabTexts, instanceOf, mrAttributes, mrFromApi, mrLookup, mrUrlOf, parseMrJson, repositoryIdOf, sameUrl, stripDraft, type MrDetails, type MrRef } from './glab.ts'
 import { endSession } from './http.ts'
@@ -48,8 +48,8 @@ import {
   agentSpawned, callerCtx, commandEnd, commandStart, newRebuild, observeRow, parseTraceparent, promptDropped, promptSubmitted, randomHex, sessionStarted, takeReady, stepEnd, stepStart, sweep, toolEnd, toolJoinsTurn, toolStart, turnComplete, turnPrompted, turnStart, waits, type Emit, type Rebuild, type RowIn,
 } from './rebuild.ts'
 import {
-  accountDeviceOf, agentTranscriptPath, costOf, decisionOf, decisionRow, headOf, hostIdentityOf, joinPath, madeCommit, newRowless, promptIdFrom, promptRow, providerOf, remoteSessionIdOf, repoAttributes, requestIdIn, requestRow, responseRow,
-  handoffPrompt, handoverIn, hostContinue, permissionRules, personPrompt, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, stepRequestId, typedText, uuidOf, type Handover, type HostFacts, type HostIdentityEnv, type MadeCommit, type Rowless, type Verdict,
+  accountDeviceOf, agentLedgerOf, agentTranscriptPath, costOf, decisionOf, decisionRow, headOf, hostIdentityOf, joinPath, madeCommit, newRowless, promptIdFrom, promptRow, providerOf, remoteSessionIdOf, repoAttributes, requestIdIn, requestRow, responseRow,
+  handoffPrompt, handoverIn, helperRow, hostContinue, ledgerGrowth, permissionRules, personPrompt, responseTextOf, resultRow, rowHead, seedCost, sessionIdentityOf, stepRequestId, typedText, uuidOf, type Handover, type HostFacts, type HostIdentityEnv, type HelperFacts, type MadeCommit, type ModelTokens, type Rowless, type Verdict,
 } from './rowless.ts'
 import { applyStoredSettings, ensureFetching, noteSessionIdentity, resetOrgSettings, settingsPending, settingsSummary, settingsUnavailable } from './orgsettings.ts'
 import { contentLimit } from './protect.ts'
@@ -162,6 +162,12 @@ let stepsInFlight = 0
  * it was as the request began, and the ID of the last row of the model's the loop's conversation kept since (`session.append`).
  */
 let stepRows = new Map<string, StepRows>()
+/**
+ * Each subagent's ledger (`$.agent.list()`'s tokens by model) as last read, while the plugin builds the rows: read as a step of its
+ * ends that called a tool which makes a model request of its own (`HELPER_SOURCES`), and again as each such call ends, so what the
+ * ledger grew by over the run is that request's (`ledgerGrowth`).
+ */
+let agentLedgers = new Map<string, Promise<ModelTokens[] | undefined>>()
 /** The built rows of the requests whose ID is looked for in the transcript, sent in order as each is found: a turn's end waits for them. */
 let requestRows: Promise<void> = Promise.resolve()
 let requestRowsPending = 0
@@ -1303,12 +1309,12 @@ async function nextSession($: EngineInterface): Promise<void> {
  * Reads one row into the rebuild: the row's own attributes as Claude Code raised them, before any stamp. Answers what it produced
  * and the ids the row's copy carries, where the rebuild gives them; null when the plugin does not rebuild.
  */
-async function observe($: EngineInterface, e: Frozen<TelemetryRecordEntry>): Promise<(Emit & { rowCtx?: { traceId: string; spanId: string } }) | null> {
+async function observe($: EngineInterface, e: Frozen<TelemetryRecordEntry>, call?: string): Promise<(Emit & { rowCtx?: { traceId: string; spanId: string } }) | null> {
   const r = await rebuildOf($)
   if (r === null) return null
   const atMs = Date.parse(e.loggedAt)
   const span = e.span === undefined ? undefined : { traceId: e.span.traceId, spanId: e.span.spanId }
-  return observeRow(r, { event: e.event, atMs: Number.isFinite(atMs) ? atMs : await $.clock.now(), ...(span ? { span } : {}), attributes: e.attributes })
+  return observeRow(r, { event: e.event, atMs: Number.isFinite(atMs) ? atMs : await $.clock.now(), ...(span ? { span } : {}), ...(call !== undefined ? { call } : {}), attributes: e.attributes })
 }
 
 /**
@@ -1354,10 +1360,10 @@ export async function stampRow($: RowParams[0], e: RowParams[1], next: RowParams
  * is the plugin's own: a fault in either never holds the exporter's row, and a fault in the rebuild never holds the copy. The row's
  * copy is queued before what the row completes, as the row came first.
  */
-async function copyRow($: EngineInterface, e: Frozen<TelemetryRecordEntry>, attributes: Record<string, TelemetryAttribute>, built = false, given?: RowFill): Promise<void> {
+async function copyRow($: EngineInterface, e: Frozen<TelemetryRecordEntry>, attributes: Record<string, TelemetryAttribute>, built = false, given?: RowFill, call?: string): Promise<void> {
   let out: Awaited<ReturnType<typeof observe>> = null
   try {
-    out = await observe($, e)
+    out = await observe($, e, call)
   } catch {
     out = null
   }
@@ -1638,6 +1644,7 @@ async function readHead($: EngineInterface): Promise<MadeCommit | undefined> {
 
 /** A row built from Claude Code's events, as Claude Code's own go: stamped (its prompt's client among them), through the rebuild, and copied. */
 async function feedRow($: EngineInterface, row: RowIn, fill?: RowFill): Promise<void> {
+  // A tool's own request names its call, which the rebuild puts it under; the row's copy carries no more than Claude Code's.
   entrypoint ??= readEntrypoint($)
   const ep = await entrypoint
   const e = { to: 'collector', event: row.event, attributes: row.attributes, loggedAt: new Date(row.atMs).toISOString() } as Frozen<TelemetryRecordEntry>
@@ -1646,7 +1653,7 @@ async function feedRow($: EngineInterface, row: RowIn, fill?: RowFill): Promise<
     // Built at the turn's start or later, when the prompt's row in the transcript is written.
     ...(await clientStamp($, row.attributes, true)),
   })
-  await copyRow($, e, attributes, true, fill)
+  await copyRow($, e, attributes, true, fill, row.call)
 }
 
 /** Claude Code's id of the prompt the session is on, so the rows built of its turn carry the one its own records do; undefined where it can't be read. */
@@ -2107,11 +2114,54 @@ export async function* stepHook($: StepParams[0], e: StepParams[1], next: StepPa
         const looked = mine?.last !== undefined && !mine.overlapped ? requestIdOf($, mine.at, mine.last) : undefined
         await sendRequestRows($, request, response, looked, e.agentId === undefined)
       }
+      // A subagent's step that called a tool which makes a request of its own: its ledger as the step ended, before that request.
+      if (rowless && e.agentId !== undefined && result?.toolUses?.some(t => HELPER_SOURCES[t.name] !== undefined)) noteLedger($, e.agentId)
     } catch {
       // The request's span goes without its stop reason.
     }
   }
   return result
+}
+
+/** A subagent's ledger as `$.agent.list()` answers it now; undefined where it can't be read. */
+async function ledgerOf($: EngineInterface, agentId: string): Promise<ModelTokens[] | undefined> {
+  try {
+    return agentLedgerOf(await ($ as unknown as { agent: { list: () => Promise<unknown> } }).agent.list(), agentId)
+  } catch {
+    return undefined
+  }
+}
+
+/** Reads a subagent's ledger now, as the reading its next tool's own request is counted from. */
+function noteLedger($: EngineInterface, agentId: string): void {
+  agentLedgers.delete(agentId)
+  agentLedgers.set(agentId, ledgerOf($, agentId))
+  if (agentLedgers.size > MAX_VERDICTS) agentLedgers.delete(agentLedgers.keys().next().value!)
+}
+
+/**
+ * What the request a WebFetch or WebSearch call made in its run cost, read as the call ends: what the session's cost grew by since the
+ * last reading (`costOf`), so it is this request's, not the next one's; and in a subagent, its model and tokens, what the subagent's
+ * ledger grew by since it was last read. Undefined where the call made none (nothing grew) or none of it could be read.
+ */
+async function helperOf($: EngineInterface, call: { tool: string; id: string; agentId?: string }, runStartMs: number, endMs: number): Promise<HelperFacts | undefined> {
+  return takeCost($, async ({ costUsd }) => {
+    const share = costOf(rowlessState, costUsd)
+    let usage: ModelTokens | undefined
+    const agentId = call.agentId
+    const before = agentId !== undefined ? agentLedgers.get(agentId) : undefined
+    if (agentId !== undefined && before !== undefined) {
+      const was = await before.catch(() => undefined)
+      const now = await ledgerOf($, agentId)
+      if (now !== undefined) agentLedgers.set(agentId, Promise.resolve(now))
+      if (was !== undefined && now !== undefined) usage = ledgerGrowth(was, now)
+    }
+    if ((share === undefined || share <= 0) && usage === undefined) return undefined
+    return {
+      tool: call.tool, toolUseId: call.id, ...(agentId !== undefined ? { agentId } : {}), runStartMs, endMs,
+      ...(share !== undefined ? { costUsd: share } : {}), ...(usage !== undefined ? { usage } : {}),
+    }
+  })
 }
 
 /** The call's own arguments, and who made it: what the engine adds beside the arguments is not the tool's input. */
@@ -2132,6 +2182,8 @@ type CallRows = {
   endMs: number
   decision?: { refused: boolean; source?: string; atMs: number }
   ran?: { startMs: number; runStartMs?: number; endMs: number; isError: boolean; input: Readonly<Record<string, unknown>>; text?: string; commit?: MadeCommit }
+  /** The model request the tool made in its run (WebFetch's, WebSearch's): its row goes between the call's decision and its result. */
+  helper?: HelperFacts
 }
 
 /** A tool call's decision row, its end in the rebuild, then its result row: the decision first, so a refused call's spans go as it ends. */
@@ -2139,6 +2191,8 @@ async function sendCall($: EngineInterface, r: Rebuild, c: CallRows): Promise<vo
   const built = c.decision !== undefined && rowless
   const head = built ? await rowlessHead($) : undefined
   if (built) await feedRow($, decisionRow(rowlessState, head!, { ...c.call, ...c.decision! }, c.decision!.atMs))
+  const helper = built && c.helper !== undefined ? helperRow(rowlessState, head!, c.helper) : undefined
+  if (helper !== undefined) await feedRow($, { ...helper, call: c.call.id })
   await emit($, toolEnd(r, c.id, c.result as never, c.endMs))
   if (built && c.ran !== undefined) await feedRow($, resultRow(rowlessState, head!, { ...c.call, ...c.ran }))
 }
@@ -2273,8 +2327,11 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
         if (commit !== undefined) captureCommit(capture, id!, commit)
         ran = { startMs: startMs!, ...(ranAtMs !== undefined ? { runStartMs: ranAtMs } : {}), endMs, isError, input, ...(typeof text === 'string' ? { text } : {}), ...(commit !== undefined ? { commit } : {}) }
       }
+      // A WebFetch or WebSearch call that answered made a model request in its run: its cost is read now, before the next request's.
+      const helper = ran !== undefined && !isError && HELPER_SOURCES[e.tool] !== undefined ? await helperOf($, call, ranAtMs ?? startMs!, endMs).catch(() => undefined) : undefined
       const rows: CallRows = {
         id, call, result, startMs: startMs ?? endMs, endMs, ...(built ? { decision: { refused, ...(decision.source !== undefined ? { source: decision.source } : {}), atMs: decision.atMs } } : {}), ...(ran !== undefined ? { ran } : {}),
+        ...(helper !== undefined ? { helper } : {}),
       }
       if (hold && built) earlyCalls.push(rows)
       else {
@@ -2606,6 +2663,7 @@ export const register: Register = on => {
   rowsAtLoad = null
   stepsInFlight = 0
   stepRows = new Map()
+  agentLedgers = new Map()
   requestRows = Promise.resolve()
   requestRowsPending = 0
   mainRequestRows = Promise.resolve()

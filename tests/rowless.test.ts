@@ -5,7 +5,7 @@
 import type { On } from 'claude-code'
 import { describe, expect, mock, test, type Engine } from 'claude-code/testing'
 
-import { accountDeviceOf, agentTranscriptPath, costOf, decisionOf, handoffPrompt, hostContinue, insertedText, permissionRules, personPrompt, handoverIn, typedText, decisionSource, headOf, hostIdentityOf, joinPath, madeCommit, refusalKind, repoAttributes, promptIdFrom, responseTextOf, seedCost, newRowless, promptRow, providerOf, remoteSessionIdOf, requestIdIn, requestRow, resultRow, rowHead, sessionIdentityOf, stepRequestId, uuidOf } from '../hooks/rowless.ts'
+import { accountDeviceOf, agentLedgerOf, agentTranscriptPath, costOf, helperRequestId, helperRow, ledgerGrowth, decisionOf, handoffPrompt, hostContinue, insertedText, permissionRules, personPrompt, handoverIn, typedText, decisionSource, headOf, hostIdentityOf, joinPath, madeCommit, refusalKind, repoAttributes, promptIdFrom, responseTextOf, seedCost, newRowless, promptRow, providerOf, remoteSessionIdOf, requestIdIn, requestRow, resultRow, rowHead, sessionIdentityOf, stepRequestId, uuidOf } from '../hooks/rowless.ts'
 import { REQUEST_ID_TRIES, TRANSCRIPT_RETRY_MS } from '../hooks/register.ts'
 import { ACCOUNT, boot, contractViolations, DEVICE, EMAIL, infoCall, keylessAnswer, LOGGED_AT, memoryStore, network, ORG, PROD, records, type Post, type Reply } from './rig.ts'
 
@@ -23,7 +23,7 @@ const HOST_EMAIL = 'host@example.com'
 const BUILT = 'mainwave.telemetry.built_from'
 const USAGE = { input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 300, cache_creation_input_tokens: 40, ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 40 }
 
-type World = { messages?: unknown[] | (() => unknown[]); settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown>; transcript?: string | (() => string); promptId?: string | (() => string); duringCall?: (id: string) => Promise<void>; duringStep?: (step: { turnId: string; index: number; agentId?: string }) => Promise<void>; live?: Record<string, () => string> }
+type World = { messages?: unknown[] | (() => unknown[]); settings?: () => Reply | Promise<Reply>; repo?: { remote: string | null } | null; files?: Record<string, string>; saved?: boolean; env?: Record<string, string>; entrypoint?: string; machine?: string; dropPrompt?: string; turns?: Record<string, () => Promise<void>>; accountFile?: unknown; version?: string; costs?: number[]; rowsSeen?: boolean; startedAt?: number; costBefore?: number; store?: Record<string, unknown>; transcript?: string | (() => string); promptId?: string | (() => string); duringCall?: (id: string) => Promise<void>; duringStep?: (step: { turnId: string; index: number; agentId?: string }) => Promise<void>; live?: Record<string, () => string>; stepTools?: (step: { agentId?: string }) => string[]; agents?: () => unknown[] }
 
 function world(on: On, opts: World = {}) {
   const clock = mock.clock(on, { now: START })
@@ -105,8 +105,11 @@ function world(on: On, opts: World = {}) {
     // The rows of the response the conversation keeps, as the engine keeps them while the request streams (`session.append`).
     await opts.duringStep?.({ turnId: e.turnId, index: e.index, ...(e.agentId !== undefined ? { agentId: e.agentId } : {}) })
     cost = Math.round(((costs.shift() ?? 0) + cost) * 1e9) / 1e9
-    return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses: [], stopReason: 'end_turn', usage: { ...USAGE, model: 'claude-haiku-5-5' } } as never
+    const toolUses = (opts.stepTools?.({ ...(e.agentId !== undefined ? { agentId: e.agentId } : {}) }) ?? []).map(name => ({ name, input: {} }))
+    return { turnId: e.turnId, index: e.index, answer: 'ok', toolUses, stopReason: toolUses.length > 0 ? 'tool_use' : 'end_turn', usage: { ...USAGE, model: 'claude-haiku-5-5' } } as never
   })
+  // The session's subagents, each with its ledger as `agents` says it is at the call.
+  if (opts.agents !== undefined) on('agent.list', () => ({ value: opts.agents!() }) as never)
   // The permission check: an ask for a command outside the working folder, and for one a settings hook on the permission request
   // answers (`touch /asked`); an allow for the rest. With `saved`, the answer was saved: the check allows the command outright.
   on('tool.check', (_$, e) => {
@@ -129,6 +132,7 @@ function world(on: On, opts: World = {}) {
     const input = e as unknown as { command?: string }
     if (input.command === 'rm -rf x') return { deny: 'refused in test' } as never
     if (input.command === 'false') return { ref: 1, isError: true, result: 'Error: exit 1', text: 'Error: exit 1' } as never
+    if ((e as unknown as { url?: string }).url === 'https://example.com/missing') return { ref: 1, isError: true, result: 'Error: 404', text: 'Error: 404' } as never
     if (input.command === 'git commit -m x') return { result: { stdout: '[feature/login 1a2b3c4] x\n 1 file changed', stderr: '', interrupted: false, isImage: false, noOutputExpected: false } } as never
     return { result: { stdout: 'hi', stderr: '', interrupted: false, isImage: false, noOutputExpected: false } } as never
   })
@@ -544,6 +548,141 @@ describe('the rows built from events', () => {
     const req = rows.find(r => r.attributes['event.name'] === 'api_request')!.attributes
     expect(req['agent_id']).toBe('a1')
     expect(req['query_source']).toBe('agent:custom')
+  })
+})
+
+describe("a tool's own model request (WebFetch's, WebSearch's), in the rows built from events", () => {
+  const event = (r: { attributes: Record<string, unknown> }) => r.attributes['event.name']
+  const requests = (w: ReturnType<typeof world>) => w.built().filter(r => event(r) === 'api_request').map(r => r.attributes)
+  const read = async (stream: AsyncGenerator<unknown, unknown, unknown>) => {
+    while (!(await stream.next()).done) {
+      // Read to its end, as the engine does.
+    }
+  }
+
+  /** A main-loop turn: a request that asks for `call`, the call, and the request after it. */
+  async function callTurn($: Engine, call: Record<string, unknown>) {
+    await $.turn.start({ turnId: 't1', text: 'go' } as never)
+    await read($.turn.step({ turnId: 't1', index: 0, model: 'claude-haiku-5-5', messageCount: 1 } as never))
+    await $.tool.call(call as never)
+    await read($.turn.step({ turnId: 't1', index: 1, model: 'claude-haiku-5-5', messageCount: 3 } as never))
+    await $.turn.complete({ turnId: 't1', answer: 'ok', durationMs: 200, isAborted: false, reason: 'answer' } as never)
+  }
+
+  test("a WebFetch call's request in the main loop: a row and span of its own, its cost its own and not the next request's", keyless, async ($, on) => {
+    let spend = (_usd: number) => 0
+    const w = world(on, { accountFile: ACCOUNT_FILE, env: { CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: '1' }, costs: [0.01, 0.03], duringCall: async id => void (id === 'toolu_w' && spend(0.004)) })
+    spend = w.spend
+    await start($)
+    await callTurn($, { tool: 'WebFetch', url: 'https://example.com/a', prompt: 'Summarize', tool_use_id: 'toolu_w' })
+    await w.clock.advance(5_000)
+    await end($)
+    // Between the call's decision and its result, as Claude Code logs it.
+    expect(w.built().map(event)).toEqual(['user_prompt', 'api_request', 'assistant_response', 'tool_decision', 'api_request', 'tool_result', 'api_request', 'assistant_response'])
+    expect(requests(w).map(r => r['cost_usd'])).toEqual([0.01, 0.004, 0.03])
+    const helper = requests(w)[1]!
+    expect(helper).toEqual(expect.objectContaining({ query_source: 'web_fetch_apply', request_id: 'helper_toolu_w', cost_usd: 0.004, cost_usd_micros: 4000, duration_ms: 25 }))
+    // No event of the main loop's says the request's model or tokens.
+    for (const k of ['model', 'input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_creation_tokens', 'agent_id']) expect(helper[k]).toBeUndefined()
+    // Its span sits in the call's run, in the turn's trace, as Claude Code's does; its row is logged in that run.
+    const sent = spans(w.posts)
+    const run = sent.find(s => s.name === 'claude_code.tool.execution' && s.attrs['tool_use_id'] === 'toolu_w')!
+    const llm = sent.filter(s => s.name === 'claude_code.llm_request')
+    expect(llm.length).toBe(3)
+    const own = llm.find(s => s.attrs['request_id'] === 'helper_toolu_w')!
+    expect(own.parentSpanId).toBe(run.spanId)
+    expect(own.traceId).toBe(sent.find(s => s.name === 'claude_code.interaction')!.traceId)
+    expect(own.attrs).toEqual(expect.objectContaining({ 'llm_request.context': 'tool', query_source_safe: 'web_fetch_apply', [BUILT]: 'events' }))
+    const record = w.built().find(r => r.attributes['request_id'] === 'helper_toolu_w')!
+    expect([record.traceId, record.spanId]).toEqual([run.traceId, run.spanId])
+    // Its cost counts as Claude Code's exporter counts a request outside the main loop and its subagents'.
+    const cost = points(w.posts).filter(x => x.name === 'claude_code.cost.usage')
+    expect(cost.find(x => x.attrs['query_source'] === 'auxiliary')?.value).toBe(0.004)
+    expect(Math.abs(cost.reduce((n, x) => n + x.value, 0) - 0.044)).toBeLessThan(1e-9)
+  })
+
+  test("a WebSearch call's request in a subagent: its model and tokens, what the subagent's ledger grew by over the call", keyless, async ($, on) => {
+    let spend = (_usd: number) => 0
+    const ledger: Record<string, unknown>[] = [{ model: 'claude-sonnet-5-5', input_tokens: 1201, output_tokens: 20, cache_read_input_tokens: 300, cache_creation_input_tokens: 40 }]
+    const w = world(on, {
+      accountFile: ACCOUNT_FILE, costs: [0.01, 0.03],
+      stepTools: step => (step.agentId === 'a1' ? ['WebSearch'] : []),
+      agents: () => [{ id: 'a0', usage: [] }, { id: 'a1', usage: ledger.map(u => ({ ...u })) }],
+      duringCall: async id => {
+        if (id !== 'toolu_s') return
+        ledger.push({ model: 'claude-haiku-5-5', input_tokens: 900, output_tokens: 40, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 })
+        spend(0.002)
+      },
+    })
+    spend = w.spend
+    await start($)
+    await $.turn.start({ turnId: 't1', text: 'go' } as never)
+    await $.turn.start({ turnId: 't2', text: 'sub', agentId: 'a1' } as never)
+    await read($.turn.step({ turnId: 't2', index: 0, model: 'claude-sonnet-5-5', messageCount: 1, agentId: 'a1' } as never))
+    await $.tool.call({ tool: 'WebSearch', query: 'news', agentId: 'a1', tool_use_id: 'toolu_s' } as never)
+    await read($.turn.step({ turnId: 't2', index: 1, model: 'claude-sonnet-5-5', messageCount: 3, agentId: 'a1' } as never))
+    await w.clock.advance(5_000)
+    await end($)
+    expect(requests(w).map(r => r['cost_usd'])).toEqual([0.01, 0.002, 0.03])
+    expect(requests(w)[1]).toEqual(expect.objectContaining({
+      query_source: 'web_search_tool', request_id: 'helper_toolu_s', agent_id: 'a1', model: 'claude-haiku-5-5',
+      input_tokens: 900, output_tokens: 40, cache_read_tokens: 0, cache_creation_tokens: 0, cache_creation_5m_tokens: 0, cache_creation_1h_tokens: 0,
+    }))
+    const tokens = points(w.posts).filter(x => x.name === 'claude_code.token.usage' && x.attrs['model'] === 'claude-haiku-5-5' && x.attrs['query_source'] === 'auxiliary')
+    expect(tokens.map(x => [x.attrs['type'], x.value])).toEqual([['input', 900], ['output', 40], ['cacheRead', 0], ['cacheCreation', 0]])
+  })
+
+  test('a call that made no request, or failed, builds none: what the session spent meanwhile stays with the next reading', keyless, async ($, on) => {
+    let spend = (_usd: number) => 0
+    const w = world(on, { accountFile: ACCOUNT_FILE, costs: [0.01, 0.03, 0.05, 0.07], duringCall: async id => void (id === 'toolu_bad' && spend(0.004)) })
+    spend = w.spend
+    await start($)
+    // Nothing grew while it ran (a page it answered without asking the model).
+    await callTurn($, { tool: 'WebFetch', url: 'https://example.com/a', prompt: 'x', tool_use_id: 'toolu_free' })
+    // It failed: no request of its own, whatever the session spent meanwhile.
+    await callTurn($, { tool: 'WebFetch', url: 'https://example.com/missing', prompt: 'x', tool_use_id: 'toolu_bad' })
+    await w.clock.advance(5_000)
+    expect(requests(w).map(r => r['query_source'])).toEqual(['repl_main_thread', 'repl_main_thread', 'repl_main_thread', 'repl_main_thread'])
+    expect(requests(w).map(r => r['cost_usd'])).toEqual([0.01, 0.03, 0.05, 0.074])
+  })
+
+  test("a subagent's ledger: what grew between two readings, on one model alone", () => {
+    const u = (model: string, input: number, extra: Record<string, number> = {}) => ({ model, input_tokens: input, output_tokens: 10, cache_read_input_tokens: 5, cache_creation_input_tokens: 2, ...extra })
+    expect(agentLedgerOf([{ id: 'a1', usage: [u('m1', 100), { model: 1 }, null] }, { id: 'a2' }], 'a1')).toEqual([u('m1', 100)])
+    expect(agentLedgerOf([{ id: 'a2', usage: [] }], 'a1')).toBeUndefined()
+    expect(agentLedgerOf({ deny: 'no' }, 'a1')).toBeUndefined()
+    // A model new to the ledger, or one grown.
+    expect(ledgerGrowth([u('m1', 100)], [u('m1', 100), u('m2', 50)])).toEqual(u('m2', 50))
+    expect(ledgerGrowth([u('m1', 100)], [{ ...u('m1', 130), output_tokens: 14 }])).toEqual({ model: 'm1', input_tokens: 30, output_tokens: 4, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 })
+    expect(ledgerGrowth([u('m1', 100, { ephemeral_5m_input_tokens: 2, ephemeral_1h_input_tokens: 0 })], [u('m1', 120, { ephemeral_5m_input_tokens: 2, ephemeral_1h_input_tokens: 0 })]))
+      .toEqual({ model: 'm1', input_tokens: 20, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 0 })
+    // Nothing grew; two models grew (which counts are whose no reading says); the ledger started over.
+    expect(ledgerGrowth([u('m1', 100)], [u('m1', 100)])).toBeUndefined()
+    expect(ledgerGrowth([u('m1', 100)], [u('m1', 120), u('m2', 50)])).toBeUndefined()
+    expect(ledgerGrowth([u('m1', 100)], [u('m1', 40)])).toBeUndefined()
+  })
+
+  test("a tool's own request's row: its source by the tool, an ID of the call's that is never an API request's, and only what is known", () => {
+    expect(helperRequestId('toolu_1')).toBe('helper_toolu_1')
+    expect(helperRequestId('toolu_1').startsWith('req_')).toBe(false)
+    const state = newRowless()
+    expect(helperRow(state, {}, { tool: 'Bash', toolUseId: 'toolu_1', runStartMs: 0, endMs: 10, costUsd: 0.1 })).toBeUndefined()
+    const fetched = helperRow(state, { 'session.id': 's-1' }, { tool: 'WebFetch', toolUseId: 'toolu_1', runStartMs: 1_000, endMs: 1_250, costUsd: 0.0012345 })!
+    expect(fetched.event).toBe('api_request')
+    expect(fetched.atMs).toBe(1_250)
+    expect(fetched.attributes).toEqual({
+      'session.id': 's-1', 'event.name': 'api_request', 'event.timestamp': new Date(1_250).toISOString(), 'event.sequence': 0,
+      cost_usd: 0.0012345, cost_usd_micros: 1235, duration_ms: 250, request_id: 'helper_toolu_1', query_source: 'web_fetch_apply',
+    })
+    const searched = helperRow(state, {}, {
+      tool: 'WebSearch', toolUseId: 'toolu_2', agentId: 'a1', runStartMs: 0, endMs: 10,
+      usage: { model: 'claude-haiku-5-5', input_tokens: 9, output_tokens: 1, cache_read_input_tokens: 0, cache_creation_input_tokens: 3, ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 3 },
+    })!
+    expect(searched.attributes).toEqual(expect.objectContaining({
+      'event.sequence': 1, model: 'claude-haiku-5-5', input_tokens: 9, output_tokens: 1, cache_read_tokens: 0, cache_creation_tokens: 3, cache_creation_5m_tokens: 0, cache_creation_1h_tokens: 3,
+      query_source: 'web_search_tool', agent_id: 'a1',
+    }))
+    expect(searched.attributes['cost_usd']).toBeUndefined()
   })
 })
 

@@ -15,7 +15,9 @@
 //   user_prompt     a main-loop turn began: its prompt's length (the text itself is the gate's to add, as for Claude Code's row); the
 //                   turn's own text, or the prompt submitted while idle where the host starts the turn with none (register.ts)
 //   api_request     a model request answered: its model, tokens, effort, duration, time to first token and cost, and its request ID
-//                   (the transcript's, else one that stands for it), which its response row and its span carry too
+//                   (the transcript's, else one that stands for it), which its response row and its span carry too. Also the request
+//                   a WebFetch or WebSearch call makes in its own run, which raises no step: its cost, and in a subagent its model and
+//                   tokens (`helperRow`), so its cost is its own and not the next request's
 //   assistant_response  a model request answered with text: its length (the text itself is the gate's to add, as for Claude
 //                   Code's row), after its request row
 //   tool_decision   a tool call settled: refused (its permission check refused it, or asked and the call never ran) or accepted,
@@ -29,6 +31,7 @@
 
 import type { TelemetryAttribute } from 'claude-code'
 
+import { HELPER_SOURCES } from './derive.ts'
 import { identityOf } from './identity.ts'
 import { COWORK_SURFACE, isTruthy } from './otlp.ts'
 import type { RowIn } from './rebuild.ts'
@@ -488,6 +491,13 @@ export type RequestFacts = {
  */
 export const stepRequestId = (turnId: string, index: number): string => `step_${turnId}_${index}`
 
+/**
+ * The ID a tool's own model request (`HELPER_SOURCES`) carries: no event names the API's, so the call's, which names one request (a
+ * WebFetch or WebSearch call makes one), the same on the record and its span. It starts `helper_`, so it is never taken for an API
+ * request's ID (`req_`) or a step's (`stepRequestId`).
+ */
+export const helperRequestId = (toolUseId: string): string => `helper_${toolUseId}`
+
 /** An API request's ID as a transcript row names it (`req_…` first party; another provider's of its own shape). */
 const REQUEST_ID = /^[0-9A-Za-z._:-]{1,128}$/
 
@@ -594,6 +604,105 @@ export function requestRow(state: Rowless, head: Attrs, f: RequestFacts): RowIn 
     ['effort', effort],
     ['agent_id', f.agentId],
     ['agent.name', f.agent?.type],
+  ])
+}
+
+/** One model's token counts, as a subagent's ledger (`$.agent.list()`'s `usage`) lists them. */
+export type ModelTokens = {
+  model: string
+  input_tokens: number
+  output_tokens: number
+  cache_read_input_tokens: number
+  cache_creation_input_tokens: number
+  ephemeral_5m_input_tokens?: number
+  ephemeral_1h_input_tokens?: number
+}
+
+/** A subagent's ledger, read from what `$.agent.list()` answers for it: its tokens by model; undefined where it lists none. */
+export function agentLedgerOf(list: unknown, agentId: string): ModelTokens[] | undefined {
+  if (!Array.isArray(list)) return undefined
+  const agent = list.find(a => a !== null && typeof a === 'object' && (a as { id?: unknown }).id === agentId) as { usage?: unknown } | undefined
+  if (!Array.isArray(agent?.usage)) return undefined
+  const out: ModelTokens[] = []
+  for (const u of agent.usage as unknown[]) {
+    if (u === null || typeof u !== 'object') continue
+    const x = u as Record<string, unknown>
+    if (typeof x['model'] !== 'string') continue
+    const n = (k: string) => whole(x[k]) ?? 0
+    out.push({
+      model: x['model'], input_tokens: n('input_tokens'), output_tokens: n('output_tokens'), cache_read_input_tokens: n('cache_read_input_tokens'),
+      cache_creation_input_tokens: n('cache_creation_input_tokens'),
+      ...(whole(x['ephemeral_5m_input_tokens']) !== undefined ? { ephemeral_5m_input_tokens: whole(x['ephemeral_5m_input_tokens'])! } : {}),
+      ...(whole(x['ephemeral_1h_input_tokens']) !== undefined ? { ephemeral_1h_input_tokens: whole(x['ephemeral_1h_input_tokens'])! } : {}),
+    })
+  }
+  return out
+}
+
+const TOKEN_KEYS = ['input_tokens', 'output_tokens', 'cache_read_input_tokens', 'cache_creation_input_tokens'] as const
+
+/**
+ * What a subagent's ledger grew by between two readings: the one model whose counts grew, and by how much. Undefined where none grew,
+ * where more than one did (which counts went to which request no reading says), or where a count went down (the ledger started over).
+ */
+export function ledgerGrowth(before: readonly ModelTokens[], after: readonly ModelTokens[]): ModelTokens | undefined {
+  const was = new Map(before.map(u => [u.model, u]))
+  const grown: ModelTokens[] = []
+  for (const u of after) {
+    const b = was.get(u.model)
+    const d = (k: keyof ModelTokens) => ((u[k] as number | undefined) ?? 0) - (((b?.[k] as number | undefined)) ?? 0)
+    if (TOKEN_KEYS.some(k => d(k) < 0)) return undefined
+    if (TOKEN_KEYS.every(k => d(k) === 0)) continue
+    const lifetimes = u.ephemeral_5m_input_tokens !== undefined || u.ephemeral_1h_input_tokens !== undefined
+    grown.push({
+      model: u.model, input_tokens: d('input_tokens'), output_tokens: d('output_tokens'), cache_read_input_tokens: d('cache_read_input_tokens'),
+      cache_creation_input_tokens: d('cache_creation_input_tokens'),
+      ...(lifetimes ? { ephemeral_5m_input_tokens: Math.max(0, d('ephemeral_5m_input_tokens')), ephemeral_1h_input_tokens: Math.max(0, d('ephemeral_1h_input_tokens')) } : {}),
+    })
+  }
+  return grown.length === 1 ? grown[0] : undefined
+}
+
+/**
+ * What one tool's own model request (`HELPER_SOURCES`) is known by: the call it was made in, the run it fits in, its cost (what the
+ * session's grew by over the run, `costOf`), and, in a subagent, its model and tokens (what the subagent's ledger grew by over the run,
+ * `ledgerGrowth`). The main loop has no ledger of its own a plugin can read, so there its model and tokens go unsaid.
+ */
+export type HelperFacts = {
+  tool: string
+  toolUseId: string
+  agentId?: string
+  runStartMs: number
+  endMs: number
+  /** Undefined where the session's cost could not be read. */
+  costUsd?: number
+  usage?: ModelTokens
+}
+
+/**
+ * A tool's own model request: its `api_request` row, under Claude Code's attributes, as it logs one in the tool's run (before the
+ * call's result). Its duration is the call's run, which holds it: WebSearch's run is its request, WebFetch's fetches the page first.
+ * Undefined for a tool that makes none.
+ */
+export function helperRow(state: Rowless, head: Attrs, f: HelperFacts): RowIn | undefined {
+  const source = HELPER_SOURCES[f.tool]
+  if (source === undefined) return undefined
+  const u = f.usage
+  const noLifetime = u !== undefined && u.ephemeral_5m_input_tokens === undefined && u.ephemeral_1h_input_tokens === undefined ? 0 : undefined
+  return row(state, head, 'api_request', f.endMs, [
+    ['model', u?.model],
+    ['input_tokens', u?.input_tokens],
+    ['output_tokens', u?.output_tokens],
+    ['cache_read_tokens', u?.cache_read_input_tokens],
+    ['cache_creation_tokens', u?.cache_creation_input_tokens],
+    ['cache_creation_5m_tokens', u?.ephemeral_5m_input_tokens ?? noLifetime],
+    ['cache_creation_1h_tokens', u?.ephemeral_1h_input_tokens ?? noLifetime],
+    ['cost_usd', f.costUsd],
+    ['cost_usd_micros', f.costUsd === undefined ? undefined : Math.round(f.costUsd * 1e6)],
+    ['duration_ms', Math.max(0, Math.round(f.endMs - f.runStartMs))],
+    ['request_id', helperRequestId(f.toolUseId)],
+    ['query_source', source],
+    ['agent_id', f.agentId],
   ])
 }
 

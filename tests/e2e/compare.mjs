@@ -66,6 +66,7 @@ import { execFileSync, spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { createServer } from 'node:http'
+import { createServer as createHttpsServer } from 'node:https'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -137,7 +138,8 @@ const SESSION_COUNT_TOLERANCE_MS = 2_000
 // ── The mock model ───────────────────────────────────────────────────────────
 // The main loop's prompt names a script of tool calls, one per request; the subagent's prompt names its own. Auto mode's classifier
 // blocks the command meant to be refused and allows anything else it is asked about (such as the Agent call). Every other request
-// (a title, a summary) gets a short text answer. Each response's usage is distinct, so each request can be told apart by it.
+// (a title, a summary) gets a short text answer, the requests WebFetch and WebSearch make in their own runs among them. Each response's
+// usage is distinct, so each request can be told apart by it.
 
 /** The command meant to be refused. If it ever runs, it is a GET to a closed loopback port, its output dropped, within 2 seconds. */
 const REFUSED = 'curl -s -m 2 -o /dev/null http://127.0.0.1:9/'
@@ -145,6 +147,10 @@ let work = ''
 let messageId = 0
 /** What the mock's classifier was asked in the session: how many requests, and how many of them about the refused command. */
 let classified = { asked: 0, refused: 0 }
+/** The page WebFetch reads: a local https server (`pages`), whose certificate the session trusts (NODE_EXTRA_CA_CERTS). */
+let pageUrl = ''
+/** The calls that load WebFetch and WebSearch where they are deferred, by name: no script runs them before a ToolSearch call has. */
+const WEB_TOOLS = ['WebFetch', 'WebSearch']
 const textOf = c => (typeof c === 'string' ? c : (c ?? []).map(b => (b?.type === 'text' ? b.text : '')).join(' '))
 /** Auto mode's classifier: a request outside the conversation (not streamed) whose instructions ask for a severity or a block. */
 const isClassifier = req => !req.stream && /<severity>|<block>/.test(textOf(req.system))
@@ -174,13 +180,21 @@ function modelReply(req) {
     const own = (req.messages ?? []).some(m => Array.isArray(m.content) && m.content.some(b => b?.type === 'tool_use' && String(b.id).startsWith('toolu_e2e_')))
     return own ? { id, blocks: [{ type: 'text', text: 'ok' }], stop: 'end_turn', usage } : { id, blocks: [call('Bash', { command: 'echo e2e', description: 'Print e2e' })], stop: 'tool_use', usage }
   }
+  // WebFetch and WebSearch may be deferred: a ToolSearch call loads them first, where they are (and once it has, it stays in the script).
+  const searched = (req.messages ?? []).some(m => Array.isArray(m.content) && m.content.some(b => b?.type === 'tool_use' && b.name === 'ToolSearch'))
+  const load = searched || (tools.includes('ToolSearch') && !WEB_TOOLS.every(t => tools.includes(t))) ? [call('ToolSearch', { query: `select:${WEB_TOOLS.join(',')}`, max_results: 5 })] : []
   let script = []
-  if (tools.includes('Bash') && first.includes('E2E_SUBTASK')) script = [call('Bash', { command: 'echo sub', description: 'Print sub' })]
+  // The subagent fetches a page (WebFetch makes a request of its own in its run, its model and tokens in the subagent's ledger).
+  if (tools.includes('Bash') && first.includes('E2E_SUBTASK')) script = [...load, call('WebFetch', { url: `${pageUrl}/sub`, prompt: 'Summarize the page' }), call('Bash', { command: 'echo sub', description: 'Print sub' })]
   else if (tools.includes('Bash') && first.includes('E2E_MAINTASK')) {
     script = [
+      ...load,
       call('Bash', { command: 'echo e2e', description: 'Print e2e' }),
       call('Write', { file_path: join(work, 'a.txt'), content: 'one\ntwo\n' }),
       call('Edit', { file_path: join(work, 'a.txt'), old_string: 'two', new_string: 'three' }),
+      // Each makes a model request of its own in its run, which raises no step: the plugin's rows of it must match the exporter's.
+      call('WebFetch', { url: `${pageUrl}/main`, prompt: 'Summarize the page' }),
+      call('WebSearch', { query: 'e2e search', mode: 'standard' }),
       // Not quiet: git prints the commit's line, which the plugin's commit marker reads (markers.ts).
       call('Bash', { command: 'git -c user.name=e2e -c user.email=e2e@example.com commit --allow-empty -m e2e', description: 'Commit' }),
       // Allowed, and fails: a run that ends in an error.
@@ -341,6 +355,18 @@ const server = createServer(async (req, res) => {
 await new Promise(r => server.listen(0, '127.0.0.1', r))
 const base = `http://127.0.0.1:${server.address().port}`
 
+// The page WebFetch reads, over https (it fetches nothing else), on a loopback address (it refuses a host without a dot). Its
+// certificate is made for this run, and the session trusts it as an extra CA. Nothing of it is kept.
+const certDir = mkdtempSync(join(tmpdir(), 'mainwave-e2e-cert-'))
+execFileSync('openssl', ['req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', join(certDir, 'key.pem'), '-out', join(certDir, 'cert.pem'), '-days', '1', '-subj', '/CN=127.0.0.1', '-addext', 'subjectAltName=IP:127.0.0.1'], { stdio: 'ignore' })
+const pages = createHttpsServer({ key: readFileSync(join(certDir, 'key.pem')), cert: readFileSync(join(certDir, 'cert.pem')) }, (_req, res) => {
+  res.writeHead(200, { 'content-type': 'text/html' })
+  res.end('<html><body><h1>E2E page</h1><p>A page the end-to-end session reads.</p></body></html>')
+})
+await new Promise(r => pages.listen(0, '127.0.0.1', r))
+pageUrl = `https://127.0.0.1:${pages.address().port}`
+process.on('exit', () => rmSync(certDir, { recursive: true, force: true }))
+
 // ── The session ──────────────────────────────────────────────────────────────
 
 /** What the person typed in the chat the handoff took over, and the reminder Cowork puts ahead of it, in a block of its own. */
@@ -402,10 +428,10 @@ async function session(details, envBlock, auto, rowless = false, fail = false, h
   git('-c', 'user.name=e2e', '-c', 'user.email=e2e@example.com', 'commit', '-q', '--allow-empty', '-m', 'init')
   // With the env block, the person's own settings (the config folder's settings.json) name the receiver as the plugin's collector, under
   // both ids a folder's plugin may have. Without it, the plugin's defaults: no settings at all.
-  if (envBlock) {
-    const options = { collectorUrl: `${base}/plugin` }
-    writeFileSync(join(config, 'settings.json'), JSON.stringify({ pluginConfigs: { 'mainwave@inline': { options }, mainwave: { options } } }))
-  }
+  // WebFetch asks Anthropic's API whether a domain may be fetched before it fetches it, unless the settings skip that: they do, so
+  // nothing leaves the machine.
+  const options = { collectorUrl: `${base}/plugin` }
+  writeFileSync(join(config, 'settings.json'), JSON.stringify({ skipWebFetchPreflight: true, ...(envBlock ? { pluginConfigs: { 'mainwave@inline': { options }, mainwave: { options } } } : {}) }))
   // With it, settings that turn on the identifiers and content the captures turn on in Claude Code: on with the captures on; as Claude
   // Code sends them with each set to 0, where the exporter is the reference for what a switch at 0 leaves.
   if (envBlock) {
@@ -426,6 +452,7 @@ async function session(details, envBlock, auto, rowless = false, fail = false, h
     ANTHROPIC_API_KEY: 'sk-ant-e2e-not-a-key',
     ANTHROPIC_BASE_URL: base,
     DISABLE_AUTOUPDATER: '1',
+    NODE_EXTRA_CA_CERTS: join(certDir, 'cert.pem'),
     ...(fail ? { CLAUDE_CODE_MAX_RETRIES: '0' } : {}),
     // Cowork, by the variable rather than its entry point (`remote_cowork` holds a folder's plugins back until the organization's managed
     // settings are read, which a session on an API key never does); the turn the chat left cut off, taken up as the session resumes; and
@@ -462,7 +489,7 @@ async function session(details, envBlock, auto, rowless = false, fail = false, h
     ...(handoff ? ['--plugin-dir', observe] : []),
     '--plugin-dir', root,
     '--plugin-dir', redirect,
-    '--allowedTools', 'Bash(echo e2e),Bash(echo sub),Bash(git -c user.name=e2e -c user.email=e2e@example.com commit:*),Bash(ls e2e-missing-file),Write,Edit,Agent',
+    '--allowedTools', 'Bash(echo e2e),Bash(echo sub),Bash(git -c user.name=e2e -c user.email=e2e@example.com commit:*),Bash(ls e2e-missing-file),Write,Edit,Agent,ToolSearch,WebFetch,WebSearch',
     '--model', 'claude-haiku-5-5',
     ...(auto ? ['--permission-mode', 'auto'] : []),
     '--debug-file', join(config, 'debug.log'),
@@ -776,8 +803,15 @@ function compare(pass, details, auto, { captured, run, work }) {
     // plugin's own, by design: known, and on that span alone.
     const stampsOn = e.name === 'claude_code.tool' && Object.keys(p.attrs).some(a => a.startsWith(COMMAND_STAMP))
     if (stampsOn) noteKnown("traces: a shell command's tool span carries the plugin's own outcome stamps (mainwave.command.*), which Claude Code sends none of")
-    const eKeys = Object.keys(e.attrs).filter(a => a !== ROUTE)
-    const pKeys = Object.keys(p.attrs).filter(a => a !== ROUTE && !(e.name === 'claude_code.tool' && a.startsWith(COMMAND_STAMP)))
+    // A WebFetch call's address and site are the plugin's own on its tool span (web.url, web.domain).
+    const urlOwn = a => e.name === 'claude_code.tool' && e.attrs.tool_name?.v === 'WebFetch' && (a === 'url.full' || a === 'url.domain') && e.attrs[a] === undefined
+    if (Object.keys(p.attrs).some(urlOwn)) noteKnown("traces: a WebFetch call's tool span carries the plugin's own url.full and url.domain, which Claude Code sends none of")
+    // A request outside a conversation (a tool's own, a title) raises no step, which is what says why the model stopped.
+    const outside = e.name === 'claude_code.llm_request' && !stepSource(String(e.attrs.query_source_safe?.v ?? '').replaceAll('.', ':'))
+    const unstopped = a => outside && (a === 'stop_reason' || a === 'gen_ai.response.finish_reasons') && p.attrs[a] === undefined
+    if (Object.keys(e.attrs).some(unstopped)) noteKnown(`traces: llm_request of a request outside a conversation (${e.attrs.query_source_safe?.v}) has no stop_reason: no step reports it`)
+    const eKeys = Object.keys(e.attrs).filter(a => a !== ROUTE && !unstopped(a))
+    const pKeys = Object.keys(p.attrs).filter(a => a !== ROUTE && !(e.name === 'claude_code.tool' && a.startsWith(COMMAND_STAMP)) && !urlOwn(a))
     if (!same(eKeys, pKeys)) noteDiff(`span attribute keys (${e.name}): exporter [${eKeys.join(', ')}], plugin [${pKeys.join(', ')}]`, k)
     for (const a of new Set([...eKeys, ...pKeys])) {
       if (same(e.attrs[a], p.attrs[a])) continue
@@ -928,7 +962,10 @@ function traceShape(spans, subagents = true) {
         break
       case 'claude_code.llm_request': {
         const agent = s.attrs.agent_id?.v
-        if (s.attrs['llm_request.context']?.v === 'standalone') {
+        const tool = HELPER_TOOL[s.attrs.query_source_safe?.v]
+        if (tool !== undefined) {
+          if (parent?.name !== 'claude_code.tool.execution' || callOf.get(parent.attrs.tool_use_id?.v)?.attrs.tool_name?.v !== tool) note(`a request of ${tool}'s own not under its call's run`, s)
+        } else if (s.attrs['llm_request.context']?.v === 'standalone') {
           if (s.parentSpanId) note('a standalone request with a parent', s)
         } else if (agent === undefined ? parent?.name !== 'claude_code.interaction' : parent?.name !== 'claude_code.tool.execution' || callOf.get(parent.attrs.tool_use_id?.v)?.attrs.tool_name?.v !== 'Agent') {
           note(agent === undefined ? 'a main-loop request not under an interaction' : "a subagent's request not under an Agent call's run", s)
@@ -1080,6 +1117,26 @@ function checkKeyless(pass, { captured, run, config }, reference) {
 
 /** Claude Code's query sources of the main loop and of subagents: the requests a `turn.step` shows a plugin. */
 const stepSource = qs => typeof qs === 'string' && (qs.startsWith('repl_main_thread') || qs === 'sdk' || qs.startsWith('agent:') || qs === 'hook_agent')
+/** The requests WebFetch and WebSearch make in their own runs, by `query_source`, and the tool that makes each: no step raises them. */
+const HELPER_TOOL = { web_fetch_apply: 'WebFetch', web_search_tool: 'WebSearch' }
+const helperSource = qs => typeof qs === 'string' && Object.hasOwn(HELPER_TOOL, qs)
+/** The token counts of a request row, in order. */
+const TOKEN_KEYS = ['input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_creation_tokens']
+/**
+ * A request row's key, to pair the built with Claude Code's: a step's, its tokens (each response's are distinct); a tool's own request's,
+ * its source, its loop's kind (the main loop's has no tokens on the built side) and its place among those. Rows in the order logged.
+ */
+function requestKeys(list) {
+  const seen = new Map()
+  return [...list].sort((a, b) => Number(a.attributes['event.sequence']?.v) - Number(b.attributes['event.sequence']?.v)).map(r => {
+    const qs = r.attributes.query_source?.v
+    if (!helperSource(qs)) return [TOKEN_KEYS.map(k => r.attributes[k]?.v).join('/'), r]
+    const kind = `${qs}|${r.attributes.agent_id === undefined ? 'main' : 'subagent'}`
+    const n = seen.get(kind) ?? 0
+    seen.set(kind, n + 1)
+    return [`${kind}#${n}`, r]
+  })
+}
 /** The plugin's own rows, which no row of Claude Code's is a copy of. */
 const OWN_ROWS = new Set([STATUS, 'mcp_server_configured', 'skill_prompt'])
 /** The rows the plugin builds from Claude Code's events where none reaches it (hooks/rowless.ts). */
@@ -1113,16 +1170,44 @@ function checkRowless(pass, { captured, run }, reference) {
     if (r.attributes['organization.id']?.v !== ORG || r.attributes['user.email']?.v !== EMAIL) problems.push(`logs: a ${ev(r)} row not under the session's organization and email`)
   }
   const ofEvent = (list, name) => list.filter(r => ev(r) === name)
-  const requests = { plugin: ofEvent(rows, 'api_request'), exporter: ofEvent(theirs, 'api_request').filter(r => stepSource(r.attributes.query_source?.v)) }
+  const requests = { plugin: ofEvent(rows, 'api_request'), exporter: ofEvent(theirs, 'api_request').filter(r => stepSource(r.attributes.query_source?.v) || helperSource(r.attributes.query_source?.v)) }
+  // The requests WebFetch and WebSearch make in the main loop: no event says their model or tokens, which the built rows go without.
+  const unsaid = requests.exporter.filter(r => helperSource(r.attributes.query_source?.v) && r.attributes.agent_id === undefined)
+  const helpers = requests.exporter.filter(r => helperSource(r.attributes.query_source?.v))
+  if (!helpers.some(r => r.attributes.agent_id === undefined) || !helpers.some(r => r.attributes.agent_id !== undefined)) problems.push(`the exporter logged ${helpers.length} requests of WebFetch's and WebSearch's own, not one in the main loop and one in a subagent at least`)
   const sum = (list, key) => list.reduce((n, r) => n + Number(r.attributes[key]?.v ?? 0), 0)
   for (const [what, n] of [['user_prompt', 'user_prompt'], ['api_request', 'api_request']]) {
     const [got, want] = [ofEvent(rows, n).length, n === 'api_request' ? requests.exporter.length : ofEvent(theirs, n).length]
     if (got !== want) problems.push(`logs: ${got} ${what} rows built, where the exporter sent ${want}`)
   }
-  for (const key of ['input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_creation_tokens']) {
-    const [got, want] = [sum(requests.plugin, key), sum(requests.exporter, key)]
-    if (got !== want) problems.push(`logs: the built requests' ${key} sum to ${got}, the exporter's to ${want}`)
+  for (const key of TOKEN_KEYS) {
+    const [got, want] = [sum(requests.plugin, key), sum(requests.exporter, key) - sum(unsaid, key)]
+    if (got !== want) problems.push(`logs: the built requests' ${key} sum to ${got}, the exporter's to ${want} (the main loop's tools' own requests aside)`)
   }
+  // Request by request: each costs what the exporter's does, none of it moved onto the next one; a tool's own request carries its
+  // model and tokens in a subagent, and goes without them in the main loop.
+  const builtByKey = new Map(requestKeys(requests.plugin))
+  for (const [key, r] of requestKeys(requests.exporter)) {
+    const b = builtByKey.get(key)
+    if (!b) {
+      problems.push(`logs: no built api_request row pairs with the exporter's ${key}`)
+      continue
+    }
+    const [c, w] = [Number(b.attributes.cost_usd?.v), Number(r.attributes.cost_usd?.v)]
+    if (!(Math.abs(c - w) <= 1e-9 + 1e-6 * w)) problems.push(`logs: the built request ${key} costs ${c}, the exporter's ${w}`)
+    const qs = r.attributes.query_source?.v
+    if (b.attributes.query_source?.v !== qs && helperSource(qs)) problems.push(`logs: the built request ${key} has query_source ${b.attributes.query_source?.v}, the exporter's ${qs}`)
+    if (helperSource(qs)) {
+      const said = r.attributes.agent_id !== undefined
+      for (const k of ['model', ...TOKEN_KEYS]) {
+        if (said && !same(b.attributes[k], r.attributes[k])) problems.push(`logs: the built request ${key}'s ${k} is ${JSON.stringify(b.attributes[k]?.v)}, the exporter's ${JSON.stringify(r.attributes[k]?.v)}`)
+        if (!said && b.attributes[k] !== undefined) problems.push(`logs: the built request ${key} names a ${k}, which no event of the main loop's says`)
+      }
+      if (said && b.attributes.agent_id === undefined) problems.push(`logs: the built request ${key} names no subagent`)
+    }
+  }
+  if (builtByKey.size !== requests.exporter.length) problems.push(`logs: ${builtByKey.size} built api_request rows, ${requests.exporter.length} of the exporter's`)
+  console.log(`  tools' own requests: ${helpers.length} (${unsaid.length} in the main loop, without model and tokens)`)
   const [cost, costWant] = [sum(requests.plugin, 'cost_usd'), sum(requests.exporter, 'cost_usd')]
   if (Math.abs(cost - costWant) > 0.001 * Math.max(costWant, 1e-6)) problems.push(`logs: the built requests cost ${cost}, the exporter's ${costWant}`)
   // The calls that ran: Claude Code logs a result for each, and a refused call has its decision alone.
@@ -1138,8 +1223,10 @@ function checkRowless(pass, { captured, run }, reference) {
   console.log(`  rows built: ${BUILT_ROWS.map(n => `${n} ${ofEvent(rows, n).length}`).join(', ')}; cost ${cost.toFixed(6)} (exporter ${costWant.toFixed(6)})`)
   // The content the settings turn on goes on the built rows, from the plugin's own hooks: each prompt's text, each response's text
   // (its length the row's), and each call's input. As many responses as Claude Code logs.
+  // A tool's own request's response no event says (its text is the tool's to use): Claude Code's rows add those.
   const responses = ofEvent(rows, 'assistant_response')
-  if (responses.length !== ofEvent(theirs, 'assistant_response').length) problems.push(`logs: ${responses.length} assistant_response rows built, where the exporter sent ${ofEvent(theirs, 'assistant_response').length}`)
+  const theirResponses = ofEvent(theirs, 'assistant_response').filter(r => !helperSource(r.attributes.query_source?.v))
+  if (responses.length !== theirResponses.length) problems.push(`logs: ${responses.length} assistant_response rows built, where the exporter sent ${theirResponses.length} (tools' own requests' aside)`)
   // The first turn's prompt is the script's; a later turn's may be one Claude Code began itself (a background agent's notification).
   const prompts = ofEvent(rows, 'user_prompt')
   if (prompts[0]?.attributes.prompt?.v !== 'E2E_MAINTASK: run the steps, then say ok.') problems.push(`content: the first built prompt row carries ${JSON.stringify(prompts[0]?.attributes.prompt?.v)}, not the prompt`)
@@ -1165,22 +1252,31 @@ function checkRowless(pass, { captured, run }, reference) {
   const theirInteractions = spansOf(captured.exporter.traces).filter(s => s.name === 'claude_code.interaction').length
   if (interactions !== theirInteractions) problems.push(`traces: ${interactions} interactions, where the exporter sent ${theirInteractions}`)
   const llm = spans.filter(s => s.name === 'claude_code.llm_request').length
-  if (llm !== requests.exporter.length) problems.push(`traces: ${llm} llm_request spans, where the exporter logged ${requests.exporter.length} requests of the main loop and subagents`)
+  if (llm !== requests.exporter.length) problems.push(`traces: ${llm} llm_request spans, where the exporter logged ${requests.exporter.length} requests of the main loop, subagents and their tools`)
+  // A tool's own request sits in its call's run (traceShape checks where), never alone.
+  for (const s of spans) if (s.name === 'claude_code.llm_request' && helperSource(s.attrs.query_source_safe?.v) && s.attrs['llm_request.context']?.v !== 'tool') problems.push(`traces: the request ${s.attrs.request_id?.v} of a tool's own has context ${s.attrs['llm_request.context']?.v}, not tool`)
   // Each built request carries the ID Claude Code gave it, from the transcript, as the exporter's span of the request names it; its own
   // span carries the same, and no two requests share one.
+  // A tool's own request carries an ID of its call's (`helper_<call>`): no event names the API's.
   const theirIds = new Set(spansOf(captured.exporter.traces).filter(s => s.name === 'claude_code.llm_request').map(s => s.attrs.request_id?.v))
   const builtIds = requests.plugin.map(r => r.attributes.request_id?.v)
-  for (const id of builtIds) if (!theirIds.has(id)) problems.push(`logs: a built api_request row carries request_id ${JSON.stringify(id)}, which no request span of the exporter's names`)
+  const webCalls = new Set(ofEvent(rows, 'tool_result').filter(r => Object.values(HELPER_TOOL).includes(r.attributes.tool_name?.v)).map(r => `helper_${r.attributes.tool_use_id?.v}`))
+  for (const r of requests.plugin) {
+    const id = r.attributes.request_id?.v
+    if (helperSource(r.attributes.query_source?.v) ? !webCalls.has(id) : !theirIds.has(id)) problems.push(`logs: a built api_request row carries request_id ${JSON.stringify(id)}, which no request span of the exporter's, or WebFetch or WebSearch call, names`)
+  }
   if (new Set(builtIds).size !== builtIds.length) problems.push(`logs: built api_request rows share a request_id: ${builtIds.join(', ')}`)
   const spanIds = spans.filter(s => s.name === 'claude_code.llm_request').map(s => s.attrs.request_id?.v)
   if (JSON.stringify([...spanIds].sort()) !== JSON.stringify([...builtIds].sort())) problems.push(`traces: the built llm_request spans carry request_id ${spanIds.join(', ')}, the built rows ${builtIds.join(', ')}`)
 
   const points = pointsOf(captured.plugin.metrics)
-  const theirPoints = pointsOf(captured.exporter.metrics).filter(p => p.attrs.query_source?.v !== 'auxiliary')
+  const theirPoints = pointsOf(captured.exporter.metrics)
   const total = (list, name, type) => list.filter(p => p.name === name && (type === undefined || p.attrs.type?.v === type)).reduce((n, p) => n + p.value, 0)
-  for (const type of ['input', 'output', 'cacheRead', 'cacheCreation']) {
-    const [got, want] = [total(points, 'claude_code.token.usage', type), total(theirPoints, 'claude_code.token.usage', type)]
-    if (got !== want) problems.push(`metrics: token.usage ${type} sums to ${got}, the exporter's to ${want}`)
+  // The main loop's tools' own requests' tokens, as this session's exporter's spans of them count them: no event says them.
+  const unsaidSpans = spansOf(captured.exporter.traces).filter(s => s.name === 'claude_code.llm_request' && helperSource(s.attrs.query_source_safe?.v) && s.attrs.agent_id === undefined)
+  for (const [type, key] of [['input', 'input_tokens'], ['output', 'output_tokens'], ['cacheRead', 'cache_read_tokens'], ['cacheCreation', 'cache_creation_tokens']]) {
+    const [got, want] = [total(points, 'claude_code.token.usage', type), total(theirPoints, 'claude_code.token.usage', type) - unsaidSpans.reduce((n, s) => n + Number(s.attrs[key]?.v ?? 0), 0)]
+    if (got !== want) problems.push(`metrics: token.usage ${type} sums to ${got}, the exporter's to ${want} (the main loop's tools' own requests aside)`)
   }
   const [metricCost, metricCostWant] = [total(points, 'claude_code.cost.usage'), total(theirPoints, 'claude_code.cost.usage')]
   if (Math.abs(metricCost - metricCostWant) > 0.001 * Math.max(metricCostWant, 1e-6)) problems.push(`metrics: cost.usage sums to ${metricCost}, the exporter's to ${metricCostWant}`)
@@ -1273,17 +1369,20 @@ function keysAdd(withRows, built) {
       else problems.push(`keys add: ${name} rows, which the known differences do not list`)
     }
   }
-  const pairKey = (name, r) => (name === 'tool_decision' || name === 'tool_result') ? r.attributes.tool_use_id?.v
-    : name === 'api_request' ? ['input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_creation_tokens'].map(k => r.attributes[k]?.v).join('/') : undefined
+  const pairKey = (name, r) => (name === 'tool_decision' || name === 'tool_result') ? r.attributes.tool_use_id?.v : undefined
+  // What Claude Code's rows of a tool's own request carry that no event says: in a subagent, its effort; in the main loop, its model,
+  // tokens and effort too. Nor does any event say the response of one.
+  const HELPER_UNSAID = { subagent: ['effort'], main: ['model', ...TOKEN_KEYS, 'cache_creation_5m_tokens', 'cache_creation_1h_tokens', 'effort'] }
+  if (rowsWith.some(r => ev(r) === 'assistant_response' && helperSource(r.attributes.query_source?.v))) found.push("the assistant_response rows of tools' own requests")
   for (const name of BUILT_ROWS) {
-    const a = rowsWith.filter(r => ev(r) === name)
+    const a = rowsWith.filter(r => ev(r) === name && !(name === 'assistant_response' && helperSource(r.attributes.query_source?.v)))
     const b = built.rows.filter(r => ev(r) === name)
     const keysA = new Set(a.flatMap(r => Object.keys(r.attributes)))
     const keysB = new Set(b.flatMap(r => Object.keys(r.attributes)))
     const known = KEYS_ADD.attributes[name] ?? []
     for (const k of keysA) if (!keysB.has(k)) (known.includes(k) ? found.push(`${name}.${k}`) : problems.push(`keys add: ${name} rows lack ${k}, which the known differences do not list`))
     for (const k of keysB) if (!keysA.has(k) && k !== 'mainwave.telemetry.built_from' && !CONTENT_KEYS.has(k)) problems.push(`keys add: built ${name} rows carry ${k}, which Claude Code's do not`)
-    const index = list => new Map(list.map((r, i) => [pairKey(name, r) ?? String(i), r]))
+    const index = list => new Map(name === 'api_request' ? requestKeys(list) : list.map((r, i) => [pairKey(name, r) ?? String(i), r]))
     const [ia, ib] = [index(a), index(b)]
     for (const [key, ra] of ia) {
       const rb = ib.get(key)
@@ -1291,8 +1390,20 @@ function keysAdd(withRows, built) {
         problems.push(`keys add: no built ${name} row pairs with ${key}`)
         continue
       }
+      const qs = ra.attributes.query_source?.v
+      if (name === 'api_request' && helperSource(qs)) {
+        const loop = ra.attributes.agent_id === undefined ? 'main' : 'subagent'
+        for (const k of Object.keys(ra.attributes)) {
+          if (rb.attributes[k] !== undefined || PER_SESSION.has(k) || k.startsWith('mainwave.') || KEYS_ADD.attributes.api_request.includes(k)) continue
+          if (HELPER_UNSAID[loop].includes(k)) found.push(`api_request.${k} of a tool's own request in ${loop === 'main' ? 'the main loop' : 'a subagent'}`)
+          else problems.push(`keys add: a built api_request row of a tool's own request (${qs}, ${loop}) lacks ${k}, which the known differences do not list`)
+        }
+      }
+      // WebSearch's input as a hook sees it lacks the `mode` the model gave it, which Claude Code counts in the input's size.
+      if (name === 'tool_result' && ra.attributes.tool_name?.v === 'WebSearch' && !same(ra.attributes.tool_input_size_bytes, rb.attributes.tool_input_size_bytes)) found.push("a WebSearch call's tool_result.tool_input_size_bytes (the hook's input has no mode)")
       for (const [k, v] of Object.entries(ra.attributes)) {
         if (PER_SESSION.has(k) || CONTENT_KEYS.has(k) || k.startsWith('mainwave.') || rb.attributes[k] === undefined) continue
+        if (name === 'tool_result' && k === 'tool_input_size_bytes' && ra.attributes.tool_name?.v === 'WebSearch') continue
         if (!same(v, rb.attributes[k])) problems.push(`keys add: a built ${name} row's ${k} is ${JSON.stringify(rb.attributes[k].v)}, Claude Code's ${JSON.stringify(v.v)}`)
       }
     }
@@ -1307,12 +1418,18 @@ function keysAdd(withRows, built) {
   }
   const sums = list => list.reduce((m, p) => m.set(`${p.name} ${p.attrs.type?.v ?? ''}`, (m.get(`${p.name} ${p.attrs.type?.v ?? ''}`) ?? 0) + p.value), new Map())
   const [sa, sb] = [sums(pointsOf(withRows.metrics)), sums(built.points)]
+  // The tokens of the main loop's tools' own requests, which the built rows go without: the copy with rows counts them besides.
+  const unsaid = rowsWith.filter(r => ev(r) === 'api_request' && helperSource(r.attributes.query_source?.v) && r.attributes.agent_id === undefined)
+  const unsaidOf = { input: 'input_tokens', output: 'output_tokens', cacheRead: 'cache_read_tokens', cacheCreation: 'cache_creation_tokens' }
   for (const key of new Set([...sa.keys(), ...sb.keys()])) {
     // A turn's time is the plugin's clock in both, a few milliseconds apart; a cost, to the thousandth.
     const tolerance = key.startsWith('claude_code.active_time') ? 0.25 : key.startsWith('claude_code.cost') ? 0.001 * (sa.get(key) ?? 0) : 0
-    if (Math.abs((sa.get(key) ?? 0) - (sb.get(key) ?? 0)) > tolerance + 1e-12) problems.push(`keys add: ${key} sums to ${sb.get(key) ?? 0} built, ${sa.get(key) ?? 0} with rows`)
+    const type = key.startsWith('claude_code.token.usage ') ? key.slice('claude_code.token.usage '.length) : undefined
+    const gap = type !== undefined && unsaidOf[type] ? unsaid.reduce((n, r) => n + Number(r.attributes[unsaidOf[type]]?.v ?? 0), 0) : 0
+    if (gap > 0) found.push(`${key} of the main loop's tools' own requests (${gap})`)
+    if (Math.abs((sa.get(key) ?? 0) - gap - (sb.get(key) ?? 0)) > tolerance + 1e-12) problems.push(`keys add: ${key} sums to ${sb.get(key) ?? 0} built, ${sa.get(key) ?? 0} with rows${gap > 0 ? ` (${gap} of them the main loop's tools' own requests')` : ''}`)
   }
-  console.log(`  what Claude Code's rows add over the rows built from events: ${found.join(', ') || 'nothing'}`)
+  console.log(`  what Claude Code's rows add over the rows built from events: ${[...new Set(found)].join(', ') || 'nothing'}`)
 }
 
 /** The rows of a copy, less the plugin's status rows, without checking them. */
@@ -1384,6 +1501,7 @@ for (const [pass, details, envBlock, auto, rowless] of passes) {
   checkHandoff(result)
 }
 server.close()
+pages.close()
 
 if (problems.length) {
   // What each session itself said about the plugins, and what the plugin kept: enough to see why without --keep.
