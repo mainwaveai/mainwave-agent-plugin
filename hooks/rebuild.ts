@@ -14,6 +14,7 @@
 //      │                                  no row carries, so it is new.
 //      ├─ claude_code.tool.blocked_on_user   the permission decision: the `tool_decision` row's own span, ids and all.
 //      └─ claude_code.tool.execution         the run. Its id is new, except for an Agent call, whose subagent's rows name it.
+//         └─ claude_code.llm_request         a request the tool makes itself (WebFetch's, WebSearch's): its `api_request` row's span.
 //
 // Every span and measure starts with the attributes Claude Code puts first on each of its records (the session's identity, the
 // organization's resource attributes, the repository): the attributes of the latest row, up to its `event.name`.
@@ -37,7 +38,7 @@ import type { TelemetryAttribute } from 'claude-code'
 
 import { isAccountMemoryTool, notRecorded, shellCommand } from './capture.ts'
 import { TOOL_OUTPUT_EVENT } from './catalog.ts'
-import { bashClass, CODE_EDIT_TOOLS, commandOutcomes, errorClassOf, genAiProvider, gitCounts, languageOf, linesChanged, mcpCreatesPr, mcpParts, metricQuerySource, querySourceSafe, toolNameSafe } from './derive.ts'
+import { bashClass, CODE_EDIT_TOOLS, commandOutcomes, errorClassOf, genAiProvider, gitCounts, HELPER_SOURCES, languageOf, linesChanged, mcpCreatesPr, mcpParts, metricQuerySource, querySourceSafe, toolNameSafe } from './derive.ts'
 import { allows, type Gate } from './gate.ts'
 import type { Measure } from './meter.ts'
 import type { BuiltSpan } from './otlp.ts'
@@ -47,8 +48,12 @@ import { commandStamps, stripOwned } from './stamps.ts'
 type Attrs = Record<string, TelemetryAttribute>
 type Ctx = { traceId: string; spanId: string }
 
-/** A collector row as the rebuild reads it: its event, when it was logged, its span, its attributes as Claude Code raised them. */
-export type RowIn = { event: string; atMs: number; span?: Ctx; attributes: Readonly<Record<string, TelemetryAttribute>> }
+/**
+ * A collector row as the rebuild reads it: its event, when it was logged, its span, its attributes as Claude Code raised them. A row the
+ * plugin built of a tool's own model request (WebFetch's, WebSearch's) names the call it was made in (`call`, the call's id): it sits
+ * in the call's run, as Claude Code's does, where no span is named.
+ */
+export type RowIn = { event: string; atMs: number; span?: Ctx; call?: string; attributes: Readonly<Record<string, TelemetryAttribute>> }
 
 /** What the session's environment says about the exporter, read once per load. */
 export type Settings = {
@@ -111,7 +116,10 @@ type Tool = {
    * yet takes its subagent's when its spans go.
    */
   home?: Home
-  /** In coherent mode, the span id of the call's run, made when it first starts a subagent: every subagent it starts sits under it. */
+  /**
+   * In coherent mode, the span id of the call's run, made when it first starts a subagent or makes a model request of its own: every
+   * subagent it starts, and every such request, sits under it.
+   */
   execId?: string
   /** What the call answered, as the plugin read it: its output for `tool.output`, and the text of an error. */
   output?: { atMs: number; attributes: Attrs }
@@ -326,6 +334,9 @@ function contextOfRow(r: Rebuild, row: RowIn): Ctx | undefined {
   const ctx = validCtx(row.span)
   if (ctx) return { traceId: retrace(r, ctx.traceId), spanId: respan(r, ctx.spanId) }
   if (!buildsTrace(r)) return undefined
+  // A tool's own request ran in its call's run.
+  const call = helperCallOf(r, row)
+  if (call !== undefined) return callRunCtx(r, call)
   // A request outside the main loop and its subagents (a session title, a summary) ran in no span: its own is a root.
   if ((row.event === 'api_request' || row.event === 'api_error') && !hasStep(row)) return undefined
   const agentId = str(row.attributes['agent_id'])
@@ -435,6 +446,7 @@ function readRowEvent(r: Rebuild, row: RowIn): Emit {
     case 'api_request':
     case 'api_error': {
       learnInteraction(r, row, ctx)
+      namedRun(r, row)
       const measures = row.event === 'api_request' ? requestMeasures(r, row) : []
       return merge(pairRequest(r, row), { spans: [], measures })
     }
@@ -514,7 +526,13 @@ const sameUsage = (u: StepUsage | null, a: RowIn['attributes']) =>
  * call is known to have started sits where it was first seen (`looseHome`).
  */
 function homeOf(r: Rebuild, row: RowIn): Req['home'] {
-  if (!buildsTrace(r) || validCtx(row.span) !== undefined || !hasStep(row)) return undefined
+  if (!buildsTrace(r) || validCtx(row.span) !== undefined) return undefined
+  const call = helperCallOf(r, row)
+  if (call !== undefined) {
+    const run = callRunCtx(r, call)
+    return run ? { traceId: run.traceId, parentId: run.spanId, context: 'tool' } : undefined
+  }
+  if (!hasStep(row)) return undefined
   const agentId = str(row.attributes['agent_id'])
   if (agentId !== undefined) {
     const agent = r.agentCtx.get(agentId)
@@ -524,6 +542,47 @@ function homeOf(r: Rebuild, row: RowIn): Req['home'] {
   }
   const open = openCtx(r)
   return open ? { traceId: open.traceId, parentId: open.spanId, context: 'interaction' } : undefined
+}
+
+/**
+ * The call a tool's own request (`HELPER_SOURCES`) was made in: the one the row names, else, for a row of Claude Code's, the one call
+ * of that tool in the row's loop still running. Undefined for any other row, or where no one call fits.
+ */
+function helperCallOf(r: Rebuild, row: RowIn): string | undefined {
+  if (row.call !== undefined) return row.call
+  if (row.event !== 'api_request' && row.event !== 'api_error') return undefined
+  const qs = row.attributes['query_source']
+  const tool = Object.keys(HELPER_SOURCES).find(t => HELPER_SOURCES[t] === qs)
+  if (tool === undefined) return undefined
+  const agentId = str(row.attributes['agent_id'])
+  const running = [...r.tools.values()].filter(t => t.name === tool && t.agentId === agentId && t.endMs === undefined)
+  return running.length === 1 ? running[0]!.id : undefined
+}
+
+/**
+ * A row of Claude Code's of a tool's own request names its call's run as its span: the run takes that id, as an Agent call's takes the
+ * one its subagent's rows name.
+ */
+function namedRun(r: Rebuild, row: RowIn): void {
+  const ctx = validCtx(row.span)
+  const call = ctx ? helperCallOf(r, row) : undefined
+  const tool = call !== undefined ? r.tools.get(call) : undefined
+  // Never a span another row named (an interaction, a decision): only one no other span of the plugin's has taken.
+  if (!ctx || !tool || tool.sent || tool.execId !== undefined || r.knownIds.has(ctx.spanId) || r.interactionIds.has(ctx.spanId)) return
+  tool.execId = respan(r, ctx.spanId)
+}
+
+/**
+ * Where a call's run sits, for a request the tool made itself in it: the run's span (its id made now, if not yet) in the call's trace.
+ * In coherent mode alone, for a call not yet sent; undefined otherwise.
+ */
+function callRunCtx(r: Rebuild, id: string): Ctx | undefined {
+  const tool = r.tools.get(id)
+  if (tool === undefined || tool.sent || !isCoherent(r)) return undefined
+  const traceId = homeOfTool(r, tool)?.traceId
+  if (traceId === undefined) return undefined
+  tool.execId ??= r.mint(16)
+  return { traceId: retrace(r, traceId), spanId: tool.execId }
 }
 
 /** Pairs a request's row with its step result, or holds it a moment for the step to finish. */
@@ -869,7 +928,7 @@ export function toolEnd(r: Rebuild, id: string | undefined, result: { isError?: 
   // (a file being uploaded, account memory), which Claude Code never records.
   if (tool.isError && typeof result?.text === 'string' && result.text !== '' && (!mcpParts(tool.name) || shellCommand(tool.name, tool.input) !== undefined)) tool.errorText = result.text
   if (ok && allows(gate, 'tool.result', false)) {
-    const output = toolOutput(r, tool, result?.result)
+    const output = toolOutput(r, tool, result?.result, result?.text)
     if (output) tool.output = { atMs: nowMs, attributes: output }
   }
   if (ok && (tool.name === 'Edit' || tool.name === 'Write' || tool.name === 'NotebookEdit')) {
@@ -966,9 +1025,10 @@ function mcpText(result: unknown): string | undefined {
 /**
  * What a call that succeeded answered, as Claude Code's `tool.output` span event carries it (`OTEL_LOG_TOOL_CONTENT`): a file read's
  * path and content, a file edit's path and patch or a file written's path and content, a Bash command and its output, an MCP call's
- * text. Each value is cut as Claude Code cuts content. Undefined for another tool, or a result of another shape.
+ * text, what a WebFetch call drew from its page and the text a WebSearch call gave the model (`text`, its result as the model read it).
+ * Each value is cut as Claude Code cuts content. Undefined for another tool, or a result of another shape.
  */
-function toolOutput(r: Rebuild, tool: Tool, data: unknown): Attrs | undefined {
+function toolOutput(r: Rebuild, tool: Tool, data: unknown, text?: unknown): Attrs | undefined {
   const gate = r.settings.gate()
   const input = tool.input
   const out: [string, string][] = []
@@ -991,6 +1051,11 @@ function toolOutput(r: Rebuild, tool: Tool, data: unknown): Attrs | undefined {
     } else if (tool.name === 'Bash' && typeof input['command'] === 'string') {
       if (allows(gate, 'bash.command', false)) out.push(['bash_command', input['command']])
       if ('stdout' in d) out.push(['output', String(d['stdout'])])
+    } else if (tool.name === 'WebFetch' && typeof d['result'] === 'string') {
+      // What the call's prompt drew from the page; a search, the text the model read of its results.
+      out.push(['output', d['result']])
+    } else if (tool.name === 'WebSearch' && typeof text === 'string') {
+      out.push(['output', text])
     }
   }
   if (out.length === 0) return undefined
@@ -1094,7 +1159,8 @@ function sendExecution(r: Rebuild, tool: Tool): Emit {
   // The text can repeat what the call read and ran: it goes with tool input too.
   const own = allows(gate, 'tool.result', false) && allows(gate, 'tool.input', false) ? tool.errorText : undefined
   const error = text ?? own ?? tool.result?.errorType
-  const spanId = (tool.spawned && r.execOfAgent.get(tool.spawned)) || r.mint(16)
+  // A subagent's rows name an Agent call's run; a request the tool made itself was put in it (`callRunCtx`).
+  const spanId = (tool.spawned && r.execOfAgent.get(tool.spawned)) || tool.execId || r.mint(16)
   const traceId = retrace(r, tool.decision?.ctx?.traceId ?? tool.result?.ctx?.traceId ?? homeOfTool(r, tool)?.traceId ?? r.mint(32))
   return {
     spans: [{

@@ -48,6 +48,12 @@ export function metricQuerySource(querySource: unknown): 'main' | 'subagent' | '
   return 'auxiliary'
 }
 
+/**
+ * The `query_source` of the model request a tool makes inside its own run, by the tool: WebFetch's to apply the call's prompt to the
+ * page, WebSearch's to search. Neither raises a `turn.step`; each is a request of its own on Claude Code's rows.
+ */
+export const HELPER_SOURCES: Readonly<Record<string, string>> = { WebFetch: 'web_fetch_apply', WebSearch: 'web_search_tool' }
+
 /** A request's query source as `llm_request` spans carry it (`query_source_safe`): custom agents folded, `:` as `.`. */
 export function querySourceSafe(querySource: unknown): string | undefined {
   if (typeof querySource !== 'string') return undefined

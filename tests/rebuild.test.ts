@@ -355,6 +355,35 @@ describe('tools', () => {
     expect(measures[0]!.attributes).toEqual(expect.objectContaining({ query_source: 'subagent', 'agent.name': 'general-purpose' }))
   })
 
+  test("a WebFetch call's run takes the id its own request's row names, and that request sits under it; its output is what it drew from the page", () => {
+    const RUN = '3333333333333333'
+    const r = rebuild()
+    observeRow(r, row('user_prompt', 0, {}, INTERACTION))
+    turnStart(r, { turnId: 't', text: '' }, 0)
+    toolStart(r, { tool: 'WebFetch', tool_use_id: 'toolu_f', url: 'https://example.com/a', prompt: 'Summarize' }, 10)
+    observeRow(r, row('tool_decision', 11, { decision: 'accept', source: 'config', tool_name: 'WebFetch', tool_use_id: 'toolu_f' }, BLOCKED))
+    const own = observeRow(r, row('api_request', 15, { model: 'claude-haiku-5-5', input_tokens: 900, output_tokens: 9, cache_read_tokens: 0, cache_creation_tokens: 0, cost_usd: 0.001, duration_ms: 4, request_id: 'req_f', query_source: 'web_fetch_apply' }, RUN))
+    const [req] = named(own.spans, 'llm_request')
+    expect([req!.parentSpanId, req!.attributes['llm_request.context'], req!.attributes['query_source_safe']]).toEqual([RUN, 'tool', 'web_fetch_apply'])
+    const ended = toolEnd(r, 'toolu_f', { result: { bytes: 10, code: 200, codeText: 'OK', result: 'A page about a.', durationMs: 5, url: 'https://example.com/a' }, text: 'A page about a.' }, 20)
+    const after = observeRow(r, row('tool_result', 21, { tool_name: 'WebFetch', tool_use_id: 'toolu_f', success: 'true' }, INTERACTION))
+    const spans = [...ended.spans, ...after.spans]
+    expect(named(spans, 'tool.execution')[0]!.spanId).toBe(RUN)
+    expect(named(spans, 'tool')[0]!.events).toEqual([expect.objectContaining({ name: 'tool.output', attributes: { output: 'A page about a.' } })])
+  })
+
+  test("a WebSearch call's output is the text the model read of its results", () => {
+    const r = rebuild()
+    observeRow(r, row('user_prompt', 0, {}, INTERACTION))
+    turnStart(r, { turnId: 't', text: '' }, 0)
+    toolStart(r, { tool: 'WebSearch', tool_use_id: 'toolu_s', query: 'news' }, 10)
+    observeRow(r, row('tool_decision', 11, { decision: 'accept', source: 'config', tool_name: 'WebSearch', tool_use_id: 'toolu_s' }, BLOCKED))
+    const text = 'Web search results for query: "news"\n\nNothing new.'
+    const ended = toolEnd(r, 'toolu_s', { result: { query: 'news', results: ['Nothing new.'], durationSeconds: 0.2 }, text }, 20)
+    const after = observeRow(r, row('tool_result', 21, { tool_name: 'WebSearch', tool_use_id: 'toolu_s', success: 'true' }, INTERACTION))
+    expect(named([...ended.spans, ...after.spans], 'tool')[0]!.events).toEqual([expect.objectContaining({ name: 'tool.output', attributes: { output: text } })])
+  })
+
   test("an Agent call whose subagent names nothing still sends its run when the subagent's turn ends", () => {
     const r = rebuild()
     toolStart(r, { tool: 'Agent', tool_use_id: 'toolu_6', subagent_type: 'Explore' }, 10)
@@ -626,6 +655,40 @@ describe('without the beta, no row names a span: the plugin builds the trace (co
     expect(one(spans, 'tool.blocked_on_user').parentSpanId).toBe(tool.spanId)
     expect(one(spans, 'tool.execution').parentSpanId).toBe(tool.spanId)
     expect(new Set(spans.map(s => s.spanId)).size).toBe(spans.length)
+  })
+
+  test("a tool's own request (WebFetch's, WebSearch's) sits in its call's run: a row of Claude Code's by the one call of that tool still running, a built row by the call it names", () => {
+    const r = coherent()
+    const out: Emit[] = []
+    out.push(turnStart(r, { turnId: 't1', text: 'go' }, 0))
+    toolStart(r, { tool: 'WebFetch', tool_use_id: 'toolu_f', url: 'https://example.com', prompt: 'x' }, 10)
+    toolStart(r, { tool: 'WebSearch', tool_use_id: 'toolu_s1', query: 'a' }, 11)
+    toolStart(r, { tool: 'WebSearch', tool_use_id: 'toolu_s2', query: 'b' }, 12)
+    for (const id of ['toolu_f', 'toolu_s1', 'toolu_s2']) out.push(observeRow(r, row('tool_decision', 13, { decision: 'accept', source: 'config', tool_use_id: id })))
+    const helper = (atMs: number, qs: string, id: string) => row('api_request', atMs, { cost_usd: 0.001, duration_ms: 5, request_id: id, query_source: qs })
+    // Claude Code's row of WebFetch's request names no call: the one WebFetch call running is its. Two WebSearch calls run: neither is
+    // known to be its, so its request stands alone. A built row names its call.
+    const fetched = observeRow(r, helper(20, 'web_fetch_apply', 'req_f'))
+    out.push(fetched)
+    out.push(observeRow(r, helper(21, 'web_search_tool', 'req_s')))
+    const built = observeRow(r, { ...helper(22, 'web_search_tool', 'helper_toolu_s2'), call: 'toolu_s2' })
+    out.push(built)
+    for (const id of ['toolu_f', 'toolu_s1', 'toolu_s2']) {
+      out.push(observeRow(r, row('tool_result', 30, { tool_use_id: id, success: 'true' })))
+      out.push(toolEnd(r, id, { result: {} }, 31))
+    }
+    out.push(turnComplete(r, { turnId: 't1', durationMs: 40 }, 40))
+    const { spans } = all(...out)
+    const i = one(spans, 'interaction')
+    const runOf = (id: string) => named(spans, 'tool.execution').find(s => s.attributes['tool_use_id'] === id)!
+    const req = (id: string) => named(spans, 'llm_request').find(s => s.attributes['request_id'] === id)!
+    for (const [id, call] of [['req_f', 'toolu_f'], ['helper_toolu_s2', 'toolu_s2']] as const) {
+      expect([req(id).traceId, req(id).parentSpanId, req(id).attributes['llm_request.context']]).toEqual([i.traceId, runOf(call).spanId, 'tool'])
+    }
+    expect([req('req_s').parentSpanId, req('req_s').attributes['llm_request.context']]).toEqual([undefined, 'standalone'])
+    // The rows themselves are logged in the run, so their cost joins the request's span.
+    expect(fetched.rowCtx).toEqual({ traceId: i.traceId, spanId: runOf('toolu_f').spanId })
+    expect(built.rowCtx).toEqual({ traceId: i.traceId, spanId: runOf('toolu_s2').spanId })
   })
 
   test('each turn is a trace of its own', () => {
