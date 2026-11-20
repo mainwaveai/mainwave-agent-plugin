@@ -810,6 +810,22 @@ export function toolStart(r: Rebuild, e: { tool: string; tool_use_id?: string; a
   r.tools.set(id, { id, name, input, ...(agentId ? { agentId } : {}), ...(home ? { home } : {}), ...(rebuilt ? { rebuilt: true as const } : {}), startMs: nowMs, spanId: r.mint(16), sent: false, execWaits: false })
 }
 
+/**
+ * A main-loop call that ran before the turn it belongs to began, joining that turn as its rows are built: it sits under the turn's
+ * interaction, as a call made in the turn does. Nothing for a call that has ended in the rebuild already, or with no interaction open.
+ */
+export function toolJoinsTurn(r: Rebuild, id: string): void {
+  const tool = r.tools.get(id)
+  const it = r.interaction
+  if (tool === undefined || tool.agentId !== undefined || tool.endedAtMs !== undefined || it?.ctx === undefined) return
+  const home = { traceId: it.ctx.traceId, parentId: it.ctx.spanId }
+  if (isCoherent(r)) tool.home = home
+  else if (it.rebuilt) {
+    tool.home = home
+    tool.rebuilt = true
+  }
+}
+
 /** A coherent-mode call's trace and parent, settled the first time its spans or its subagent need them; undefined in any other mode. */
 function homeOfTool(r: Rebuild, tool: Tool): Home | undefined {
   const home = tool.home

@@ -877,6 +877,73 @@ describe('in Cowork', () => {
     expect(w.built().filter(r => r.attributes['event.name'] === 'api_request').length).toBe(1)
   })
 
+  // Cowork hands a conversation begun in chat over to Claude Code with the chat's last call cut off: Claude Code runs that call before
+  // the turn it is part of starts, with no text of its own.
+  const handedOver = (done: boolean) => [
+    { role: 'user', text: REMINDER + typed, toolUses: [] }, CALLED('toolu_glob'), ANSWERED('toolu_glob'), CALLED('toolu_early'), ...(done ? [ANSWERED('toolu_early', 'hi')] : []),
+  ]
+  async function earlyCallThenTurn($: Engine, w: ReturnType<typeof world>, ran: () => void) {
+    await start($)
+    await w.clock.advance(1_000)
+    await $.tool.call({ tool: 'Bash', command: 'echo hi', description: 'x', tool_use_id: 'toolu_early' } as never)
+    ran()
+    await w.clock.advance(200)
+    await $.turn.start({ turnId: 't1', text: '' } as never)
+    const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-haiku-5-5', messageCount: 6, effort: 'medium' } as never)
+    while (!(await stream.next()).done) {
+      // Read to its end, as the engine does.
+    }
+    await $.turn.complete({ turnId: 't1', answer: 'ok', durationMs: 400, isAborted: false, reason: 'answer' } as never)
+    await w.clock.advance(5_000)
+    await end($)
+  }
+
+  for (const [how, env] of TRACES) {
+    test(`a call Claude Code runs before the load's first turn starts has its rows under that turn's prompt, timed as it ran, its spans under the turn's interaction (${how})`, keyless, async ($, on) => {
+      let done = false
+      const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', env, store: { dataPoints: { 'prompt.text': 'on' } }, messages: () => handedOver(done) })
+      await earlyCallThenTurn($, w, () => (done = true))
+      expect(promptsOf(w)).toEqual([[String(typed.length), typed]])
+      const rows = w.built().filter(r => r.attributes['event.name'] !== 'plugin_status')
+      expect(rows.map(r => r.attributes['event.name'])).toEqual(['user_prompt', 'tool_decision', 'tool_result', 'api_request', 'assistant_response'])
+      const prompt = rows[0]!
+      for (const r of rows) expect(r.attributes['prompt.id']).toBe(prompt.attributes['prompt.id'])
+      // The call began a second after the session started and ran 25 ms; the turn began 200 ms after it ended. The prompt row is timed
+      // as the call began, so nothing of the turn's comes before it.
+      const call = START + 1_000
+      expect(prompt.attributes['event.timestamp']).toBe(new Date(call).toISOString())
+      const decision = rows[1]!
+      const result = rows[2]!
+      expect([decision.attributes['tool_use_id'], decision.attributes['decision'], decision.attributes['source']]).toEqual(['toolu_early', 'accept', 'config'])
+      expect(decision.attributes['event.timestamp']).toBe(new Date(call).toISOString())
+      expect([result.attributes['tool_use_id'], result.attributes['success'], result.attributes['duration_ms']]).toEqual(['toolu_early', 'true', '25'])
+      expect(result.attributes['event.timestamp']).toBe(new Date(call + 25).toISOString())
+      const all = spans(w.posts)
+      const interaction = all.find(x => x.name === 'claude_code.interaction')!
+      expect(interaction.attrs['user_prompt']).toBe(typed)
+      const tool = all.find(x => x.name === 'claude_code.tool' && x.attrs['tool_use_id'] === 'toolu_early')!
+      expect([tool.traceId, tool.parentSpanId]).toEqual([interaction.traceId, interaction.spanId])
+    })
+  }
+
+  test("a call before the load's first turn whose turn makes no request has its rows as the turn ends", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: handedOver(true) })
+    await start($)
+    await $.tool.call({ tool: 'Bash', command: 'echo hi', description: 'x', tool_use_id: 'toolu_early' } as never)
+    await w.clock.advance(200)
+    await $.turn.start({ turnId: 't1', text: '' } as never)
+    await $.turn.complete({ turnId: 't1', answer: '', durationMs: 10, isAborted: true, reason: 'aborted' } as never)
+    await w.clock.advance(5_000)
+    expect(w.built().filter(r => r.attributes['event.name'] !== 'plugin_status').map(r => [r.attributes['event.name'], r.attributes['tool_use_id']])).toEqual([['tool_decision', 'toolu_early'], ['tool_result', 'toolu_early']])
+  })
+
+  test("outside Cowork, a call before the load's first turn is not held for it", keyless, async ($, on) => {
+    let done = false
+    const w = world(on, { accountFile: ACCOUNT_FILE, messages: () => handedOver(done) })
+    await earlyCallThenTurn($, w, () => (done = true))
+    expect(w.built().filter(r => r.attributes['tool_use_id'] === 'toolu_early')).toEqual([])
+  })
+
   test("a Cowork prompt's own text goes without the reminder, its length the text's, and its row filled", keyless, async ($, on) => {
     const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', store: { dataPoints: { 'prompt.text': 'on' } } })
     await start($)
