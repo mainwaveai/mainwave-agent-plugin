@@ -988,9 +988,11 @@ describe('in Cowork', () => {
       let done = false
       const w = world(on, {
         accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', store: { dataPoints: { 'prompt.text': 'on' } }, messages: () => handedOver(done), transcript,
-        // The turn begins while the call still runs.
+        // The turn begins while the call still runs, 200 ms after it began.
         duringCall: async id => {
-          if (id === 'toolu_early') await $.turn.start({ turnId: 't1', text: '' } as never)
+          if (id !== 'toolu_early') return
+          await w.clock.advance(200)
+          await $.turn.start({ turnId: 't1', text: '' } as never)
         },
       })
       await start($)
@@ -1001,7 +1003,8 @@ describe('in Cowork', () => {
         // Read to its end.
       }
       await $.tool.call({ tool: 'Bash', command: 'echo later', description: 'x', tool_use_id: 'toolu_later' } as never)
-      await $.turn.complete({ turnId: 't1', answer: 'ok', durationMs: 400, isAborted: false, reason: 'answer' } as never)
+      // The turn's own duration starts it after the call began.
+      await $.turn.complete({ turnId: 't1', answer: 'ok', durationMs: 10, isAborted: false, reason: 'answer' } as never)
       await w.clock.advance(5_000)
       await end($)
       expect(promptsOf(w)).toEqual([[String(typed.length), typed]])
@@ -1011,12 +1014,31 @@ describe('in Cowork', () => {
         ['tool_decision', 'toolu_later'], ['tool_result', 'toolu_later'],
       ])
       for (const r of rows) expect(r.attributes['prompt.id']).toBe(rows[0]!.attributes['prompt.id'])
+      // The prompt row is timed as the call began, though the call was still running as the turn began: nothing of the turn's before it.
+      expect(rows[0]!.attributes['event.timestamp']).toBe(new Date(START).toISOString())
+      expect(rows[1]!.attributes['event.timestamp']).toBe(new Date(START).toISOString())
       const all = spans(w.posts)
       const interaction = all.find(x => x.name === 'claude_code.interaction')!
       const tool = all.find(x => x.name === 'claude_code.tool' && x.attrs['tool_use_id'] === 'toolu_early')!
       expect([tool.traceId, tool.parentSpanId]).toEqual([interaction.traceId, interaction.spanId])
+      // The interaction's span starts no later than the call it holds; its duration stays the turn's.
+      const startOf = (x: unknown) => BigInt((x as { startTimeUnixNano: string }).startTimeUnixNano)
+      expect(startOf(interaction)).toBe(startOf(tool))
+      expect(interaction.attrs['interaction.duration_ms']).toBe(10)
     })
   }
+
+  test("calls held for a first turn that never comes have their rows as the session ends, with no prompt", keyless, async ($, on) => {
+    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: handedOver(true), transcript: CUT_OFF })
+    await start($)
+    await $.tool.call({ tool: 'Bash', command: 'echo hi', description: 'x', tool_use_id: 'toolu_early' } as never)
+    await w.clock.advance(5_000)
+    expect(w.built().filter(r => r.attributes['tool_use_id'] === 'toolu_early')).toEqual([])
+    await end($)
+    const rows = w.built().filter(r => r.attributes['tool_use_id'] === 'toolu_early')
+    expect(rows.map(r => [r.attributes['event.name'], r.attributes['prompt.id']])).toEqual([['tool_decision', undefined], ['tool_result', undefined]])
+    expect(spans(w.posts).filter(x => x.name === 'claude_code.tool' && x.attrs['tool_use_id'] === 'toolu_early').length).toBe(1)
+  })
 
   test("a call before the first turn keeps what its permission check said: an ask answered, with its wait; an ask refused, nobody there to ask", keyless, async ($, on) => {
     const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: [...handedOver(true), CALLED('toolu_ask'), ANSWERED('toolu_ask'), CALLED('toolu_no'), ANSWERED('toolu_no', 'refused')], transcript: CUT_OFF })

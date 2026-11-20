@@ -191,6 +191,8 @@ let earlyCalls: CallRows[] = []
 const MAX_EARLY_CALLS = 50
 /** A main-loop call began before the load's first turn, in Cowork: a handover's first turn may take the person's carried-over message. */
 let earlySeen = false
+/** When each of those calls began, by its id, while it runs: the first turn's prompt row is timed no later (`earliestStart`). */
+let earlyRunning = new Map<string, number>()
 /** When each tool call the plugin builds rows for began, by its id, until it ends. */
 let callStarts = new Map<string, number>()
 /** The permission check's verdict on each of those calls (`allow`, `deny` or `ask`), by its id, until it ends. */
@@ -1931,8 +1933,11 @@ async function releaseEarlyCalls($: EngineInterface, r: Rebuild | null): Promise
   }
 }
 
-/** When the load's first turn's prompt row is timed: as the turn began, or as the first call that ran before it began, if earlier. */
-const earliestStart = (atMs: number) => earlyCalls.reduce((min, c) => Math.min(min, c.startMs), atMs)
+/**
+ * When the load's first turn's prompt row is timed: as the turn began, or as the first call that began before it, if earlier, ended or
+ * still running.
+ */
+const earliestStart = (atMs: number) => Math.min(earlyCalls.reduce((min, c) => Math.min(min, c.startMs), atMs), ...earlyRunning.values())
 
 /**
  * One tool call: when it began and ended, and what it did; once it ended without error, its markers, beside it. The call and its
@@ -1949,13 +1954,19 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
   // A main-loop call before the load's first turn began, in Cowork (`earlyCalls`): whether the plugin builds the rows is decided as it
   // ends, as that turn's start would decide it, so what its check and run say is kept meanwhile.
   let early = false
+  // What the transcript's end says of a handover, for a call begun before the first turn: read as it begins, its rows written by then.
+  let handover: Promise<Handover | undefined> | undefined
   try {
     r = await rebuildOf($)
     if (r !== null) {
       early = e.agentId === undefined && !mainTurnSeen && !mainTurnOpen && !rowSeen && typeof e.tool_use_id === 'string' && e.tool_use_id !== '' && (await hostFactsOf($)).cowork === true
-      if (early) earlySeen = true
+      if (early) {
+        earlySeen = true
+        handover = handoverOf($)
+      }
       if (ended !== undefined) captureTool(capture, ended.toolUseId, ended.tool, ended.input)
       const startMs = await $.clock.now()
+      if (early) earlyRunning.set(e.tool_use_id!, startMs)
       toolStart(r, e as never, startMs)
       if ((rowless || early) && e.tool_use_id !== undefined) callStarts.set(e.tool_use_id, startMs)
     }
@@ -1977,6 +1988,9 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
   const startMs = id !== undefined ? callStarts.get(id) : undefined
   try {
     result = await next(e)
+  } catch (err) {
+    if (id !== undefined) earlyRunning.delete(id)
+    throw err
   } finally {
     if (withArgs) argsInFlight -= 1
     if (id !== undefined) callStarts.delete(id)
@@ -1988,7 +2002,8 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
       // before the handover's row): the plugin builds the rows from here on where no row of Claude Code's reaches it, as that turn's start
       // would decide. Their rows wait for the turn's prompt row while it is still to come; where the turn has begun and has it, they go
       // now, under its interaction.
-      const handed = early && (await handoverOf($))?.carried === true
+      // Its read waits no longer than HEAD's does: a read that hangs never holds the call's result.
+      const handed = handover !== undefined && (await Promise.race([handover, $.clock.sleep(HEAD_READ_MS).then(() => undefined)]))?.carried === true
       if (handed) await decideRowless($).catch(() => undefined)
       const hold = handed && rowless && (!mainTurnSeen || promptLater !== undefined) && earlyCalls.length < MAX_EARLY_CALLS
       const joins = handed && rowless && !hold
@@ -2042,6 +2057,8 @@ export async function toolCallHook($: ToolCallParams[0], e: ToolCallParams[1], n
       // The call's spans go with what the rows say.
     }
   }
+  // Held by now where it waits, or sent: no longer running before the first turn.
+  if (id !== undefined) earlyRunning.delete(id)
   // A refused or failed call makes no marker.
   try {
     if (ended !== undefined && result.deny === undefined && result.isError !== true && isCopying() && mayMark(ended)) {
@@ -2370,6 +2387,7 @@ export const register: Register = on => {
   promptLater = undefined
   earlyCalls = []
   earlySeen = false
+  earlyRunning = new Map()
   callStarts = new Map()
   verdicts = new Map()
   judgments = new Map()

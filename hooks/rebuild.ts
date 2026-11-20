@@ -747,6 +747,8 @@ export function turnComplete(r: Rebuild, e: { turnId: string; durationMs: number
   r.heldPrompt = undefined
   const durationMs = Math.max(0, Math.round(e.durationMs))
   return interactionSpan(r, { ctx: it.prompt?.ctx ?? it.ctx, prompt: it.prompt, text: it.text, sequence: it.sequence, startMs: Math.min(nowMs - durationMs, it.fromMs ?? Infinity), endMs: nowMs, durationMs })
+  // The span starts no later than a call it holds that began before the turn (`toolJoinsTurn`); its duration stays Claude Code's for the
+  // turn, as do the active time and `interaction.duration_ms`.
 }
 
 /**

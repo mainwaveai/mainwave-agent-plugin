@@ -379,8 +379,9 @@ export function handoffPrompt(messages: readonly WalkedMessage[], host?: string)
 /**
  * What the end of a session's transcript says of a handover from chat, as Cowork's host marks it on the rows it writes: `relay`, the
  * system row it leaves at the handover (`upgrade_relay_marker`); `hostWritten`, the newest prompt row is one it wrote after that row
- * (`textNotTyped`), its text `newest`; `carried`, the newest prompt row is from before that row and not the host's (no prompt has been
- * written since the handover); `handedOff`, it is also marked as the person's message the host carried over from chat (`handedOff`). `person`, the text of the newest prompt row before the handover's row that the host did not write: the person's last
+ * (`textNotTyped`), its text `newest`; `carried`, the newest prompt row is from before that row and not the host's (no prompt has
+ * been written since the handover); `handedOff`, it is also marked as the person's message the host carried over from chat
+ * (`handedOff`). `person`, the text of the newest prompt row before the handover's row that the host did not write: the person's last
  * message in chat. A prompt row is a user row of text that is not a tool's result, a message Claude Code inserted, or `isMeta`.
  */
 export type Handover = { relay: boolean; hostWritten: boolean; carried: boolean; handedOff: boolean; newest?: string; person?: string }
