@@ -180,7 +180,7 @@ let mainTurnSeen = false
  */
 let promptLater: { turnId: string; atMs: number } | undefined
 /** How many of the transcript's newest messages a turn begun with no text reads back for its prompt (`personPrompt`). */
-const TRANSCRIPT_WALK = 10
+const TRANSCRIPT_WALK = 40
 /** When each tool call the plugin builds rows for began, by its id, until it ends. */
 let callStarts = new Map<string, number>()
 /** The permission check's verdict on each of those calls (`allow`, `deny` or `ask`), by its id, until it ends. */

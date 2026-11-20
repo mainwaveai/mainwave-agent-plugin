@@ -297,17 +297,32 @@ export function insertedText(text: string): boolean {
   return /^<[a-z][a-z0-9-]*>/.test(t) || t.startsWith('This session is being continued from a previous conversation') || t.startsWith('[Request interrupted by user')
 }
 
+/** Whether a user message's text, or one of its tool results', is the mark an interrupted request leaves: the turn it was in ended. */
+function interrupted(m: { text?: unknown; toolResults?: readonly unknown[] }): boolean {
+  const marks = (t: unknown) => typeof t === 'string' && typedText(t).trimStart().startsWith('[Request interrupted by user')
+  return marks(m.text) || (m.toolResults ?? []).some(r => r !== null && typeof r === 'object' && marks((r as { text?: unknown }).text))
+}
+
 /**
- * The person's message the current turn began with, from the newest of the transcript's messages: walked back from the end past the
- * messages Claude Code inserted after it (a background task's notification, a command's output), up to the model's message or a tool's
- * results, so an earlier turn's prompt is never taken. '' where there is none.
+ * The person's message the current turn began with, from the newest of the transcript's messages, or '' where there is none. The walk
+ * goes back from the end past what the turn has done since (the model's tool calls and their results; a response's text, which the
+ * transcript holds apart from the calls that follow it) and past the messages Claude Code inserted (a background task's notification,
+ * a command's output, a message of Cowork's reminders alone). It stops where an earlier turn ended, so that turn's prompt is never
+ * taken: at the model's message with no tool calls that no message of the model's follows, at an interrupted request, at a compaction's
+ * summary.
  */
-export function personPrompt(messages: readonly { role?: unknown; text?: unknown; toolResults?: readonly unknown[] }[]): string {
+export function personPrompt(messages: readonly { role?: unknown; text?: unknown; toolUses?: readonly unknown[]; toolResults?: readonly unknown[] }[]): string {
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]
-    if (m?.role !== 'user' || (m.toolResults?.length ?? 0) > 0) return ''
-    // A message of Cowork's reminders alone holds nothing the person typed: the walk goes on past it.
-    if (typeof m.text === 'string' && typedText(m.text).trim() !== '' && !insertedText(m.text)) return m.text
+    if (m?.role === 'assistant') {
+      if ((m.toolUses?.length ?? 0) > 0 || messages[i + 1]?.role === 'assistant') continue
+      return ''
+    }
+    if (m?.role !== 'user' || interrupted(m)) return ''
+    if ((m.toolResults?.length ?? 0) > 0) continue
+    if (typeof m.text !== 'string') continue
+    if (typedText(m.text).trimStart().startsWith('This session is being continued from a previous conversation')) return ''
+    if (typedText(m.text).trim() !== '' && !insertedText(m.text)) return m.text
   }
   return ''
 }
