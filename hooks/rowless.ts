@@ -290,11 +290,11 @@ function row(state: Rowless, head: Attrs, event: string, atMs: number, attribute
 
 /**
  * Whether a user message's text is one Claude Code inserted rather than one the person typed: a background task's notification, a
- * command's output or caveat, a compaction's summary.
+ * command's output or caveat, a compaction's summary, the mark an interrupted request leaves.
  */
 export function insertedText(text: string): boolean {
   const t = typedText(text).trimStart()
-  return /^<[a-z][a-z0-9-]*>/.test(t) || t.startsWith('This session is being continued from a previous conversation')
+  return /^<[a-z][a-z0-9-]*>/.test(t) || t.startsWith('This session is being continued from a previous conversation') || t.startsWith('[Request interrupted by user')
 }
 
 /**
@@ -306,7 +306,8 @@ export function personPrompt(messages: readonly { role?: unknown; text?: unknown
   for (let i = messages.length - 1; i >= 0; i--) {
     const m = messages[i]
     if (m?.role !== 'user' || (m.toolResults?.length ?? 0) > 0) return ''
-    if (typeof m.text === 'string' && m.text.trim() !== '' && !insertedText(m.text)) return m.text
+    // A message of Cowork's reminders alone holds nothing the person typed: the walk goes on past it.
+    if (typeof m.text === 'string' && typedText(m.text).trim() !== '' && !insertedText(m.text)) return m.text
   }
   return ''
 }

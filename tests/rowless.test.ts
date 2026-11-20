@@ -761,52 +761,64 @@ describe('in Cowork', () => {
     expect(promptsOf(w)).toEqual([[String(typed.length), typed]])
   })
 
-  test("a first turn never takes an earlier turn's prompt: the model's message or a tool's results end the walk back", keyless, async ($, on) => {
-    const notice = { role: 'user', text: '<task-notification>\n<task-id>b1</task-id>\n</task-notification>', toolUses: [] }
-    const earlier = { role: 'user', text: 'an earlier prompt', toolUses: [] }
-    const results = { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'toolu_0', text: 'done', isError: false }] }
-    let messages: unknown[] = [earlier, { role: 'assistant', text: 'done', toolUses: [] }, notice]
-    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: () => messages })
-    await start($)
-    await turn($, '', 'toolu_1')
-    messages = [earlier, results, notice]
-    await turn($, '', 'toolu_2')
-    await w.clock.advance(5_000)
-    expect(promptsOf(w)).toEqual([])
-    expect(personPrompt([earlier, results, notice])).toBe('')
-    expect(personPrompt([earlier, { role: 'assistant', text: 'ok', toolUses: [] }, { role: 'user', text: 'now this', toolUses: [] }, notice])).toBe('now this')
+  const NOTICE = { role: 'user', text: '<task-notification>\n<task-id>b1</task-id>\n</task-notification>', toolUses: [] }
+  const EARLIER = { role: 'user', text: 'an earlier prompt', toolUses: [] }
+  const RESULTS = { role: 'user', text: '', toolUses: [], toolResults: [{ tool_use_id: 'toolu_0', text: 'done', isError: false }] }
+  const ENDS: [string, unknown][] = [['the model\'s message', { role: 'assistant', text: 'done', toolUses: [] }], ['a tool\'s results', RESULTS]]
+  for (const [what, stop] of ENDS) {
+    test(`a load's first turn never takes an earlier turn's prompt: ${what} ends the walk back`, keyless, async ($, on) => {
+      const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: [EARLIER, stop, NOTICE] })
+      await start($)
+      await turn($, '')
+      await w.clock.advance(5_000)
+      expect(promptsOf(w)).toEqual([])
+    })
+  }
+
+  test("the walk back: past the messages Claude Code inserted and those of Cowork's reminders alone, never past the model's message or a tool's results", () => {
+    const reminderOnly = { role: 'user', text: REMINDER, toolUses: [] }
+    const interrupted = { role: 'user', text: '[Request interrupted by user]', toolUses: [] }
+    expect(personPrompt([{ role: 'user', text: REMINDER + typed, toolUses: [] }, reminderOnly, NOTICE, interrupted])).toBe(REMINDER + typed)
+    expect(personPrompt([EARLIER, RESULTS, NOTICE])).toBe('')
+    expect(personPrompt([EARLIER, { role: 'assistant', text: 'ok', toolUses: [] }, { role: 'user', text: 'now this', toolUses: [] }, NOTICE])).toBe('now this')
+    expect(personPrompt([EARLIER, interrupted])).toBe('an earlier prompt')
+    expect(personPrompt([reminderOnly])).toBe('')
     expect(personPrompt([])).toBe('')
   })
 
-  test("a first turn whose message reaches the transcript only after the turn began takes it at its first request: timed at the turn's start, before the request's rows, its interaction with it", keyless, async ($, on) => {
-    let messages: unknown[] = []
-    const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', env: { CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: '1' }, store: { dataPoints: { 'prompt.text': 'on' } }, messages: () => messages })
-    await start($)
-    const startedMs = START
-    await $.turn.start({ turnId: 't1', text: '' } as never)
-    await w.clock.advance(40)
-    messages = [{ role: 'user', text: REMINDER + typed, toolUses: [] }, { role: 'user', text: '<task-notification>\nx\n</task-notification>', toolUses: [] }]
-    const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-haiku-5-5', messageCount: 2, effort: 'medium' } as never)
-    while (!(await stream.next()).done) {
-      // Read to its end, as the engine does.
-    }
-    // A later request of the turn looks no more.
-    const again = $.turn.step({ turnId: 't1', index: 1, model: 'claude-haiku-5-5', messageCount: 4, effort: 'medium' } as never)
-    while (!(await again.next()).done) {
-      // Read to its end.
-    }
-    await $.turn.complete({ turnId: 't1', answer: 'ok', durationMs: 200, isAborted: false, reason: 'answer' } as never)
-    await w.clock.advance(5_000)
-    await end($)
-    expect(promptsOf(w)).toEqual([[String(typed.length), typed]])
-    const rows = w.built().filter(r => r.attributes['event.name'] !== 'plugin_status')
-    const prompt = rows.find(r => r.attributes['event.name'] === 'user_prompt')!
-    expect(prompt.attributes['event.timestamp']).toBe(new Date(startedMs).toISOString())
-    expect(prompt.attributes['event.sequence']).toBe(0)
-    for (const r of rows.filter(r => r.attributes['event.name'] === 'api_request')) expect(r.attributes['prompt.id']).toBe(prompt.attributes['prompt.id'])
-    const interactions = spans(w.posts).filter(x => x.name === 'claude_code.interaction')
-    expect(interactions.map(x => [x.attrs['user_prompt_length'], x.attrs['user_prompt']])).toEqual([[typed.length, typed]])
-  })
+  const TRACES: [string, Record<string, string>][] = [['with the beta on', { CLAUDE_CODE_ENHANCED_TELEMETRY_BETA: '1' }], ['where the plugin builds the trace', {}]]
+  for (const [how, env] of TRACES) {
+    test(`a first turn whose message reaches the transcript only after the turn began takes it at its first request (${how}): timed at the turn's start, before the request's rows, its interaction with it`, keyless, async ($, on) => {
+      let messages: unknown[] = []
+      const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', env, store: { dataPoints: { 'prompt.text': 'on' } }, messages: () => messages })
+      await start($)
+      await $.turn.start({ turnId: 't1', text: '' } as never)
+      await w.clock.advance(40)
+      messages = [{ role: 'user', text: REMINDER + typed, toolUses: [] }, NOTICE]
+      const stream = $.turn.step({ turnId: 't1', index: 0, model: 'claude-haiku-5-5', messageCount: 2, effort: 'medium' } as never)
+      while (!(await stream.next()).done) {
+        // Read to its end, as the engine does.
+      }
+      // A later request of the turn looks no more.
+      const again = $.turn.step({ turnId: 't1', index: 1, model: 'claude-haiku-5-5', messageCount: 4, effort: 'medium' } as never)
+      while (!(await again.next()).done) {
+        // Read to its end.
+      }
+      await $.turn.complete({ turnId: 't1', answer: 'ok', durationMs: 200, isAborted: false, reason: 'answer' } as never)
+      await w.clock.advance(5_000)
+      await end($)
+      expect(promptsOf(w)).toEqual([[String(typed.length), typed]])
+      const rows = w.built().filter(r => r.attributes['event.name'] !== 'plugin_status')
+      const prompt = rows.find(r => r.attributes['event.name'] === 'user_prompt')!
+      expect(prompt.attributes['event.timestamp']).toBe(new Date(START).toISOString())
+      expect(prompt.attributes['event.sequence']).toBe(0)
+      const requests = rows.filter(r => r.attributes['event.name'] === 'api_request')
+      expect(requests.length).toBe(2)
+      for (const r of requests) expect(r.attributes['prompt.id']).toBe(prompt.attributes['prompt.id'])
+      const interactions = spans(w.posts).filter(x => x.name === 'claude_code.interaction')
+      expect(interactions.map(x => [x.attrs['user_prompt_length'], x.attrs['user_prompt']])).toEqual([[typed.length, typed]])
+    })
+  }
 
   test("a first turn whose transcript holds no message of the person's even at its first request builds no prompt row", keyless, async ($, on) => {
     const w = world(on, { accountFile: ACCOUNT_FILE, entrypoint: 'remote_cowork', messages: [] })
