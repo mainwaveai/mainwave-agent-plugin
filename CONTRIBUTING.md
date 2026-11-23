@@ -23,6 +23,7 @@ The plugin sits at the repository's root:
 claude plugin validate .        # manifest, marketplace and hooks module, read the way Claude Code will
 claude plugin test .            # tests/*.test.ts against the engine
 scripts/check-version.sh        # plugin.json and hooks/version.ts agree; the Claude Code floor is the same in CI's pin, plugin.json and the README
+scripts/next-version.sh --check # the version is the next from main's (YYYY.M.N in UTC); fetch origin main first
 scripts/check-layout.sh         # one plugin, at the root: org sync refuses a .claude-plugin/ or plugin.json anywhere else
 scripts/check-hooks.sh          # the row hooks keep their fail-open .catch; the hooks that must be there are; no classic hook
 scripts/check-vendored.sh       # the copies of Mainwave's catalog and command cases (JSON) and the twins the tests import agree; --write rewrites the twins
@@ -45,7 +46,8 @@ CI runs all but the last on every pull request, on two Claude Code versions: the
 
 ## Releases and the Claude Code floor
 
-- A release bumps the version in `.claude-plugin/plugin.json` and `hooks/version.ts` together.
+- **Don't edit the version.** Every merge to `main` is a release. On each pull request, CI's `set version` job writes the next `YYYY.M.N` to `.claude-plugin/plugin.json` and `hooks/version.ts` and pushes it as a `chore(release): <version>` commit, so pull before pushing again. The README's Releasing section says how it works.
+- **When the version lines conflict** as you update a branch from `main`, take `main`'s version in both files and push: the job writes the next one. A pull request from a fork gets no version commit: a maintainer runs `git fetch origin main && scripts/next-version.sh --write` on its branch and pushes.
 - Raising the Claude Code floor is a pull request of its own. It changes `.github/claude-code-floor/package.json`, `engines` in `.claude-plugin/plugin.json`, the README's Install section and the note at the README's top together. Dependabot's version updates don't watch the floor.
 
 ## Commits

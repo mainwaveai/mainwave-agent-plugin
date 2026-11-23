@@ -3,6 +3,12 @@
 # default seated, on two Claude Code versions: the latest, which Dependabot keeps current, and the floor, the oldest version the
 # plugin supports.
 #
+# The version: each pull request carries the next version from main's (scripts/next-version.sh). The `set version` job writes it and
+# pushes one `chore(release): <version>` commit to the pull request's branch, which the squash merge folds into its commit on main.
+# The rest of that run skips, as its commit is no longer the head. GitHub holds the pull_request run that push starts for approval
+# (a push with a workflow's token starts a run only once it is approved), so the job approves it: CI, the `version` check among it, then runs on
+# the new head as a pull_request run, which is what counts for the required checks (a workflow_dispatch run's checks don't).
+#
 # Not here: the TypeScript type check. It needs the declarations Claude Code writes beside a plugin it loads from disk
 # (.claude-plugin/types/), which only a session writes, so it runs locally (README, Developing).
 # Actions are pinned by commit SHA.
@@ -26,8 +32,103 @@ env:
   DISABLE_AUTOUPDATER: '1'
 
 jobs:
+  bump:
+    name: set version
+    # A fork's pull request gets a read-only token, so its version is set by hand (the `version` job says how).
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+      # To approve the run its push starts (below).
+      actions: write
+    outputs:
+      pushed: ${{ steps.set.outputs.pushed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The branch's tip, not the merge commit: the version commit goes on top of it.
+          ref: ${{ github.head_ref }}
+          # The token goes on the push alone (below), not on disk while the branch's scripts run.
+          persist-credentials: false
+      - name: Set the version
+        id: set
+        env:
+          BRANCH: ${{ github.head_ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+          scripts/next-version.sh --write
+          if git diff --quiet; then
+            echo "pushed=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          scripts/check-version.sh
+          version=$(scripts/next-version.sh)
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -q -m "chore(release): $version" .claude-plugin/plugin.json hooks/version.ts
+          # Not forced: where the branch moved since this run began, the push fails, and the run for its new tip sets the version.
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          git -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" push origin "HEAD:refs/heads/$BRANCH"
+          echo "pushed=true" >>"$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
+          echo "::notice::set the version to $version"
+      - name: Start CI on the version commit
+        # A push with this job's token starts the pull request's run for the new commit in an approval-required state. Approving
+        # it starts CI there, which reports the required checks; the run's own `set version` finds the version set and pushes nothing.
+        if: steps.set.outputs.pushed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.set.outputs.sha }}
+        run: |
+          runs=
+          # This repository's own runs alone: a fork's pull request at the same commit keeps its own approval.
+          for _ in $(seq 1 60); do
+            runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SHA&event=pull_request" \
+              --jq '.workflow_runs[] | select(.conclusion == "action_required" and .head_repository.full_name == env.GITHUB_REPOSITORY) | .id')
+            [ -n "$runs" ] && break
+            sleep 5
+          done
+          # Failing here shows on the pull request; the version commit would otherwise sit with no checks and nothing saying why.
+          if [ -z "$runs" ]; then
+            echo "::error::no run waits for approval on $SHA after 5 minutes: approve it in the pull request's merge box, or push again"
+            exit 1
+          fi
+          for run in $runs; do
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$run/approve" || {
+              echo "::error::could not approve run $run: a maintainer approves it in the pull request's merge box"
+              exit 1
+            }
+          done
+
+  version:
+    name: version
+    needs: bump
+    # Not where `set version` pushed a commit (this run's commit is no longer the head) or failed (which shows on the pull request).
+    # (`!cancelled()` runs it where that job skips: on main, on a dispatch and on a fork's pull request.)
+    if: ${{ !cancelled() && needs.bump.result != 'failure' && needs.bump.outputs.pushed != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A pull request's head, not its merge commit: the version it carries.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: The version is the next from main's
+        run: |
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
+            scripts/check-version.sh
+            exit 0
+          fi
+          git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+          scripts/next-version.sh --check
+
   gate:
     name: gate (${{ matrix.claude-code }})
+    needs: bump
+    if: ${{ !cancelled() && needs.bump.result != 'failure' && needs.bump.outputs.pushed != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:
