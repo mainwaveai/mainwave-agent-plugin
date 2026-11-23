@@ -22,8 +22,12 @@ export const MAX_PATTERN = 300
 export const MAX_RULES = 50
 /** The largest count a quantifier may give (`{n}`, `{n,}`, `{n,m}`). */
 export const MAX_COUNT = 1000
-/** The most instructions a rule's program may have, once its counted repeats are written out. */
-export const MAX_PROGRAM = 10_000
+/**
+ * The most instructions a rule's program may have, once its counted repeats are written out: enough for any pattern of 300 characters
+ * whose nested counts multiply to at most 1,000 (`a{1,1000}` 33 times over is 66,000), as Mainwave's check allows. A scan's cost is
+ * bounded by its budget whatever the program's size.
+ */
+export const MAX_PROGRAM = 70_000
 /**
  * The steps the custom rules may take between them to scan one value, per character of it, and the steps they may take however short
  * the value. About 160 million steps run in a second, so a value of 61,440 characters costs the rules 50 ms at most.
@@ -396,12 +400,18 @@ function assemble(insts: Inst[]): Program {
   const sets: (Ranges | undefined)[] = new Array(len)
   const setAscii: (Uint8Array | undefined)[] = new Array(len)
   const asserts: (Assertion | undefined)[] = new Array(len)
+  // A set repeated by a count is one array, written out once per copy: its table is made once.
+  const tables = new Map<Ranges, Uint8Array>()
   insts.forEach((inst, k) => {
     ops[k] = inst.op
     x[k] = inst.x ?? 0
     y[k] = inst.y ?? 0
     sets[k] = inst.set
-    if (inst.set !== undefined) setAscii[k] = asciiOf(inst.set)
+    if (inst.set !== undefined) {
+      let table = tables.get(inst.set)
+      if (table === undefined) tables.set(inst.set, (table = asciiOf(inst.set)))
+      setAscii[k] = table
+    }
     asserts[k] = inst.at
   })
   // What a match can begin with: every set reachable from the start without consuming, assertions passed over.

@@ -60,7 +60,7 @@ describe('what a rule may be written with', () => {
     ['\\b', 'the pattern can match the empty string'],
     ['a|', 'the pattern can match the empty string'],
     ['(?:a?)*b', 'a repeat of what can match the empty string'],
-    ['(?:x{1000}){11}', 'the pattern is too large'],
+    ['(?:x{1000}){71}', 'the pattern is too large'],
     ['a{,3}', undefined],
     ['a]', "the pattern doesn't compile"],
     ['a)', "the pattern doesn't compile"],
@@ -76,8 +76,10 @@ describe('what a rule may be written with', () => {
   }
 
   test(`a program is at most ${MAX_PROGRAM} instructions once its counts are written out`, () => {
-    expect('refused' in compilePattern('(?:\\d{1000}-){9}')).toBe(false)
-    expect(compilePattern('(?:\\d{1000}-){10}')).toEqual({ refused: 'the pattern is too large' })
+    expect('refused' in compilePattern('(?:\\d{1000}-){69}')).toBe(false)
+    expect(compilePattern('(?:\\d{1000}-){70}')).toEqual({ refused: 'the pattern is too large' })
+    // Any pattern Mainwave's check allows fits: 300 characters of counts whose nesting multiplies to at most 1,000.
+    expect('refused' in compilePattern('a{1,1000}'.repeat(33))).toBe(false)
   })
 })
 
