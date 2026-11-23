@@ -3,6 +3,10 @@
 # default seated, on two Claude Code versions: the latest, which Dependabot keeps current, and the floor, the oldest version the
 # plugin supports.
 #
+# The version: each pull request carries the next version from main's (scripts/next-version.sh). The `set version` job writes it and
+# pushes one `chore(release): <version>` commit to the pull request's branch, which the squash merge folds into its commit on main.
+# The rest of that run skips, as its commit is no longer the head; the `version` job then checks the version on the new head.
+#
 # Not here: the TypeScript type check. It needs the declarations Claude Code writes beside a plugin it loads from disk
 # (.claude-plugin/types/), which only a session writes, so it runs locally (README, Developing).
 # Actions are pinned by commit SHA.
@@ -26,8 +30,69 @@ env:
   DISABLE_AUTOUPDATER: '1'
 
 jobs:
+  bump:
+    name: set version
+    # A fork's pull request gets a read-only token, so its version is set by hand (the `version` job says how).
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      pushed: ${{ steps.set.outputs.pushed }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The branch's tip, not the merge commit: the version commit goes on top of it.
+          ref: ${{ github.head_ref }}
+          # This job pushes that commit with its token.
+          persist-credentials: true
+      - name: Set the version
+        id: set
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+          scripts/next-version.sh --write
+          if git diff --quiet; then
+            echo "pushed=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          scripts/check-version.sh
+          version=$(scripts/next-version.sh)
+          git -c user.name='github-actions[bot]' -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -q -m "chore(release): $version" .claude-plugin/plugin.json hooks/version.ts
+          # Not forced: where the branch moved since this run began, the push fails, and the run for its new tip sets the version.
+          git push origin "HEAD:refs/heads/$BRANCH"
+          echo "pushed=true" >>"$GITHUB_OUTPUT"
+          echo "::notice::set the version to $version"
+
+  version:
+    name: version
+    needs: bump
+    # Not where `set version` pushed a commit: this run's commit is no longer the head. (`!cancelled()` runs it where that job skips.)
+    if: ${{ !cancelled() && needs.bump.outputs.pushed != 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # A pull request's head, not its merge commit: the version it carries.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: The version is the next from main's
+        run: |
+          if [ "$GITHUB_REF" = refs/heads/main ]; then
+            scripts/check-version.sh
+            exit 0
+          fi
+          git fetch --no-tags --depth=1 origin +refs/heads/main:refs/remotes/origin/main
+          scripts/next-version.sh --check
+
   gate:
     name: gate (${{ matrix.claude-code }})
+    needs: bump
+    if: ${{ !cancelled() && needs.bump.outputs.pushed != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     strategy:

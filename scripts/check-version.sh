@@ -1,6 +1,8 @@
 #!/bin/sh
 # The plugin's version is written twice: .claude-plugin/plugin.json (what Claude Code reads) and hooks/version.ts (what the plugin
-# stamps on rows, since a hooks module cannot read its own manifest). Fails when they differ.
+# stamps on rows, since a hooks module cannot read its own manifest). Fails when they differ, or when the version is not YYYY.M.N
+# (the year, the month with no leading zero, and the release that month, from 1). CI's version job sets it on every pull request
+# (scripts/next-version.sh); nobody edits it by hand.
 #
 # The oldest Claude Code version the plugin supports (the floor) is written four times: .github/claude-code-floor/package.json
 # (what CI tests), `engines` in plugin.json (what Claude Code 2.1.323 and later enforce), and in the README (what people read): in
@@ -17,6 +19,10 @@ if [ -z "$manifest" ] || [ -z "$code" ]; then
 fi
 if [ "$manifest" != "$code" ]; then
   echo "check-version: plugin.json says $manifest, hooks/version.ts says $code" >&2
+  exit 1
+fi
+if ! echo "$code" | grep -Eqx '[0-9]{4}\.([1-9]|1[0-2])\.[1-9][0-9]*'; then
+  echo "check-version: the version $code is not YYYY.M.N (such as 2026.11.1)" >&2
   exit 1
 fi
 echo "version $code"
