@@ -39,7 +39,7 @@ import type { TelemetryAttribute } from 'claude-code'
 import { isAccountMemoryTool, notRecorded, shellCommand } from './capture.ts'
 import { TOOL_OUTPUT_EVENT } from './catalog.ts'
 import { bashClass, CODE_EDIT_TOOLS, commandOutcomes, errorClassOf, genAiProvider, gitCounts, HELPER_SOURCES, languageOf, linesChanged, mcpCreatesPr, mcpParts, metricQuerySource, querySourceSafe, toolNameSafe } from './derive.ts'
-import { allows, type Gate } from './gate.ts'
+import { allows, openOf, withheldFindings, withheldOutput, type Gate } from './gate.ts'
 import type { Measure } from './meter.ts'
 import type { BuiltSpan } from './otlp.ts'
 import { cut } from './protect.ts'
@@ -123,6 +123,8 @@ type Tool = {
   execId?: string
   /** What the call answered, as the plugin read it: its output for `tool.output`, and the text of an error. */
   output?: { atMs: number; attributes: Attrs }
+  /** What the packs found in an output the gate keeps off its span (gate.ts, `withheldOutput`): the findings stamp the span carries. */
+  withheld?: Attrs
   errorText?: string
   /** The tool span and its children are sent; an Agent call's execution may wait for its subagent to name it. */
   sent: boolean
@@ -645,6 +647,10 @@ function llmSpan(r: Rebuild, row: Req, step: Step | undefined): BuiltSpan {
   const error = str(a['error'])
   const attempt = num(a['attempt']) ?? 1
   const stop = step?.stopReason ?? undefined
+  const gate = r.settings.gate()
+  // Claude Code never exports thinking: only where the gate turns it on. Where it does not, what the packs find in it goes alone.
+  const thinking = step?.thinking !== undefined && allows(gate, 'response.thinking', false) ? step.thinking : undefined
+  const withheld = thinking === undefined ? withheldFindings(gate, [['response.thinking', step?.thinking]]) : {}
   return {
     traceId: retrace(r, parent?.traceId ?? row.home?.traceId ?? r.interaction?.prompt?.ctx?.traceId ?? r.mint(32)),
     spanId: r.mint(16),
@@ -652,36 +658,38 @@ function llmSpan(r: Rebuild, row: Req, step: Step | undefined): BuiltSpan {
     name: 'claude_code.llm_request',
     startMs,
     endMs,
-    attributes: attrs(r, [
-      ...head(r, 'llm_request'),
-      ['model', model],
-      ['gen_ai.system', 'anthropic'],
-      ['gen_ai.request.model', model],
-      ['llm_request.context', context],
-      ['speed', a['speed'] === 'fast' ? 'fast' : 'normal'],
-      ['gen_ai.conversation.id', conversationOf(r, agentId)],
-      ['query_source_safe', querySourceSafe(a['query_source'])],
-      ...agentAttrs(r, agentId),
-      ['duration_ms', durationOf(startMs, endMs)],
-      ['input_tokens', num(a['input_tokens'])],
-      ['output_tokens', num(a['output_tokens'])],
-      ['cache_read_tokens', num(a['cache_read_tokens'])],
-      ['cache_creation_tokens', num(a['cache_creation_tokens'])],
-      ['success', !failed],
-      ['status_code', failed && status !== undefined ? Math.trunc(status) : undefined],
-      ['error', failed ? error : undefined],
-      ['attempt', Math.trunc(attempt)],
-      ['request_id', str(a['request_id'])],
-      ['gen_ai.response.id', str(a['request_id'])],
-      ['client_request_id', str(a['client_request_id'])],
-      ['ttft_ms', num(a['ttft_ms'])],
-      ['first_content_ms', num(a['ttft_ms'])],
-      ['effort', str(a['effort'])],
-      ['stop_reason', stop],
-      ['gen_ai.response.finish_reasons', stop === undefined ? undefined : [stop]],
-      // Claude Code never exports thinking: only where the gate turns it on.
-      ['response.thinking', step?.thinking !== undefined && allows(r.settings.gate(), 'response.thinking', false) ? step.thinking : undefined],
-    ]),
+    attributes: {
+      ...attrs(r, [
+        ...head(r, 'llm_request'),
+        ['model', model],
+        ['gen_ai.system', 'anthropic'],
+        ['gen_ai.request.model', model],
+        ['llm_request.context', context],
+        ['speed', a['speed'] === 'fast' ? 'fast' : 'normal'],
+        ['gen_ai.conversation.id', conversationOf(r, agentId)],
+        ['query_source_safe', querySourceSafe(a['query_source'])],
+        ...agentAttrs(r, agentId),
+        ['duration_ms', durationOf(startMs, endMs)],
+        ['input_tokens', num(a['input_tokens'])],
+        ['output_tokens', num(a['output_tokens'])],
+        ['cache_read_tokens', num(a['cache_read_tokens'])],
+        ['cache_creation_tokens', num(a['cache_creation_tokens'])],
+        ['success', !failed],
+        ['status_code', failed && status !== undefined ? Math.trunc(status) : undefined],
+        ['error', failed ? error : undefined],
+        ['attempt', Math.trunc(attempt)],
+        ['request_id', str(a['request_id'])],
+        ['gen_ai.response.id', str(a['request_id'])],
+        ['client_request_id', str(a['client_request_id'])],
+        ['ttft_ms', num(a['ttft_ms'])],
+        ['first_content_ms', num(a['ttft_ms'])],
+        ['effort', str(a['effort'])],
+        ['stop_reason', stop],
+        ['gen_ai.response.finish_reasons', stop === undefined ? undefined : [stop]],
+        ['response.thinking', thinking],
+      ]),
+      ...withheld,
+    },
     events: [{ name: 'gen_ai.request.attempt', timeMs: startMs, attributes: { attempt: Math.trunc(attempt) } }],
     ...(failed ? { status: { code: 2 as const, ...(error ? { message: error } : {}) } } : {}),
   }
@@ -928,8 +936,15 @@ export function toolEnd(r: Rebuild, id: string | undefined, result: { isError?: 
   // (a file being uploaded, account memory), which Claude Code never records.
   if (tool.isError && typeof result?.text === 'string' && result.text !== '' && (!mcpParts(tool.name) || shellCommand(tool.name, tool.input) !== undefined)) tool.errorText = result.text
   if (ok && allows(gate, 'tool.result', false)) {
-    const output = toolOutput(r, tool, result?.result, result?.text)
+    const output = toolOutput(r, gate, tool, result?.result, result?.text)
     if (output) tool.output = { atMs: nowMs, attributes: output }
+  } else if (ok) {
+    // An output the gate keeps on the machine: read as it would go with everything on, for what the packs find in it alone.
+    try {
+      tool.withheld = withheldOutput(gate, toolOutput(r, openOf(gate), tool, result?.result, result?.text))
+    } catch {
+      // The span goes without them.
+    }
   }
   if (ok && (tool.name === 'Edit' || tool.name === 'Write' || tool.name === 'NotebookEdit')) {
     const lines = linesChanged(result?.result)
@@ -1028,8 +1043,7 @@ function mcpText(result: unknown): string | undefined {
  * text, what a WebFetch call drew from its page and the text a WebSearch call gave the model (`text`, its result as the model read it).
  * Each value is cut as Claude Code cuts content. Undefined for another tool, or a result of another shape.
  */
-function toolOutput(r: Rebuild, tool: Tool, data: unknown, text?: unknown): Attrs | undefined {
-  const gate = r.settings.gate()
+function toolOutput(r: Rebuild, gate: Gate, tool: Tool, data: unknown, text?: unknown): Attrs | undefined {
   const input = tool.input
   const out: [string, string][] = []
   const path = input['file_path']
@@ -1096,21 +1110,25 @@ function finishTool(r: Rebuild, tool: Tool, force: boolean): Emit {
     name: 'claude_code.tool',
     startMs: tool.startMs,
     endMs,
-    attributes: attrs(r, [
-      ...head(r, 'tool'),
-      ['tool_name', tool.name],
-      ['tool_name_safe', toolNameSafe(tool.name)],
-      ['gen_ai.operation.name', 'execute_tool'],
-      ['gen_ai.tool.name', mcp?.tool ?? tool.name],
-      ['anthropic.mcp.server.name', mcp?.server],
-      ['gen_ai.conversation.id', conversation],
-      ...inputAttrs(r, tool),
-      ...outcomeAttrs(r, tool),
-      ...agentAttrs(r, tool.agentId),
-      ['tool_use_id', tool.id],
-      ['gen_ai.tool.call.id', tool.id],
-      ['duration_ms', durationOf(tool.startMs, endMs)],
-    ]),
+    attributes: {
+      ...attrs(r, [
+        ...head(r, 'tool'),
+        ['tool_name', tool.name],
+        ['tool_name_safe', toolNameSafe(tool.name)],
+        ['gen_ai.operation.name', 'execute_tool'],
+        ['gen_ai.tool.name', mcp?.tool ?? tool.name],
+        ['anthropic.mcp.server.name', mcp?.server],
+        ['gen_ai.conversation.id', conversation],
+        ...inputAttrs(r, tool),
+        ...outcomeAttrs(r, tool),
+        ...agentAttrs(r, tool.agentId),
+        ['tool_use_id', tool.id],
+        ['gen_ai.tool.call.id', tool.id],
+        ['duration_ms', durationOf(tool.startMs, endMs)],
+      ]),
+      // What the packs found in an output the gate keeps on the machine.
+      ...tool.withheld,
+    },
     ...(tool.output ? { events: [{ name: TOOL_OUTPUT_EVENT, timeMs: Math.min(tool.output.atMs, endMs), attributes: tool.output.attributes }] } : {}),
   }]
   const d = tool.decision

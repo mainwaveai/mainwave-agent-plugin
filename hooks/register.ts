@@ -33,7 +33,7 @@ import { captureCommit, capturePrompt, captureTool, dropStreamedText, loopKey, n
 import { MCP_SERVER_ROW, PLUGIN_STATUS_ROW, SKILL_PROMPT_ROW, type Switch } from './catalog.ts'
 import { clientPlatformIn } from './client.ts'
 import { HELPER_SOURCES, mcpParts } from './derive.ts'
-import { allows, configureGate, currentGate, gateAttributes, gateMarker, gateRow, gateSpan, metricAllowed, openGate, resetPacks, setOptIn, setOverrides, type RowFill } from './gate.ts'
+import { allows, configureGate, currentGate, gateAttributes, gateMarker, gateMeasure, gateRow, gateSpan, metricAllowed, openGate, resetPacks, setOptIn, setOverrides, type RowFill } from './gate.ts'
 import { classifyGlab, glabConfigDir, glabHosts, glabTexts, instanceOf, mrAttributes, mrFromApi, mrLookup, mrUrlOf, parseMrJson, repositoryIdOf, sameUrl, stripDraft, type MrDetails, type MrRef } from './glab.ts'
 import { endSession } from './http.ts'
 import { identityOf, isOrgId, mergeIdentity } from './identity.ts'
@@ -479,7 +479,7 @@ async function emitNow($: EngineInterface, out: Emit, built: boolean): Promise<v
   const strip = built && !builtRepoAllowed(gate)
   for (const m of out.measures) {
     const attributes = strip ? withoutRepo(m.attributes) : m.attributes
-    if (metricAllowed(gate, m.name, built)) add(meter, { ...m, attributes: { ...gateAttributes(gate, m.name, attributes, {}, built), ...routeStamps() } })
+    if (metricAllowed(gate, m.name, built)) add(meter, { ...m, attributes: { ...gateMeasure(gate, m.name, attributes, built), ...routeStamps() } })
   }
   for (const span of out.spans) {
     const gated = gateSpan(gate, strip ? { ...span, attributes: withoutRepo(span.attributes) } : span, built)

@@ -5,7 +5,7 @@
 // they are removed before the plugin adds its own. What the plugin adds passes a shape check per key: a key without a rule, or a value
 // that fails its rule, is dropped, never sent.
 
-import { DEFAULTS } from './catalog.ts'
+import { DATA_POINTS, DEFAULTS, type DataPointId } from './catalog.ts'
 import { COMMAND_COUNTS, COMMAND_REFS, type CommandCount, type CommandRef } from './derive.ts'
 
 /** The plugin's name on every row it stamps. */
@@ -102,6 +102,43 @@ export function issuesStamp(codes: readonly string[]): Record<string, string[]> 
 
 /** The count of secrets the always-on protections replaced in a record's values (gate.ts), under Mainwave's SDKs' name for it. */
 export const REDACTION_COUNT = 'mainwave.redaction.count'
+
+/**
+ * What the protections found in a record's values (gate.ts), on the plugin's own copy alone: one finding per pack, rule and field,
+ * with how many matches it replaced there. `field` is the data point the value belongs to. A finding never holds the value, any part
+ * of it, or anything derived from it. Sent as JSON: a list of `{ "pack", "rule", "field", "count" }`.
+ */
+export const FINDINGS_STAMP = 'mainwave.redaction.findings'
+export type Finding = { pack: string; rule: string; field: DataPointId; count: number }
+/** How many findings a record carries at most: far more than the packs' rules times the data points. */
+export const MAX_FINDINGS = 64
+/** The shape of a pack's or a rule's name: lowercase words of letters, digits, `_` and `-`, joined by dots; at most 64 characters. */
+const FINDING_NAME = /^(?=.{1,64}$)[a-z0-9_-]+(?:\.[a-z0-9_-]+)*$/
+
+/** Whether one finding has its shape: exactly its four keys, names of their shape, a known data point, a count Mainwave reads. */
+function isFinding(v: unknown): v is Finding {
+  if (v === null || typeof v !== 'object' || Array.isArray(v)) return false
+  const f = v as Record<string, unknown>
+  return Object.keys(f).length === 4 && typeof f['pack'] === 'string' && FINDING_NAME.test(f['pack']) && typeof f['rule'] === 'string' && FINDING_NAME.test(f['rule'])
+    && typeof f['field'] === 'string' && DATA_POINTS.has(f['field'] as DataPointId) && Number.isInteger(f['count']) && (f['count'] as number) >= 1 && (f['count'] as number) <= 1_000_000
+}
+
+/** The findings a stamp's value holds: a list of findings, each pack, rule and field once; undefined when it is not one. */
+export function readFindings(value: unknown): Finding[] | undefined {
+  if (typeof value !== 'string') return undefined
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(value)
+  } catch {
+    return undefined
+  }
+  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > MAX_FINDINGS || !parsed.every(isFinding)) return undefined
+  const keys = new Set(parsed.map(f => `${f.pack}\n${f.rule}\n${f.field}`))
+  return keys.size === parsed.length ? parsed : undefined
+}
+
+/** The value the findings stamp may carry. */
+export const FINDINGS_RULE = (v: unknown): boolean => readFindings(v) !== undefined
 
 /** The keys the plugin writes with a number, and the value each may carry. */
 export const COUNT_RULES: Readonly<Record<typeof REDACTION_COUNT, (value: number) => boolean>> = {

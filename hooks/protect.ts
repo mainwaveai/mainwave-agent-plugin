@@ -7,7 +7,7 @@
 //
 // Length: Claude Code's own limit for telemetry content, and its marker, so a value the plugin cuts reads as one Claude Code cut.
 
-import { scanPacks, type PackName } from './packs.ts'
+import { addHit, scanPacks, type Hits, type PackName } from './packs.ts'
 
 /** Claude Code's limit on a telemetry content value, in characters, when nothing sets a lower one. */
 export const CONTENT_MAX_LENGTH = 61_440
@@ -78,22 +78,26 @@ const ASSIGNED: readonly Rule[] = [
 
 /**
  * A value with every secret replaced, then every match of the personal-data packs among `packs` (packs.ts), and how many were. The
- * secret rules always run, and first, so a pack never reads the digits inside a token they replace.
+ * secret rules always run, and first, so a pack never reads the digits inside a token they replace. Each match replaced is counted in
+ * `hits` too, where given: a secret under the `secrets` pack and its rule's name, a pack's match under its pack and rule.
  */
-export function redact(text: string, packs: readonly PackName[] = []): { text: string; count: number } {
+export function redact(text: string, packs: readonly PackName[] = [], hits?: Hits): { text: string; count: number } {
   let out = text
   let count = 0
   for (const rule of SECRETS) {
-    out = out.replace(rule.pattern, () => ((count += 1), marker(rule.name)))
+    out = out.replace(rule.pattern, () => ((count += 1), addHit(hits, 'secrets', rule.name), marker(rule.name)))
   }
   for (const rule of ASSIGNED) {
     out = out.replace(rule.pattern, (...args: unknown[]) => {
       const m = args[0] as string
       const next = rule.replace!(m, ...(args.slice(1, -2) as string[]))
-      if (next !== m) count += 1
+      if (next !== m) {
+        count += 1
+        addHit(hits, 'secrets', rule.name)
+      }
       return next
     })
   }
-  const p = scanPacks(out, packs)
+  const p = scanPacks(out, packs, hits)
   return { text: p.text, count: count + p.count }
 }

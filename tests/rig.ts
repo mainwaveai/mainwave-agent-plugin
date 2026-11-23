@@ -24,6 +24,24 @@ export const CONTRACT: Record<string, (v: unknown) => boolean> = {
   'mainwave.cowork.client_platform': v => typeof v === 'string' && /^[a-z0-9_]{1,32}$/.test(v),
   // On the plugin's own copy only, where the protections replaced a secret or a redaction pack's match: how many.
   'mainwave.redaction.count': v => typeof v === 'number' && Number.isInteger(v) && v >= 1,
+  // On the plugin's own copy only, where the protections replaced a match: by pack, rule and the data point of the value, how many.
+  // Names and a count alone: the value, or anything of it, is never there.
+  'mainwave.redaction.findings': v => {
+    if (typeof v !== 'string') return false
+    let list: unknown
+    try {
+      list = JSON.parse(v)
+    } catch {
+      return false
+    }
+    const name = /^[a-z0-9_-]+(\.[a-z0-9_-]+)*$/
+    return Array.isArray(list) && list.length > 0 && list.every(f => {
+      if (f === null || typeof f !== 'object') return false
+      const { pack, rule, field, count, ...rest } = f as Record<string, unknown>
+      return Object.keys(rest).length === 0 && typeof pack === 'string' && name.test(pack) && typeof rule === 'string' && name.test(rule)
+        && typeof field === 'string' && DATA_POINT_IDS.includes(field) && Number.isInteger(count) && (count as number) >= 1
+    })
+  },
   // On the plugin's own copy only, where the person opted in to data points off by default: which, each once.
   'mainwave.telemetry.opt_in': v => typeof v === 'string' && v.split(',').every(id => OPT_IN_IDS.includes(id)) && new Set(v.split(',')).size === v.split(',').length,
   // On a shell command's tool span, in the plugin's own copy only: the command was read; then what it did, each count above 0, and a
@@ -45,6 +63,12 @@ export const ISSUE_CODES = [
   'redaction_unreadable', 'redaction_unknown_pack', 'copy_dropped',
 ]
 /** The data points a person may opt in to: those off by default, every identifier and every piece of content. */
+/** Every data point's ID, as Mainwave's catalog names them. */
+export const DATA_POINT_IDS = [
+  'session.identity', 'session.links', 'session.client', 'usage', 'tool.call', 'tool.mcp', 'skill.name', 'agent.type', 'command.name', 'bash.class',
+  'bash.outcome', 'file.kind', 'web.domain', 'account.plan', 'repo', 'file.path', 'web.url', 'work.item', 'mcp.url', 'bash.command', 'change.title',
+  'tool.input', 'tool.result', 'skill.text', 'prompt.text', 'response.text', 'response.thinking',
+]
 export const OPT_IN_IDS = ['repo', 'file.path', 'web.url', 'work.item', 'mcp.url', 'bash.command', 'change.title', 'tool.input', 'tool.result', 'skill.text', 'prompt.text', 'response.text', 'response.thinking']
 /**
  * Explicit settings that turn on the identifiers and content Claude Code sends with Mainwave's org-wide setup captures on: as an

@@ -22,15 +22,19 @@
 // settings (`setPersonPacks`). The person's add to the organization's, never take from them. A choice that can't be read, or that names
 // a pack the plugin does not have, holds every identifier and content value back (the record still goes): redaction that was asked for
 // never silently turns off.
+//
+// What the protections replace is reported on each record, as findings (`FINDINGS_STAMP`): by pack, rule and the data point the value
+// belongs to, with how many matches, never the value. They are read from the record as it would go with every data point on, so a value
+// the gate keeps on the machine still says what it held: it is scanned there, and only its findings go.
 
 import type { TelemetryAttribute } from 'claude-code'
 
 import { CATALOG, DATA_POINTS, DEFAULTS, METRIC_OWNERS, OUTPUT_OWNERS, OWN_ROWS, ownerOf, PARAMETER_OWNERS, sensitive, SKILL_PROMPT_ROW, TOOL_OUTPUT_EVENT, type DataPointId, type Switch } from './catalog.ts'
 import type { BuiltSpan, CopiedRow, MetricPoint } from './otlp.ts'
-import { DEFAULT_PACKS, EXEMPT_KEYS, PACK_NAMES, type PackName } from './packs.ts'
+import { addHit, DEFAULT_PACKS, EXEMPT_KEYS, PACK_NAMES, type Hits, type PackName } from './packs.ts'
 import { CONTENT_MAX_LENGTH, cut, redact } from './protect.ts'
 import { MARKER_KEYS } from './markers.ts'
-import { COMMAND_PREFIX, COMMAND_REF_KEYS, COUNT_RULES, filterStamps, OPT_IN_STAMP, REDACTION_COUNT } from './stamps.ts'
+import { COMMAND_PREFIX, COMMAND_REF_KEYS, COUNT_RULES, filterStamps, FINDINGS_STAMP, MAX_FINDINGS, OPT_IN_STAMP, readFindings, REDACTION_COUNT, type Finding } from './stamps.ts'
 
 export type Setting = 'on' | 'off' | 'claude'
 /**
@@ -101,9 +105,14 @@ export function resolveGate(
  * through it: each record waits for the answer, then goes through the gate in force, strictly.
  */
 export function openGate(): Gate {
-  const all: Overrides = Object.fromEntries(CATALOG.filter(d => !d.required).map(d => [d.id, 'on']))
-  return { ...resolveGate({}, all, current.limit), optedIn: [] }
+  return { ...resolveGate({}, ALL_ON, current.limit), optedIn: [] }
 }
+
+const ALL_ON: Overrides = Object.fromEntries(CATALOG.filter(d => !d.required).map(d => [d.id, 'on']))
+const ALL_ON_SETTINGS = resolveGate({}, ALL_ON).settings
+
+/** A gate with every data point on and the limit and redaction of `gate`: what a record's findings are read through. */
+export const openOf = (gate: Gate): Gate => ({ ...gate, settings: ALL_ON_SETTINGS, optedIn: [] })
 
 // ── Redaction packs ───────────────────────────────────────────────────────────
 
@@ -311,17 +320,30 @@ function protectedKey(record: string, key: string): boolean {
 
 /**
  * One identifier or content value through the protections: secrets replaced, then the packs in force, unless `key` is one no pack
- * scans (packs.ts, `EXEMPT_KEYS`). Null when it must not be sent: the redaction is `held`, or the value could not be scanned.
+ * scans (packs.ts, `EXEMPT_KEYS`). Null when it must not be sent: the redaction is `held`, or the value could not be scanned. What it
+ * replaced is counted in `hits` too, by pack and rule. `memo` keeps each value's result for one record, so a value both sent and
+ * reported (findings) is scanned once.
  */
-export function protectText(gate: Gate, text: string, key?: string): { text: string; count: number } | null {
+export function protectText(gate: Gate, text: string, key?: string, hits?: Hits, memo?: Memo): { text: string; count: number } | null {
   const exempt = key !== undefined && EXEMPT_KEYS.has(key)
   if ('held' in gate.redaction && !exempt) return null
-  try {
-    return redact(text, exempt || 'held' in gate.redaction ? [] : gate.redaction.packs)
-  } catch {
-    return null
+  const id = `${exempt ? 1 : 0}${text}`
+  let done = memo?.get(id)
+  if (done === undefined) {
+    const own: Hits = new Map()
+    try {
+      done = { ...redact(text, exempt || 'held' in gate.redaction ? [] : gate.redaction.packs, own), hits: own }
+    } catch {
+      return null
+    }
+    memo?.set(id, done)
   }
+  if (hits !== undefined) for (const h of done.hits.values()) addHit(hits, h.pack, h.rule, h.count)
+  return { text: done.text, count: done.count }
 }
+
+/** What `protectText` made of each value of one record, by the value. */
+type Memo = Map<string, { text: string; count: number; hits: Hits }>
 
 /**
  * The always-on protections on one record's attributes: in every identifier and content value (each string of a list too), secrets
@@ -329,7 +351,7 @@ export function protectText(gate: Gate, text: string, key?: string): { text: str
  * it. A value the protections can't clear is left out (`protectText`); the record goes without it. Answers how many matches were
  * replaced.
  */
-export function protect(gate: Gate, record: string, attributes: Attrs, all = false): { attributes: Attrs; count: number } {
+export function protect(gate: Gate, record: string, attributes: Attrs, all = false, memo?: Memo): { attributes: Attrs; count: number } {
   const out: Attrs = {}
   let count = 0
   for (const [key, value] of Object.entries(attributes)) {
@@ -340,7 +362,7 @@ export function protect(gate: Gate, record: string, attributes: Attrs, all = fal
     if (Array.isArray(value)) {
       const items: string[] = []
       for (const item of value) {
-        const r = typeof item === 'string' ? protectText(gate, cut(item, gate.limit).text, key) : null
+        const r = typeof item === 'string' ? protectText(gate, cut(item, gate.limit).text, key, undefined, memo) : null
         if (r === null) break
         items.push(r.text)
         count += r.count
@@ -353,7 +375,7 @@ export function protect(gate: Gate, record: string, attributes: Attrs, all = fal
     // names another ref.
     const c = cut(value, gate.limit)
     if (c.truncated && key.startsWith(COMMAND_PREFIX)) continue
-    const r = protectText(gate, c.text, key)
+    const r = protectText(gate, c.text, key, undefined, memo)
     if (r === null) continue
     count += r.count
     put(out, key, r.text)
@@ -373,6 +395,146 @@ function withCount(attributes: Attrs, count: number): Attrs {
   return COUNT_RULES[REDACTION_COUNT](total) ? { ...attributes, [REDACTION_COUNT]: total } : attributes
 }
 
+// ── Findings ──────────────────────────────────────────────────────────────────
+
+/**
+ * Findings being gathered for one record, by pack, rule and field, in the order first found; and the values read, by field, so a value
+ * a record carries twice under one data point (a prompt row's `prompt` and `prompt_text`) counts once.
+ */
+class Findings extends Map<string, Finding> {
+  readonly seen = new Set<string>()
+}
+/** Which of a record's keys its findings are read from. */
+type Report = (key: string) => boolean
+const everything: Report = () => true
+/**
+ * A span the plugin rebuilt reports only what no row carries: the model's thinking, and a tool's output (its event, `gateSpan`). A
+ * prompt, a tool's input and an error are reported on their rows.
+ */
+const spanOnly: Report = key => key === 'response.thinking'
+
+/**
+ * The data point a protected value is reported under: its owner on the record; `tool_input` and `tool_parameters` (each of whose keys
+ * is read on its own, `findParameters`) are tool input; an `error` or status message no data point owns is a tool's result on a tool's
+ * record, else the request's (`usage`).
+ */
+function fieldOf(record: string, key: string): DataPointId {
+  const owner = ownerOf(record, key)
+  if (owner !== undefined) return owner.id
+  if (key === 'tool_input' || key === 'tool_parameters') return 'tool.input'
+  return /tool/.test(record) ? 'tool.result' : 'usage'
+}
+
+/** What the protections replace in one value, cut first as it would be sent, added to `into` under `field`. */
+function findIn(gate: Gate, text: string, key: string | undefined, field: DataPointId, into: Findings, memo?: Memo): void {
+  const read = `${field}\n${text}`
+  if (into.seen.has(read)) return
+  into.seen.add(read)
+  const hits: Hits = new Map()
+  if (protectText(gate, cut(text, gate.limit).text, key, hits, memo) === null) return
+  for (const { pack, rule, count } of hits.values()) {
+    const at = `${pack}\n${rule}\n${field}`
+    const have = into.get(at)
+    if (have !== undefined) have.count = Math.min(have.count + count, 1_000_000)
+    else into.set(at, { pack, rule, field, count: Math.min(count, 1_000_000) })
+  }
+}
+
+/** `tool_parameters`, each key's value under its own data point (`PARAMETER_OWNERS`), tool input where none owns it. */
+function findParameters(gate: Gate, raw: string, into: Findings, memo?: Memo): void {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    parsed = undefined
+  }
+  if (!isObject(parsed)) return findIn(gate, raw, 'tool_parameters', 'tool.input', into, memo)
+  for (const [k, v] of Object.entries(parsed)) {
+    if (v === undefined || v === null || typeof v === 'boolean') continue
+    findIn(gate, typeof v === 'string' ? v : JSON.stringify(v), 'tool_parameters', PARAMETER_OWNERS[k] ?? 'tool.input', into, memo)
+  }
+}
+
+/**
+ * The findings in a record's identifier and content values (`all`: in every value), as `protect` reads them, added to `into`; only
+ * those of the keys `report` takes.
+ */
+function findAttributes(gate: Gate, record: string, attributes: Readonly<Attrs>, into: Findings, all = false, field?: (key: string) => DataPointId, report: Report = everything, memo?: Memo): void {
+  for (const [key, value] of Object.entries(attributes)) {
+    if (typeof value === 'number' || typeof value === 'boolean' || !(all || protectedKey(record, key)) || !report(key)) continue
+    const at = field?.(key) ?? fieldOf(record, key)
+    if (typeof value === 'string') {
+      if (key === 'tool_parameters') findParameters(gate, value, into, memo)
+      else findIn(gate, value, key, at, into, memo)
+    } else if (Array.isArray(value)) {
+      for (const item of value) if (typeof item === 'string') findIn(gate, item, key, at, into, memo)
+    }
+  }
+}
+
+/** The findings in a span event's values: a tool's output is all content, each value under its data point (`OUTPUT_OWNERS`). */
+function findEvent(gate: Gate, event: { name: string; attributes: Readonly<Attrs> }, into: Findings): void {
+  if (event.name !== TOOL_OUTPUT_EVENT) return
+  findAttributes(gate, event.name, event.attributes, into, true, key => OUTPUT_OWNERS[key] ?? 'tool.result')
+}
+
+/**
+ * The findings in values the record will not carry, for whoever builds it (rebuild.ts): a tool's output, the model's thinking, each
+ * value under its data point, read through the gate as it reads a record. The stamp to put on the record, or `{}` with none.
+ */
+export function withheldFindings(gate: Gate, values: readonly (readonly [DataPointId, string | undefined])[]): Attrs {
+  const into = new Findings()
+  try {
+    for (const [field, text] of values) if (text !== undefined && text !== '') findIn(gate, text, undefined, field, into)
+  } catch {
+    return {}
+  }
+  return withFindings({}, into)
+}
+
+/** A tool's output the record will not carry: its findings stamp, as `withheldFindings`, each value under its event's data point. */
+export function withheldOutput(gate: Gate, output: Readonly<Attrs> | undefined): Attrs {
+  const into = new Findings()
+  if (output === undefined) return {}
+  try {
+    findEvent(gate, { name: TOOL_OUTPUT_EVENT, attributes: output }, into)
+  } catch {
+    return {}
+  }
+  return withFindings({}, into)
+}
+
+/**
+ * Adds the findings to a record's own, if any: the counts of a pack, rule and field it carries already added to. A stamp that fails its
+ * rule is replaced. Past `MAX_FINDINGS`, the later ones are left off; the count still counts every match.
+ */
+function withFindings(attributes: Attrs, found: Findings): Attrs {
+  const had = attributes[FINDINGS_STAMP] === undefined ? [] : readFindings(attributes[FINDINGS_STAMP])
+  if (found.size === 0 && had !== undefined) return attributes
+  const merged = new Map<string, Finding>()
+  for (const f of had ?? []) merged.set(`${f.pack}\n${f.rule}\n${f.field}`, { ...f })
+  for (const [key, f] of found) {
+    const have = merged.get(key)
+    if (have !== undefined) have.count = Math.min(have.count + f.count, 1_000_000)
+    else if (merged.size < MAX_FINDINGS) merged.set(key, { ...f })
+  }
+  const { [FINDINGS_STAMP]: _old, ...rest } = attributes
+  const value = JSON.stringify([...merged.values()])
+  return merged.size === 0 || readFindings(value) === undefined ? rest : { ...rest, [FINDINGS_STAMP]: value }
+}
+
+/** A record's findings: what the protections replace in it as it would go with every data point on, `fill` included. */
+function findingsOf(gate: Gate, record: string, attributes: Readonly<Attrs>, fill: RowFill, report: Report, memo?: Memo): Findings {
+  const into = new Findings()
+  try {
+    const open = openOf(gate)
+    findAttributes(open, record, select(open, record, attributes, fill, false), into, false, undefined, report, memo)
+  } catch {
+    // A record goes without findings rather than not at all.
+  }
+  return into
+}
+
 /**
  * One record's attributes through the gate, in their order: each attribute of a data point that may not go there removed (or
  * `<REDACTED>` where Claude Code marks withheld text so), Claude Code's `tool_parameters` and `tool_input` gated by what they hold,
@@ -380,6 +542,25 @@ function withCount(attributes: Attrs, count: number): Attrs {
  * name.
  */
 export function gateAttributes(gate: Gate, record: string, attributes: Readonly<Attrs>, fill: RowFill = {}, strict = false): Attrs {
+  return gateReporting(gate, record, attributes, fill, strict, everything)
+}
+
+/** `gateAttributes`, the findings read from the keys `report` takes alone. */
+function gateReporting(gate: Gate, record: string, attributes: Readonly<Attrs>, fill: RowFill, strict: boolean, report: Report): Attrs {
+  // The values sent are scanned once: their findings read what their protection found.
+  const memo: Memo = new Map()
+  const { attributes: safe, count } = protect(gate, record, select(gate, record, attributes, fill, strict), false, memo)
+  return withFindings(withCount(safe, count), findingsOf(gate, record, attributes, fill, report, memo))
+}
+
+/** A metric point's attributes through the gate, as `gateAttributes` has them, without findings: a metric's attributes are its series. */
+export function gateMeasure(gate: Gate, name: string, attributes: Readonly<Attrs>, strict = false): Attrs {
+  const { attributes: safe, count } = protect(gate, name, select(gate, name, attributes, {}, strict))
+  return withCount(safe, count)
+}
+
+/** What of a record's attributes the gate lets go, and what the plugin read that it adds, before the protections. */
+function select(gate: Gate, record: string, attributes: Readonly<Attrs>, fill: RowFill, strict: boolean): Attrs {
   const out: Attrs = {}
   // What is there goes where Claude Code would have sent it; `strict`, for a record whose capture this load did not see, only where
   // the data point is on.
@@ -427,8 +608,7 @@ export function gateAttributes(gate: Gate, record: string, attributes: Readonly<
     delete out['skill.text']
     put(out, 'skill.text_held_back', true)
   }
-  const { attributes: safe, count } = protect(gate, record, out)
-  return withCount(safe, count)
+  return out
 }
 
 /** A span event through the gate: its attributes, or null when its data point is off. A tool's output is all content. */
@@ -495,7 +675,9 @@ function withOptIn(gate: Gate, attributes: Attrs): Attrs {
  * `error`. A run's error text is a tool result: with those off, the run keeps only the error's class, as Claude Code's does.
  */
 export function gateSpan(gate: Gate, span: BuiltSpan, strict = false): BuiltSpan {
-  let attributes = gateAttributes(gate, span.name, span.attributes, {}, strict)
+  // A marker's values are its own; a span the plugin rebuilt repeats its rows' but for a tool's output and the model's thinking.
+  const report = Object.prototype.hasOwnProperty.call(MARKER_KEYS, span.name) ? everything : spanOnly
+  let attributes = gateReporting(gate, span.name, span.attributes, {}, strict, report)
   let status = span.status
   // A failed run's error text can repeat what the call read and ran: it goes with tool results and tool input alone.
   const errorText = allows(gate, 'tool.result', !strict) && allows(gate, 'tool.input', !strict)
@@ -503,7 +685,7 @@ export function gateSpan(gate: Gate, span: BuiltSpan, strict = false): BuiltSpan
   if (span.name === 'claude_code.tool.execution' && !errorText && attributes['error'] !== undefined && attributes['error'] !== attributes['error_class']) {
     const { error: _text, ...rest } = attributes
     const cls = attributes['error_class']
-    attributes = cls === undefined ? rest : gateAttributes(gate, span.name, { ...attributes, error: cls })
+    attributes = cls === undefined ? rest : gateReporting(gate, span.name, { ...attributes, error: cls }, {}, false, report)
     if (status?.message !== undefined) status = typeof cls === 'string' ? { ...status, message: cls } : { code: status.code }
   } else if (status?.message !== undefined) {
     // The message repeats the error: the protections apply to it as to the attribute, cut first, and it is left out where the attribute
@@ -519,7 +701,14 @@ export function gateSpan(gate: Gate, span: BuiltSpan, strict = false): BuiltSpan
     events.push(g.event)
     count += g.count
   }
-  return { ...span, attributes: withOptIn(gate, withCount(attributes, count)), ...(span.events ? { events } : {}), ...(status ? { status } : {}) }
+  // What a tool's output held, whether or not it goes. The status message repeats the error, which its row reports.
+  const found = new Findings()
+  try {
+    for (const e of span.events ?? []) findEvent(gate, e, found)
+  } catch {
+    found.clear()
+  }
+  return { ...span, attributes: withOptIn(gate, withFindings(withCount(attributes, count), found)), ...(span.events ? { events } : {}), ...(status ? { status } : {}) }
 }
 
 /**
@@ -548,5 +737,5 @@ export function gateRow(gate: Gate, row: CopiedRow, strict = false): CopiedRow |
 
 /** A metric point through the gate: null when its metric's data point is off. */
 export function gatePoint(gate: Gate, point: MetricPoint, strict = false): MetricPoint | null {
-  return metricAllowed(gate, point.name, strict) ? { ...point, attributes: gateAttributes(gate, point.name, point.attributes, {}, strict) } : null
+  return metricAllowed(gate, point.name, strict) ? { ...point, attributes: gateMeasure(gate, point.name, point.attributes, strict) } : null
 }

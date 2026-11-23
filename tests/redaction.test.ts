@@ -220,3 +220,72 @@ describe("the organization's data collection settings, kept in the plugin's stor
     expect(rowOf(posts, 'user_prompt')['prompt']).toBeUndefined()
   })
 })
+
+describe('findings: what each pack caught, without the value', () => {
+  // Every identifier and content data point off, as an organization turns them off: nothing of the session's text goes.
+  const OFF = { dataPoints: { 'bash.command': 'off', 'tool.input': 'off', 'tool.result': 'off', 'prompt.text': 'off', 'response.text': 'off', 'response.thinking': 'off', 'skill.text': 'off', 'change.title': 'off', repo: 'off', 'file.path': 'off', 'web.url': 'off', 'work.item': 'off', 'mcp.url': 'off' } }
+  const findings = (attrs: Record<string, unknown>) => JSON.parse((attrs['mainwave.redaction.findings'] as string | undefined) ?? '[]') as Record<string, unknown>[]
+
+  for (const [name, store] of [['with content on', {}], ['with every content data point off', OFF]] as const) {
+    test(`${name}: a tool input holding an email gives a finding naming the pack, rule, field, tool, person and session`, keyless, async ($, on) => {
+      const { posts } = await session($, on, { policy: packsOption(ALL) }, store)
+      const result = rowOf(posts, 'tool_result')
+      expect(findings(result)).toEqual([
+        { pack: 'pii.contact', rule: 'email', field: 'tool.input', count: 1 },
+        { pack: 'pii.contact', rule: 'email', field: 'bash.command', count: 1 },
+      ])
+      // The record says the rest: the call, its MCP server and tool, the person and the session (and, as every record, its time).
+      expect([result['tool_name'], result['tool_use_id'], result['user.email'], result['session.id']]).toEqual(['mcp_tool', 'toolu_1', EMAIL, 's-1'])
+      expect(JSON.parse(result['tool_parameters'] as string)).toMatchObject({ mcp_server_name: 'remote-devices', mcp_tool_name: 'device_bash' })
+      // The prompt, the answer and the tool's output, each on the record that carries it.
+      expect(findings(rowOf(posts, 'user_prompt'))).toEqual([
+        { pack: 'pii.contact', rule: 'email', field: 'prompt.text', count: 1 },
+        { pack: 'pii.payment_card', rule: 'card_number', field: 'prompt.text', count: 1 },
+      ])
+      expect(findings(rowOf(posts, 'assistant_response'))).toEqual([{ pack: 'pii.contact', rule: 'phone_nanp', field: 'response.text', count: 1 }])
+      expect(findings(spanOf(posts, 'claude_code.tool').attrs)).toEqual([
+        { pack: 'pii.contact', rule: 'email', field: 'tool.result', count: 1 },
+        { pack: 'pii.us_gov_id', rule: 'ssn', field: 'tool.result', count: 1 },
+      ])
+      // A span repeats a row's values but for a tool's output: the rows report them, once.
+      expect(spanOf(posts, 'claude_code.interaction').attrs['mainwave.redaction.findings']).toBeUndefined()
+    })
+  }
+
+  test('with every content data point off, no content goes: only the findings', keyless, async ($, on) => {
+    const { posts } = await session($, on, { policy: packsOption(ALL) }, OFF)
+    for (const p of [...PERSONAL, 'git log', 'commit 1a2b3c', 'Done. Call', 'the refund']) expect([p, sent(posts).includes(p)]).toEqual([p, false])
+    expect(rowOf(posts, 'tool_result')['tool_input']).toBeUndefined()
+    expect(rowOf(posts, 'user_prompt')['prompt']).toBe('<REDACTED>')
+    expect(spanOf(posts, 'claude_code.tool').events).toEqual([])
+  })
+
+  test('no finding holds the matched text or any part of it: names and a count alone', keyless, async ($, on) => {
+    const { posts } = await session($, on, { policy: packsOption(ALL) })
+    const all = [...rowsOf(posts), ...spansOf(posts).map(s => s.attrs)].flatMap(findings)
+    expect(all.length).toBeGreaterThan(5)
+    for (const f of all) {
+      expect(Object.keys(f).sort()).toEqual(['count', 'field', 'pack', 'rule'])
+      for (const v of [f['pack'], f['rule'], f['field']]) expect(v).toMatch(/^[a-z0-9_]+(\.[a-z0-9_]+)*$/)
+    }
+    const stamps = JSON.stringify(all)
+    for (const part of ['ana', 'lee', 'bob', 'example', '415', '555', '2671', '078', '1120', '4111', '1111']) expect([part, stamps.includes(part)]).toEqual([part, false])
+  })
+
+  test('a notice only: the prompt, the call and its result reach the model and the tool as they were', keyless, async ($, on) => {
+    world(on, { policy: packsOption(ALL) }, OFF)
+    await $.session.start({ cwd: '/', surface: null, isInteractive: false } as never)
+    expect(await $.prompt.submit({ text: PROMPT } as never)).toEqual({ text: PROMPT })
+    expect(await $.tool.call({ tool: DEVICE_BASH, command: COMMAND, description: 'History', tool_use_id: 'toolu_1' } as never)).toEqual({ result: [{ type: 'text', text: OUTPUT }] })
+  })
+
+  test('with no choice of packs, secrets alone: no finding for personal data', keyless, async ($, on) => {
+    const { posts } = await session($, on)
+    expect(sent(posts)).not.toContain('mainwave.redaction.findings')
+  })
+
+  test('held: no finding, as nothing could be checked', keyless, async ($, on) => {
+    const { posts } = await session($, on, { policy: packsOption(['pii.contact', 'pii.passport']) })
+    expect(sent(posts)).not.toContain('mainwave.redaction.findings')
+  })
+})
