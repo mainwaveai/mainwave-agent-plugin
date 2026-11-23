@@ -103,14 +103,19 @@ describe('the matches: those RegExp finds', () => {
     ['[😀-😂]', '😀😁😂😃'],
     ['.', '😀\ud800x'],
     ['\\d+\\.\\d+', 'v1.22 and 3.4.5'],
+    // An optional start, then an assertion, where the scan skipped ahead past a position whose threads all died at an assertion.
+    ['a?\\bc', 'ax c'],
+    ['(?:acct)?\\b\\d{8}\\b', 'acctno 12345678'],
+    ['(?:US)?\\b\\d{3}', 'USA 123'],
+    ['\\d?\\B\\s', 'a aax1 1😀 1 '],
   ]
   for (const [p, text] of CASES) test(`${p} on ${JSON.stringify(text)}`, () => expect(ours(p, text)).toEqual(theirs(p, text)))
 
-  test('random patterns of the allowed syntax on random text: the same matches as RegExp, every time', () => {
+  test('random patterns of the allowed syntax on random text (4,000): the same matches as RegExp, every time', () => {
     let seed = 7
     const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff
     const pick = <T>(a: readonly T[]) => a[Math.floor(rnd() * a.length)]!
-    const ATOMS = ['a', 'b', 'x', '.', '\\d', '\\w', '\\s', '\\W', '[a-c]', '[^a]', '[\\d-]', '\\b', '\\B', '^', '$', '-', '\\.', '\\x41']
+    const ATOMS = ['a', 'b', 'x', '.', '\\d', '\\w', '\\s', '\\W', '[a-c]', '[^a]', '[\\d-]', '\\b', '\\B', '^', '$', '-', '\\.', '\\x41', 'a?', '\\d?\\b', 'x?\\B']
     const QUANTIFIERS = ['*', '+', '?', '{2}', '{1,3}', '{0,2}', '{2,}', '*?', '+?', '??', '{1,3}?']
     const gen = (d: number): string => {
       const r = rnd()
@@ -122,7 +127,7 @@ describe('the matches: those RegExp finds', () => {
     }
     const CHARS = ['a', 'b', 'x', 'A', '1', ' ', '-', '.', '\n', 'é', '😀', '_']
     let compared = 0
-    for (let n = 0; n < 3000; n++) {
+    for (let n = 0; n < 4000; n++) {
       const p = gen(0) + gen(0)
       if ('refused' in compilePattern(p)) continue
       for (let t = 0; t < 3; t++) {

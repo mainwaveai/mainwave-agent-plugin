@@ -19,7 +19,7 @@
 // `secrets` is the pack of secret rules (protect.ts), on whatever a setting says. The keys in `EXEMPT_KEYS` are never scanned by a
 // pack: the identity and routing keys Mainwave joins on.
 
-import { budgetFor, matchAt, type Rule } from './rules.ts'
+import { budgetFor, matchAt, type Budget, type Rule } from './rules.ts'
 
 /** Every pack, in the order they run. */
 export const PACK_NAMES = ['secrets', 'pii.contact', 'pii.us_gov_id', 'pii.payment_card'] as const
@@ -121,7 +121,7 @@ export function addHit(hits: Hits | undefined, pack: string, rule: string, n = 1
  * What runs beside the built-in packs: the custom rules (rules.ts), each as the pack `custom.<name>`, after them; the allow-list, its
  * entries lowercased (rules.ts, `allowListOf`); and the names of the secret rules (protect.ts), whose markers no custom rule reads.
  */
-export type Extra = { custom?: readonly Rule[]; allow?: ReadonlySet<string>; secretNames?: ReadonlySet<string> }
+export type Extra = { custom?: readonly Rule[]; allow?: ReadonlySet<string>; secretNames?: ReadonlySet<string>; budget?: Budget }
 
 /** The markers the built-in packs write, by name: `pii.contact.email` and the rest. */
 const PACK_MARKERS: ReadonlySet<string> = new Set(Object.entries(PII_PACKS).flatMap(([pack, rules]) => rules.map(r => `${pack}.${r.name}`)))
@@ -153,8 +153,8 @@ const allowed = (match: string, extra: Extra | undefined) => extra?.allow !== un
 
 /**
  * Plain text with every match of the packs' rules replaced, in pack order, then every match of the custom rules, in their order; and
- * how many were. A match the allow-list holds is left as it is. The custom rules share one budget for the text (rules.ts, `budgetFor`):
- * spending it throws, and the value is not sent.
+ * how many were. A match the allow-list holds is left as it is. The custom rules share one budget for the whole value (rules.ts,
+ * `budgetFor`, made in `scanPacks`): spending it throws, and the value is not sent.
  */
 function scanText(text: string, packs: readonly PackName[], hits?: Hits, extra?: Extra): { text: string; count: number } {
   let out = text
@@ -173,7 +173,7 @@ function scanText(text: string, packs: readonly PackName[], hits?: Hits, extra?:
   }
   const custom = extra?.custom ?? []
   if (custom.length === 0) return { text: out, count }
-  const budget = budgetFor(out.length)
+  const budget = extra!.budget ?? budgetFor(out.length)
   let blocked = blockedIn(out, extra!)
   for (const rule of custom) {
     const pack = `custom.${rule.name}`
@@ -230,6 +230,8 @@ function scanLoose(text: string, packs: readonly PackName[], hits?: Hits, extra?
  */
 export function scanPacks(text: string, packs: readonly PackName[], hits?: Hits, extra?: Extra): { text: string; count: number } {
   if (!packs.some(p => p !== 'secrets') && !(extra?.custom !== undefined && extra.custom.length > 0)) return { text, count: 0 }
+  // One budget for the whole value, however many runs or JSON values it is scanned as.
+  if (extra?.custom !== undefined && extra.custom.length > 0) extra = { ...extra, budget: extra.budget ?? budgetFor(text.length) }
   const tokens = tokenizeJson(text)
   if (tokens === undefined) return scanLoose(text, packs, hits, extra)
   let out = ''

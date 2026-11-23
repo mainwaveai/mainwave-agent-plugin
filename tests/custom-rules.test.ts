@@ -234,6 +234,20 @@ describe('custom rules in the packs', () => {
     expect(redact(`key ${TOKEN}`, [], undefined, { custom: [rule('gh', 'ghp_\\w+')] }).text).toBe('key [REDACTED:github_token]')
   })
 
+  test('a rule with an optional start before \\b finds its match past a word it began to read', () => {
+    expect(redact('acctno 12345678 and acct 87654321', [], undefined, { custom: [rule('acct', '(?:acct)?\\b\\d{8}\\b')] })).toEqual({
+      text: 'acctno [REDACTED:custom.acct] and acct [REDACTED:custom.acct]',
+      count: 2,
+    })
+  })
+
+  test('one budget for the whole value: a JSON value scanned token by token spends it as plain text does', () => {
+    const slow = Array.from({ length: 13 }, (_, k) => rule(`slow_${k}`, `(?:a?){${950 + k}}b`))
+    const at = Date.now()
+    expect(() => redact(JSON.stringify(Array(15000).fill('a')), [], undefined, { custom: slow })).toThrow()
+    expect(Date.now() - at).toBeLessThan(2000)
+  })
+
   test('run in a JSON value in place, value by value', () => {
     const json = JSON.stringify({ command: 'pay W123456', n: 7 })
     expect(redact(json, [], undefined, { custom: [rule('worker_id', WORKER.pattern)] })).toEqual({ text: '{"command":"pay [REDACTED:custom.worker_id]","n":7}', count: 1 })

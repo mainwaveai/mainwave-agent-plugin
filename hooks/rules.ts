@@ -609,6 +609,8 @@ export function matchAt(program: Program, text: string, from: number, budget: Bu
           if (!(blocked?.[pos]) && (c < 128 ? ascii[c] === 1 : inRanges(first, c))) break
           pos += c > 0xffff ? 2 : 1
         }
+        // A position of its own: what the last step marked, at the position it moved to, must not stand for this one.
+        gen++
       }
       // A match that begins here is preferred least.
       add(false, 0, pos, pos)

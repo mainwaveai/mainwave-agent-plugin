@@ -69,8 +69,11 @@ export const REFRESH_MS = 4 * 60_000
 export const RETRY_MS = 30_000
 /** How long one request may take. */
 export const FETCH_TIMEOUT_MS = 5_000
-/** An answer longer than this is not the settings: room for 50 custom rules and an allow-list of 200 entries at their longest. */
-const MAX_ANSWER = 256 * 1024
+/**
+ * An answer longer than this is not the settings: room for 50 custom rules and an allow-list of 200 entries at their longest, each
+ * character written as a `\uXXXX` escape.
+ */
+const MAX_ANSWER = 1024 * 1024
 
 /** The settings as Mainwave answers them: the parts the plugin keeps. `customRules` and `allowList` as they came, checked as they apply. */
 export type OrgSettings = {
