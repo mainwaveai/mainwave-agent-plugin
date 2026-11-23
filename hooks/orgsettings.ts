@@ -10,10 +10,11 @@
 // The answer goes to the gate: `data_points`, the data points the organization set itself, as the explicit settings that win over
 // everything else; `in_force`, every data point as Mainwave's settings page shows it (its catalog's defaults for those the organization
 // left alone), in place of the plugin's own defaults (`setOverrides`, gate.ts); and `redaction_packs` as the organization's packs, with
-// those of its managed settings and the person's added (`setOrgPacks`). An answer without `in_force` (an older Mainwave's) gives the
-// explicit settings alone, and the plugin's defaults stand for the rest. It is kept in the store under one key, `dataCollectionSettings`,
-// as it came and with the organization it is for, written whole in one write, so a store is never left holding one organization's data
-// points beside another's packs or name.
+// those of its managed settings and the person's added (`setOrgPacks`); `custom_rules` as the organization's custom rules
+// (`setOrgRules`), and `allow_list` as its allow-list (`setAllowList`). An answer without `in_force` (an older Mainwave's) gives the
+// explicit settings alone, and the plugin's defaults stand for the rest; one without `custom_rules` or `allow_list`, no rules and an
+// empty allow-list. It is kept in the store under one key, `dataCollectionSettings`, as it came and with the organization it is for,
+// written whole in one write, so a store is never left holding one organization's data points beside another's packs or name.
 //
 // What applies, in order:
 //   - this load's answer, for the session's organization;
@@ -33,9 +34,10 @@
 
 import type { EngineInterface, Timer } from 'claude-code'
 
-import { OVERRIDES_KEY, overridesOf, PACKS_KEY, packsOf, setOrgPacks, setOverrides, type Overrides, type PackChoice } from './gate.ts'
+import { OVERRIDES_KEY, overridesOf, PACKS_KEY, packsOf, RULES_KEY, setAllowList, setOrgPacks, setOrgRules, setOverrides, type Overrides, type PackChoice, type RuleChoice } from './gate.ts'
 import { fetchWithin, type FetchOutcome } from './http.ts'
 import { isOrgId } from './identity.ts'
+import { allowListOf, rulesOf } from './rules.ts'
 import { collectorIn, namesOption, type Layer } from './settings.ts'
 
 /** The plugin's read of its organization's settings, on Mainwave's API. */
@@ -54,8 +56,8 @@ export function settingsUrlOf(collector: string): string {
 }
 
 /**
- * Where the store keeps the last answer: `{ organizationId, revision, dataPoints, inForce, redactionPacks }`, the last three as they
- * came (`inForce` only where the answer had it).
+ * Where the store keeps the last answer: `{ organizationId, revision, dataPoints, inForce, redactionPacks, customRules, allowList }`, the
+ * last five as they came (`inForce`, `customRules` and `allowList` only where the answer had them).
  */
 export const SETTINGS_KEY = 'dataCollectionSettings'
 /** The longest wait a `Retry-After` may ask for. */
@@ -67,11 +69,18 @@ export const REFRESH_MS = 4 * 60_000
 export const RETRY_MS = 30_000
 /** How long one request may take. */
 export const FETCH_TIMEOUT_MS = 5_000
-/** An answer longer than this is not the settings. */
-const MAX_ANSWER = 64 * 1024
+/** An answer longer than this is not the settings: room for 50 custom rules and an allow-list of 200 entries at their longest. */
+const MAX_ANSWER = 256 * 1024
 
-/** The settings as Mainwave answers them: the parts the plugin keeps. */
-export type OrgSettings = { revision: number; dataPoints: Readonly<Record<string, unknown>>; inForce?: Readonly<Record<string, unknown>>; redactionPacks: readonly string[] }
+/** The settings as Mainwave answers them: the parts the plugin keeps. `customRules` and `allowList` as they came, checked as they apply. */
+export type OrgSettings = {
+  revision: number
+  dataPoints: Readonly<Record<string, unknown>>
+  inForce?: Readonly<Record<string, unknown>>
+  redactionPacks: readonly string[]
+  customRules?: unknown
+  allowList?: unknown
+}
 
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v)
 
@@ -79,8 +88,10 @@ const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typ
  * The settings in an answer's body, or null when it is not an answer of the right shape: `revision` a whole number, `data_points` an
  * object of `on` and `off` (any other value, or an ID this version does not know, is kept as it came and ignored by the gate), and
  * `redaction_packs` a list of names. `in_force`, an object of the same shape, is kept where it is one; where it is missing or of another
- * shape, the answer is kept without it, and its explicit settings still apply. The other fields (the defaults, the catalog's version)
- * are not kept.
+ * shape, the answer is kept without it, and its explicit settings still apply. `custom_rules` and `allow_list` are kept as they came,
+ * where the answer has them: a list of rules of another shape holds identifier and content values back as it applies, and an allow-list
+ * of another shape spares nothing (`rulesOf`, `allowListOf`). An older Mainwave's answer has neither: no rules, nothing spared. The
+ * other fields (the defaults, the catalog's version) are not kept.
  */
 export function settingsOf(text: string): OrgSettings | null {
   if (text.length > MAX_ANSWER) return null
@@ -96,7 +107,15 @@ export function settingsOf(text: string): OrgSettings | null {
   if (!isObject(dataPoints) || !Object.values(dataPoints).every(v => typeof v === 'string')) return null
   if (!Array.isArray(packs) || !packs.every(p => typeof p === 'string')) return null
   const keepInForce = isObject(inForce) && Object.values(inForce).every(v => typeof v === 'string')
-  return { revision, dataPoints, ...(keepInForce ? { inForce } : {}), redactionPacks: packs as string[] }
+  const { custom_rules: customRules, allow_list: allowList } = body
+  return {
+    revision,
+    dataPoints,
+    ...(keepInForce ? { inForce } : {}),
+    redactionPacks: packs as string[],
+    ...(customRules !== undefined ? { customRules } : {}),
+    ...(allowList !== undefined ? { allowList } : {}),
+  }
 }
 
 /** What one request came to, for the next try and the debug line: never the email. */
@@ -206,17 +225,21 @@ export function settingsPending(): Promise<void> | undefined {
  */
 export async function applyStoredSettings($: EngineInterface): Promise<void> {
   const read = (key: string) => $.store.get(key).then(v => ({ ok: true as const, v }), () => ({ ok: false as const }))
-  const [kept, points, packs] = await Promise.all([read(SETTINGS_KEY), read(OVERRIDES_KEY), read(PACKS_KEY)])
+  const [kept, points, packs, rules] = await Promise.all([read(SETTINGS_KEY), read(OVERRIDES_KEY), read(PACKS_KEY), read(RULES_KEY)])
   // Decided after the reads, against the organization as it is then: a row that named it while they ran counts.
   const answer = fetched !== undefined && fetched.org === org ? fetched : undefined
   let overrides: Overrides = {}
   let inForce: Overrides = {}
   let choice: PackChoice = undefined
+  let ruleChoice: RuleChoice = undefined
+  let allow: unknown = undefined
   appliedFor = answer !== undefined ? org : undefined
   if (answer !== undefined) {
     overrides = overridesOf(answer.dataPoints)
     inForce = overridesOf(answer.inForce)
     choice = packsOf(answer.redactionPacks)
+    ruleChoice = rulesOf(answer.customRules)
+    allow = answer.allowList
   } else if (!kept.ok) {
     choice = 'unreadable'
   } else if (kept.v !== undefined && kept.v !== null) {
@@ -228,14 +251,24 @@ export async function applyStoredSettings($: EngineInterface): Promise<void> {
       // Kept by an earlier version, or from an answer without it: the explicit settings alone.
       inForce = overridesOf(k['inForce'])
       choice = packsOf(k['redactionPacks'])
+      ruleChoice = rulesOf(k['customRules'])
+      allow = k['allowList']
     }
   } else {
-    // No answer kept: settings written by hand, for any session.
+    // No answer kept: settings written by hand, for any session. No allow-list: only Mainwave's answer gives one.
     overrides = points.ok ? overridesOf(points.v) : {}
     choice = packs.ok ? packsOf(packs.v) : 'unreadable'
+    ruleChoice = rules.ok ? rulesOf(rules.v) : 'unreadable'
   }
   setOverrides(overrides, inForce)
-  setOrgPacks('settings', choice)
+  applyRedaction(choice, ruleChoice, allow)
+}
+
+/** The organization's packs, custom rules and allow-list from its data collection settings, applied to the gate together. */
+function applyRedaction(packs: PackChoice, rules: RuleChoice, allow: unknown): void {
+  setAllowList(allowListOf(allow))
+  setOrgRules('settings', rules)
+  setOrgPacks('settings', packs)
 }
 
 /** Keeps an answer, whole, in one write. A write that fails leaves the store as it was; the answer still applies this load. */
@@ -247,6 +280,8 @@ async function keep($: EngineInterface, forOrg: string, s: OrgSettings): Promise
       dataPoints: s.dataPoints,
       ...(s.inForce !== undefined ? { inForce: s.inForce } : {}),
       redactionPacks: s.redactionPacks,
+      ...(s.customRules !== undefined ? { customRules: s.customRules } : {}),
+      ...(s.allowList !== undefined ? { allowList: s.allowList } : {}),
     })
   } catch {
     // The next answer is kept instead.
@@ -258,7 +293,9 @@ const same = (a: OrgSettings, b: OrgSettings) =>
   a.revision === b.revision &&
   JSON.stringify(a.dataPoints) === JSON.stringify(b.dataPoints) &&
   JSON.stringify(a.inForce) === JSON.stringify(b.inForce) &&
-  JSON.stringify(a.redactionPacks) === JSON.stringify(b.redactionPacks)
+  JSON.stringify(a.redactionPacks) === JSON.stringify(b.redactionPacks) &&
+  JSON.stringify(a.customRules) === JSON.stringify(b.customRules) &&
+  JSON.stringify(a.allowList) === JSON.stringify(b.allowList)
 
 /** Asks once for the session's organization and email, applies and keeps the answer, and answers how it went. Never throws. */
 export async function fetchNow($: EngineInterface, collector: string): Promise<Outcome | undefined> {
@@ -283,7 +320,7 @@ export async function fetchNow($: EngineInterface, collector: string): Promise<O
       fetched = { ...settings, org: forOrg }
       appliedFor = forOrg
       setOverrides(overridesOf(settings.dataPoints), overridesOf(settings.inForce))
-      setOrgPacks('settings', packsOf(settings.redactionPacks))
+      applyRedaction(packsOf(settings.redactionPacks), rulesOf(settings.customRules), settings.allowList)
       if (changed) await keep($, forOrg, settings)
     }
     last = outcome

@@ -12,8 +12,14 @@
 // One difference from the CLI hooks, on purpose: there an organization's packs run before the secrets pack unless it lists it, while
 // here the secret rules always run first, so a match inside a secret is replaced as the secret, whole.
 //
+// After them run the custom rules an organization or a person adds (rules.ts), each as the pack `custom.<name>`, its match replaced with
+// `[REDACTED:custom.<name>]`. A custom rule never matches inside a marker, so a rule such as `[A-Z]+` can't rewrite one. A match of any
+// pack but `secrets` that is an entry of the organization's allow-list, whole and without case, is left as it is.
+//
 // `secrets` is the pack of secret rules (protect.ts), on whatever a setting says. The keys in `EXEMPT_KEYS` are never scanned by a
 // pack: the identity and routing keys Mainwave joins on.
+
+import { budgetFor, matchAt, type Rule } from './rules.ts'
 
 /** Every pack, in the order they run. */
 export const PACK_NAMES = ['secrets', 'pii.contact', 'pii.us_gov_id', 'pii.payment_card'] as const
@@ -111,8 +117,46 @@ export function addHit(hits: Hits | undefined, pack: string, rule: string, n = 1
   else hits.set(key, { pack, rule, count: n })
 }
 
-/** Plain text with every match of the packs' rules replaced, in pack order, and how many were. */
-function scanText(text: string, packs: readonly PackName[], hits?: Hits): { text: string; count: number } {
+/**
+ * What runs beside the built-in packs: the custom rules (rules.ts), each as the pack `custom.<name>`, after them; the allow-list, its
+ * entries lowercased (rules.ts, `allowListOf`); and the names of the secret rules (protect.ts), whose markers no custom rule reads.
+ */
+export type Extra = { custom?: readonly Rule[]; allow?: ReadonlySet<string>; secretNames?: ReadonlySet<string> }
+
+/** The markers the built-in packs write, by name: `pii.contact.email` and the rest. */
+const PACK_MARKERS: ReadonlySet<string> = new Set(Object.entries(PII_PACKS).flatMap(([pack, rules]) => rules.map(r => `${pack}.${r.name}`)))
+
+/**
+ * A marker, by its shape: one the protections write (`[REDACTED:<name>]`, its name checked in `blockedIn`), the one Claude Code writes
+ * where it withholds text (`<REDACTED>`), and the one a value cut at the limit ends with (protect.ts, `cut`).
+ */
+const MARKER = /\[REDACTED:([a-z0-9_.]{1,64})\]|<REDACTED>|\[TRUNCATED - Content exceeds \d{1,12}(?:KB| character) limit\]/g
+
+/**
+ * The characters of `text` inside a marker, one byte each, or undefined where there is none: a custom rule matches none of them, so a
+ * rule such as `[A-Z]+` never reads `REDACTED`. A `[REDACTED:<name>]` counts only with the name of a marker the protections write, so
+ * text that only looks like one is still scanned.
+ */
+function blockedIn(text: string, extra: Extra): Uint8Array | undefined {
+  let blocked: Uint8Array | undefined
+  for (const m of text.matchAll(MARKER)) {
+    const name = m[1]
+    if (name !== undefined && !(PACK_MARKERS.has(name) || extra.secretNames?.has(name) || (name.startsWith('custom.') && extra.custom?.some(r => `custom.${r.name}` === name)))) continue
+    blocked ??= new Uint8Array(text.length)
+    blocked.fill(1, m.index, m.index + m[0].length)
+  }
+  return blocked
+}
+
+/** Whether a match is an entry of the allow-list: the whole match, without case. */
+const allowed = (match: string, extra: Extra | undefined) => extra?.allow !== undefined && extra.allow.size > 0 && extra.allow.has(match.toLowerCase())
+
+/**
+ * Plain text with every match of the packs' rules replaced, in pack order, then every match of the custom rules, in their order; and
+ * how many were. A match the allow-list holds is left as it is. The custom rules share one budget for the text (rules.ts, `budgetFor`):
+ * spending it throws, and the value is not sent.
+ */
+function scanText(text: string, packs: readonly PackName[], hits?: Hits, extra?: Extra): { text: string; count: number } {
   let out = text
   let count = 0
   if (out === '') return { text: out, count }
@@ -120,12 +164,37 @@ function scanText(text: string, packs: readonly PackName[], hits?: Hits): { text
     if (pack === 'secrets' || !packs.includes(pack)) continue
     for (const rule of PII_PACKS[pack]) {
       out = out.replace(rule.pattern, match => {
-        if (match === '' || (rule.luhn && !luhnValid(match))) return match
+        if (match === '' || (rule.luhn && !luhnValid(match)) || allowed(match, extra)) return match
         count += 1
         addHit(hits, pack, rule.name)
         return `[REDACTED:${pack}.${rule.name}]`
       })
     }
+  }
+  const custom = extra?.custom ?? []
+  if (custom.length === 0) return { text: out, count }
+  const budget = budgetFor(out.length)
+  let blocked = blockedIn(out, extra!)
+  for (const rule of custom) {
+    const pack = `custom.${rule.name}`
+    let next = ''
+    let last = 0
+    let pos = 0
+    for (;;) {
+      const m = matchAt(rule.program, out, pos, budget, blocked)
+      if (m === undefined) break
+      const [start, end] = m
+      // A rule never matches the empty string (rules.ts), so the scan always moves on.
+      pos = end
+      if (allowed(out.slice(start, end), extra)) continue
+      next += `${out.slice(last, start)}[REDACTED:${pack}]`
+      last = end
+      count += 1
+      addHit(hits, pack, rule.name)
+    }
+    if (last === 0) continue
+    out = next + out.slice(last)
+    blocked = blockedIn(out, extra!)
   }
   return { text: out, count }
 }
@@ -137,38 +206,39 @@ const JSON_ESCAPE = /\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4})/g
  * Text that is not JSON: scanned whole, as the CLI hooks scan it, then each run between JSON escapes on its own, for text that was
  * JSON before it was cut or changed. The second pass only finds more: a marker the first wrote is never matched again.
  */
-function scanLoose(text: string, packs: readonly PackName[], hits?: Hits): { text: string; count: number } {
-  const whole = scanText(text, packs, hits)
+function scanLoose(text: string, packs: readonly PackName[], hits?: Hits, extra?: Extra): { text: string; count: number } {
+  const whole = scanText(text, packs, hits, extra)
   if (!whole.text.includes('\\')) return whole
   let count = whole.count
   let out = ''
   let last = 0
   for (const m of whole.text.matchAll(JSON_ESCAPE)) {
-    const run = scanText(whole.text.slice(last, m.index), packs, hits)
+    const run = scanText(whole.text.slice(last, m.index), packs, hits, extra)
     count += run.count
     out += run.text + m[0]
     last = m.index + m[0].length
   }
-  const tail = scanText(whole.text.slice(last), packs, hits)
+  const tail = scanText(whole.text.slice(last), packs, hits, extra)
   return { text: out + tail.text, count: count + tail.count }
 }
 
 /**
- * A value with every match of the personal-data packs among `packs` replaced, and how many were: in place where the value is JSON,
- * else as text (`scanLoose`). `secrets` is not run here (protect.ts runs it first). Each match replaced is counted in `hits` too, by
- * pack and rule, where given.
+ * A value with every match of the personal-data packs among `packs` replaced, then every match of the custom rules (`extra`), and how
+ * many were: in place where the value is JSON, else as text (`scanLoose`). `secrets` is not run here (protect.ts runs it first). Each
+ * match replaced is counted in `hits` too, by pack and rule, where given: a custom rule's under the pack `custom.<name>` and the rule
+ * `<name>`.
  */
-export function scanPacks(text: string, packs: readonly PackName[], hits?: Hits): { text: string; count: number } {
-  if (!packs.some(p => p !== 'secrets')) return { text, count: 0 }
+export function scanPacks(text: string, packs: readonly PackName[], hits?: Hits, extra?: Extra): { text: string; count: number } {
+  if (!packs.some(p => p !== 'secrets') && !(extra?.custom !== undefined && extra.custom.length > 0)) return { text, count: 0 }
   const tokens = tokenizeJson(text)
-  if (tokens === undefined) return scanLoose(text, packs, hits)
+  if (tokens === undefined) return scanLoose(text, packs, hits, extra)
   let out = ''
   let last = 0
   let count = 0
   for (const token of tokens) {
     const raw = text.slice(token.start, token.end)
     const value = token.kind === 'string' ? decodeJsonString(raw) : raw
-    const r = scanText(value, packs, hits)
+    const r = scanText(value, packs, hits, extra)
     if (r.text === value) continue
     count += r.count
     out += text.slice(last, token.start) + encodeJsonString(r.text)
