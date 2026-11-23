@@ -5,7 +5,9 @@
 #
 # The version: each pull request carries the next version from main's (scripts/next-version.sh). The `set version` job writes it and
 # pushes one `chore(release): <version>` commit to the pull request's branch, which the squash merge folds into its commit on main.
-# The rest of that run skips, as its commit is no longer the head; the `version` job then checks the version on the new head.
+# The rest of that run skips, as its commit is no longer the head. GitHub holds the pull_request run that push starts for approval
+# (a push with a workflow's token starts no run by itself), so the job approves it: CI, the `version` check among it, then runs on
+# the new head as a pull_request run, which is what counts for the required checks (a workflow_dispatch run's checks don't).
 #
 # Not here: the TypeScript type check. It needs the declarations Claude Code writes beside a plugin it loads from disk
 # (.claude-plugin/types/), which only a session writes, so it runs locally (README, Developing).
