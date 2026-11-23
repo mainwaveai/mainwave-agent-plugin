@@ -1,7 +1,7 @@
 {
   "name": "mainwave",
   "displayName": "Mainwave",
-  "version": "2026.11.1",
+  "version": "0.1.0",
   "description": "Reports your Claude Code and Cowork sessions to Mainwave. It adds the plugin's name, version, entry point and route to the telemetry rows Claude Code already sends to your organization's collector, and reads the organization, account, email and device ID those rows carry. It asks Mainwave for the organization's data collection settings, sending the organization ID and email alone, and applies them to what it sends. It also sends its own copy of those rows to Mainwave's production collector, with Claude Code's spans and metrics rebuilt beside them, without a key: routed by the Claude organization and email on each record. Where a built-in plugin keeps Claude Code's rows from it, it builds those rows from Claude Code's own events instead: each prompt, model request, response and tool call. Where Mainwave's CLI hooks are not there to send them, it sends the markers they send: each commit, pull request and ticket an agent makes, the Claude plan and its limits, and the kind of API error a turn ended on.",
   "author": {
     "name": "Mainwave"

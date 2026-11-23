@@ -38,6 +38,8 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: write
+      # To approve the run its push starts (below).
+      actions: write
     outputs:
       pushed: ${{ steps.set.outputs.pushed }}
     steps:
@@ -65,7 +67,31 @@ jobs:
           # Not forced: where the branch moved since this run began, the push fails, and the run for its new tip sets the version.
           git push origin "HEAD:refs/heads/$BRANCH"
           echo "pushed=true" >>"$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >>"$GITHUB_OUTPUT"
           echo "::notice::set the version to $version"
+      - name: Start CI on the version commit
+        # A push with this job's token starts the pull request's run for the new commit in an approval-required state. Approving
+        # it starts CI there, which reports the required checks; the run's own `set version` finds the version set and pushes nothing.
+        if: steps.set.outputs.pushed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.set.outputs.sha }}
+        run: |
+          runs=
+          for _ in $(seq 1 24); do
+            runs=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SHA&event=pull_request" \
+              --jq '.workflow_runs[] | select(.conclusion == "action_required") | .id')
+            [ -n "$runs" ] && break
+            sleep 5
+          done
+          if [ -z "$runs" ]; then
+            echo "::warning::no run waits for approval on $SHA: if none started, push again or approve it in the pull request"
+            exit 0
+          fi
+          for run in $runs; do
+            gh api -X POST "repos/$GITHUB_REPOSITORY/actions/runs/$run/approve" ||
+              echo "::warning::could not approve run $run: a maintainer approves it in the pull request's merge box"
+          done
 
   version:
     name: version
