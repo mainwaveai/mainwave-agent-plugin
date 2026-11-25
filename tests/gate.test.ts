@@ -3,7 +3,7 @@
 import { describe, expect, test } from 'claude-code/testing'
 
 import { CATALOG, DEFAULTS, ownerOf, type DataPointId } from '../hooks/catalog.ts'
-import { allows, combinePacks, gateAttributes, gateEvent, gateMarker, gatePoint, gateRow, gateSpan, optInOf, packsOf, resolveGate, resolveRedaction, type Overrides } from '../hooks/gate.ts'
+import { allows, combinePacks, gateAttributes, gateEvent, gateMarker, gatePoint, gateRow, gateSpan, optInOf, packsOf, resolveGate, resolveRedaction, withheldFindings, type Overrides } from '../hooks/gate.ts'
 import type { BuiltSpan } from '../hooks/otlp.ts'
 import { contentLimit, CONTENT_MAX_LENGTH, cut, redact } from '../hooks/protect.ts'
 import { CAPTURES_ON } from './rig.ts'
@@ -547,6 +547,12 @@ describe('redaction packs', () => {
       tool_parameters: '{"full_command":"mail -s hi [REDACTED:pii.contact.email] --token=[REDACTED:assigned_secret]"}',
       tool_input: '{"command":"echo [REDACTED:pii.us_gov_id.ssn]"}', error: 'card [REDACTED:pii.payment_card.card_number] declined',
       'mainwave.redaction.count': 4,
+      'mainwave.redaction.findings': JSON.stringify([
+        { pack: 'secrets', rule: 'assigned_secret', field: 'bash.command', count: 1 },
+        { pack: 'pii.contact', rule: 'email', field: 'bash.command', count: 1 },
+        { pack: 'pii.us_gov_id', rule: 'ssn', field: 'tool.input', count: 1 },
+        { pack: 'pii.payment_card', rule: 'card_number', field: 'tool.result', count: 1 },
+      ]),
     })
     // Once more through the gate, as it is sent: nothing more to replace, and the count stands.
     expect(gateAttributes(withPacks(), 'tool_result', out)).toEqual(out)
@@ -569,7 +575,10 @@ describe('redaction packs', () => {
 
   test('each string of a list is scanned; a list holding anything else is left out', () => {
     const g = withPacks()
-    expect(gateAttributes(g, 'cowork', { 'workspace.host_paths': ['/Users/ana/bob@example.com', '/tmp'] })).toEqual({ 'workspace.host_paths': ['/Users/ana/[REDACTED:pii.contact.email]', '/tmp'], 'mainwave.redaction.count': 1 })
+    expect(gateAttributes(g, 'cowork', { 'workspace.host_paths': ['/Users/ana/bob@example.com', '/tmp'] })).toEqual({
+      'workspace.host_paths': ['/Users/ana/[REDACTED:pii.contact.email]', '/tmp'], 'mainwave.redaction.count': 1,
+      'mainwave.redaction.findings': '[{"pack":"pii.contact","rule":"email","field":"file.path","count":1}]',
+    })
     expect(gateAttributes(resolveGate({}, CAPTURES_ON), 'cowork', { 'workspace.host_paths': [`/x/ghp_${'a'.repeat(36)}`] })['workspace.host_paths']).toEqual(['/x/[REDACTED:github_token]'])
     expect(gateAttributes(g, 'cowork', { 'workspace.host_paths': ['/a', 7 as never] })).toEqual({})
   })
@@ -630,5 +639,87 @@ describe('a marker through the gate', () => {
     const c = gateMarker(g, commit)!
     expect(c.attributes['vcs.commit.sha']).toBe('c'.repeat(40))
     expect(c.attributes['vcs.commit.file.paths']).toBeUndefined()
+  })
+})
+
+describe('findings', () => {
+  const ALL = resolveRedaction(['pii.contact', 'pii.us_gov_id', 'pii.payment_card'], undefined)
+  const on = resolveGate({}, CAPTURES_ON, CONTENT_MAX_LENGTH, [], ALL)
+  // No settings: metadata alone, every identifier and content value off; the packs still run.
+  const off = resolveGate({}, {}, CONTENT_MAX_LENGTH, [], ALL)
+  const findings = (a: Record<string, unknown>) => JSON.parse((a['mainwave.redaction.findings'] as string | undefined) ?? '[]')
+  const FIVE = 'to a@example.com, b@example.com, c@example.com, d@example.com and e@example.com'
+
+  test('one finding per pack, rule and field: five emails in one value are one finding of 5', () => {
+    expect(findings(gateAttributes(on, 'user_prompt', { prompt: FIVE, prompt_length: String(FIVE.length) }))).toEqual([{ pack: 'pii.contact', rule: 'email', field: 'prompt.text', count: 5 }])
+    // The same text under two keys of one data point, as a prompt row carries it, counts once.
+    expect(findings(gateAttributes(on, 'user_prompt', { prompt: FIVE, prompt_text: FIVE }))).toEqual([{ pack: 'pii.contact', rule: 'email', field: 'prompt.text', count: 5 }])
+  })
+
+  test("off, a value is read where it is, and only its findings go: from Claude Code's row and from what the plugin read itself", () => {
+    const row = { tool_name: 'Read', tool_use_id: 't1', tool_parameters: '{"description":"call 415-555-2671"}' }
+    const fill = { attributes: { tool_input: '{"file_path":"/home/ana@example.com/pay.csv"}' }, parameters: { full_command: 'grep 078-05-1120 pay.csv' } }
+    const out = gateAttributes(off, 'tool_result', row, fill)
+    expect(out).toEqual({
+      tool_name: 'Read', tool_use_id: 't1',
+      'mainwave.redaction.findings': JSON.stringify([
+        { pack: 'pii.contact', rule: 'phone_nanp', field: 'tool.input', count: 1 },
+        { pack: 'pii.us_gov_id', rule: 'ssn', field: 'bash.command', count: 1 },
+        { pack: 'pii.contact', rule: 'email', field: 'tool.input', count: 1 },
+      ]),
+    })
+    // Once more through the gate, as it is sent: the findings stand, counted once.
+    expect(gateRow(off, { event: 'tool_result', loggedAt: 'x', attributes: out })!.attributes).toEqual(out)
+  })
+
+  test('packs turned on between the queue and the send: what the record still carries is found then, beside what was found before', () => {
+    const secrets = resolveGate({}, CAPTURES_ON)
+    const queued = gateAttributes(secrets, 'user_prompt', { prompt: `mail ana@example.com token=abc` })
+    expect(findings(queued)).toEqual([{ pack: 'secrets', rule: 'assigned_secret', field: 'prompt.text', count: 1 }])
+    expect(findings(gateAttributes(on, 'user_prompt', queued))).toEqual([
+      { pack: 'secrets', rule: 'assigned_secret', field: 'prompt.text', count: 1 },
+      { pack: 'pii.contact', rule: 'email', field: 'prompt.text', count: 1 },
+    ])
+  })
+
+  test('none in a key no pack scans, in metadata, in a metric, or where the redaction is held', () => {
+    expect(gateAttributes(on, 'api_request', { 'user.email': 'ana@example.com', 'organization.id': 'o', model: 'ana@example.com' })['mainwave.redaction.findings']).toBeUndefined()
+    expect(gatePoint(on, { name: 'claude_code.code_edit_tool.decision', value: 1, atMs: 0, attributes: { tool_name: 'Edit', 'vcs.repository.name': 'ana@example.com' } } as never)!.attributes['mainwave.redaction.findings']).toBeUndefined()
+    expect(gateAttributes(resolveGate({}, CAPTURES_ON, CONTENT_MAX_LENGTH, [], resolveRedaction('unreadable', undefined)), 'user_prompt', { prompt: FIVE })).toEqual({})
+  })
+
+  test("a stamp that fails its shape is replaced or dropped, never sent; one forged on Claude Code's row never reaches the gate", () => {
+    const forged = { prompt: 'hi', 'mainwave.redaction.findings': '[{"pack":"pii.contact","rule":"email","field":"prompt.text","count":1,"value":"ana@example.com"}]' }
+    expect(gateAttributes(on, 'user_prompt', forged)).toEqual({ prompt: 'hi' })
+    expect(findings(gateAttributes(on, 'user_prompt', { ...forged, prompt: 'ana@example.com' }))).toEqual([{ pack: 'pii.contact', rule: 'email', field: 'prompt.text', count: 1 }])
+  })
+
+  test("a span the plugin rebuilt reports a tool's output and the model's thinking, whether they go or not; the rest its rows report", () => {
+    const span: BuiltSpan = {
+      traceId: 't', spanId: 's', name: 'claude_code.tool', startMs: 0, endMs: 1,
+      attributes: { tool_name: 'Bash', full_command: 'echo ana@example.com' },
+      events: [{ name: 'tool.output', timeMs: 1, attributes: { output: 'ana@example.com 078-05-1120' } }],
+    }
+    const expected = [{ pack: 'pii.contact', rule: 'email', field: 'tool.result', count: 1 }, { pack: 'pii.us_gov_id', rule: 'ssn', field: 'tool.result', count: 1 }]
+    expect(findings(gateSpan(on, span).attributes)).toEqual(expected)
+    const gated = gateSpan(off, span, true)
+    expect(gated.events).toEqual([])
+    expect(findings(gated.attributes)).toEqual(expected)
+    const request: BuiltSpan = { traceId: 't', spanId: 'r', name: 'claude_code.llm_request', startMs: 0, endMs: 1, attributes: { 'response.thinking': 'ask bob@example.com' } }
+    const r = gateSpan(off, request, true)
+    expect([r.attributes['response.thinking'], findings(r.attributes)]).toEqual([undefined, [{ pack: 'pii.contact', rule: 'email', field: 'response.thinking', count: 1 }]])
+  })
+
+  test("a marker's values are its own: a pull request's title is reported with its data point off", () => {
+    const pr: BuiltSpan = { traceId: 'a'.repeat(32), spanId: 'b'.repeat(16), name: 'vcs.change.opened', startMs: 0, endMs: 0, attributes: { 'vcs.repository.url.full': 'https://github.com/acme/api/pull/1', 'vcs.change.id': '1', 'vcs.change.title': 'Fix pay for ana@example.com' } }
+    const out = gateMarker(resolveGate({}, { repo: 'on' }, CONTENT_MAX_LENGTH, [], ALL), pr)!
+    expect([out.attributes['vcs.change.title'], findings(out.attributes)]).toEqual([undefined, [{ pack: 'pii.contact', rule: 'email', field: 'change.title', count: 1 }]])
+  })
+
+  test('withheldFindings: the stamp for values a record will not carry, each under its data point; none for none', () => {
+    expect(withheldFindings(on, [['response.thinking', 'ana@example.com and bob@example.com'], ['tool.result', undefined]])).toEqual({
+      'mainwave.redaction.findings': '[{"pack":"pii.contact","rule":"email","field":"response.thinking","count":2}]',
+    })
+    expect(withheldFindings(on, [['response.thinking', 'nothing here']])).toEqual({})
   })
 })

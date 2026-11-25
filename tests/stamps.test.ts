@@ -2,7 +2,7 @@
 
 import { describe, expect, test } from 'claude-code/testing'
 
-import { applyStamps, commandStamps, entrypointOf, filterStamps, stripOwned } from '../hooks/stamps.ts'
+import { applyStamps, commandStamps, entrypointOf, FINDINGS_RULE, filterStamps, MAX_FINDINGS, stripOwned } from '../hooks/stamps.ts'
 
 describe('stripOwned', () => {
   test('removes every key under an owned prefix and keeps the rest in order', () => {
@@ -125,5 +125,31 @@ describe('entrypointOf', () => {
     expect(entrypointOf('CLI')).toBe('other')
     expect(entrypointOf(undefined)).toBe('other')
     expect(entrypointOf(3)).toBe('other')
+  })
+})
+
+describe('the findings stamp', () => {
+  const f = (o: Record<string, unknown> = {}) => ({ pack: 'pii.contact', rule: 'email', field: 'tool.input', count: 1, ...o })
+  const ok = (v: unknown) => FINDINGS_RULE(JSON.stringify(v))
+
+  test('a list of findings: pack, rule, a data point and a count, each pack, rule and field once', () => {
+    expect(ok([f(), f({ field: 'prompt.text', count: 5 }), f({ pack: 'secrets', rule: 'github_token' })])).toBe(true)
+    expect(ok([f({ pack: 'pii.payment_card', rule: 'card_number_grouped_19' })])).toBe(true)
+    // Any pack's name of the shape, so a pack added later counts toward findings with no change here.
+    expect(ok([f({ pack: 'custom.payroll-id', rule: 'employee_id' })])).toBe(true)
+  })
+
+  test('anything else is dropped: another key, a value, an unknown field, a count out of range, a repeat, too many, not JSON', () => {
+    expect(ok([{ ...f(), value: 'ana@example.com' }])).toBe(false)
+    expect(ok([f({ rule: 'ana@example.com' })])).toBe(false)
+    expect(ok([f({ pack: 'Pii Contact' })])).toBe(false)
+    expect(ok([f({ field: 'tool_input' })])).toBe(false)
+    expect(ok([f({ count: 0 })])).toBe(false)
+    expect(ok([f({ count: 1.5 })])).toBe(false)
+    expect(ok([f(), f({ count: 2 })])).toBe(false)
+    expect(ok([])).toBe(false)
+    expect(ok(Array.from({ length: MAX_FINDINGS + 1 }, (_, i) => f({ rule: `r${i}` })))).toBe(false)
+    expect(FINDINGS_RULE('not json')).toBe(false)
+    expect(FINDINGS_RULE(3)).toBe(false)
   })
 })

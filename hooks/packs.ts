@@ -94,8 +94,25 @@ export function luhnValid(text: string): boolean {
   return sum % 10 === 0
 }
 
+/**
+ * What a scan replaced, by pack and rule: each entry its pack, its rule and how many of its matches were replaced. Keyed by `hitKey`.
+ * Any pack's rules count here, under the pack's name, so a finding (gate.ts) names whichever pack replaced the match.
+ */
+export type Hits = Map<string, { pack: string; rule: string; count: number }>
+
+const hitKey = (pack: string, rule: string) => `${pack}\n${rule}`
+
+/** `n` matches of a pack's rule replaced (one by default): counted in `hits`, where there are hits to keep. */
+export function addHit(hits: Hits | undefined, pack: string, rule: string, n = 1): void {
+  if (hits === undefined) return
+  const key = hitKey(pack, rule)
+  const hit = hits.get(key)
+  if (hit) hit.count += n
+  else hits.set(key, { pack, rule, count: n })
+}
+
 /** Plain text with every match of the packs' rules replaced, in pack order, and how many were. */
-function scanText(text: string, packs: readonly PackName[]): { text: string; count: number } {
+function scanText(text: string, packs: readonly PackName[], hits?: Hits): { text: string; count: number } {
   let out = text
   let count = 0
   if (out === '') return { text: out, count }
@@ -105,6 +122,7 @@ function scanText(text: string, packs: readonly PackName[]): { text: string; cou
       out = out.replace(rule.pattern, match => {
         if (match === '' || (rule.luhn && !luhnValid(match))) return match
         count += 1
+        addHit(hits, pack, rule.name)
         return `[REDACTED:${pack}.${rule.name}]`
       })
     }
@@ -119,37 +137,38 @@ const JSON_ESCAPE = /\\(?:["\\/bfnrt]|u[0-9A-Fa-f]{4})/g
  * Text that is not JSON: scanned whole, as the CLI hooks scan it, then each run between JSON escapes on its own, for text that was
  * JSON before it was cut or changed. The second pass only finds more: a marker the first wrote is never matched again.
  */
-function scanLoose(text: string, packs: readonly PackName[]): { text: string; count: number } {
-  const whole = scanText(text, packs)
+function scanLoose(text: string, packs: readonly PackName[], hits?: Hits): { text: string; count: number } {
+  const whole = scanText(text, packs, hits)
   if (!whole.text.includes('\\')) return whole
   let count = whole.count
   let out = ''
   let last = 0
   for (const m of whole.text.matchAll(JSON_ESCAPE)) {
-    const run = scanText(whole.text.slice(last, m.index), packs)
+    const run = scanText(whole.text.slice(last, m.index), packs, hits)
     count += run.count
     out += run.text + m[0]
     last = m.index + m[0].length
   }
-  const tail = scanText(whole.text.slice(last), packs)
+  const tail = scanText(whole.text.slice(last), packs, hits)
   return { text: out + tail.text, count: count + tail.count }
 }
 
 /**
  * A value with every match of the personal-data packs among `packs` replaced, and how many were: in place where the value is JSON,
- * else as text (`scanLoose`). `secrets` is not run here (protect.ts runs it first).
+ * else as text (`scanLoose`). `secrets` is not run here (protect.ts runs it first). Each match replaced is counted in `hits` too, by
+ * pack and rule, where given.
  */
-export function scanPacks(text: string, packs: readonly PackName[]): { text: string; count: number } {
+export function scanPacks(text: string, packs: readonly PackName[], hits?: Hits): { text: string; count: number } {
   if (!packs.some(p => p !== 'secrets')) return { text, count: 0 }
   const tokens = tokenizeJson(text)
-  if (tokens === undefined) return scanLoose(text, packs)
+  if (tokens === undefined) return scanLoose(text, packs, hits)
   let out = ''
   let last = 0
   let count = 0
   for (const token of tokens) {
     const raw = text.slice(token.start, token.end)
     const value = token.kind === 'string' ? decodeJsonString(raw) : raw
-    const r = scanText(value, packs)
+    const r = scanText(value, packs, hits)
     if (r.text === value) continue
     count += r.count
     out += text.slice(last, token.start) + encodeJsonString(r.text)

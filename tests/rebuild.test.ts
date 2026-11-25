@@ -999,3 +999,52 @@ describe('with the beta on, a turn whose prompt row names no span (an SDK host\'
     expect(held.rowCtx).toBeUndefined()
   })
 })
+
+describe('findings in what the spans leave on the machine', () => {
+  const PACKS = { packs: ['secrets', 'pii.contact', 'pii.us_gov_id'] as const }
+  const packed = (overrides: Overrides) => {
+    const g = { ...resolveGate({}, overrides), redaction: { packs: [...PACKS.packs] } }
+    return () => g
+  }
+  const findings = (s: BuiltSpan | undefined) => JSON.parse((s?.attributes['mainwave.redaction.findings'] as string | undefined) ?? '[]')
+
+  test("a tool's output the gate keeps off its span: the span carries what the packs found in it, and none of it", () => {
+    const r = rebuild({ gate: packed({ ...CAPTURES_ON, 'tool.result': 'off' }) })
+    observeRow(r, row('user_prompt', 0, {}, INTERACTION))
+    turnStart(r, { turnId: 't', text: '' }, 0)
+    toolStart(r, { tool: 'Bash', tool_use_id: 'toolu_p', command: 'cat staff.csv' }, 10)
+    observeRow(r, row('tool_decision', 11, { decision: 'accept', source: 'config', tool_name: 'Bash', tool_use_id: 'toolu_p' }, BLOCKED))
+    const ended = toolEnd(r, 'toolu_p', { result: { stdout: 'ana@example.com,078-05-1120\nbob@example.com,219-09-9999' } }, 20)
+    const after = observeRow(r, row('tool_result', 21, { tool_name: 'Bash', tool_use_id: 'toolu_p', success: 'true' }, INTERACTION))
+    const [tool] = named([...ended.spans, ...after.spans], 'tool')
+    expect(tool!.events).toBeUndefined()
+    expect(findings(tool)).toEqual([{ pack: 'pii.contact', rule: 'email', field: 'tool.result', count: 2 }, { pack: 'pii.us_gov_id', rule: 'ssn', field: 'tool.result', count: 2 }])
+    expect(JSON.stringify(tool)).not.toMatch(/ana|bob|078|219/)
+  })
+
+  test("with the output on, it rides on the span's event, and the gate reads its findings there: the rebuild adds none", () => {
+    const r = rebuild({ gate: packed(CAPTURES_ON) })
+    observeRow(r, row('user_prompt', 0, {}, INTERACTION))
+    turnStart(r, { turnId: 't', text: '' }, 0)
+    toolStart(r, { tool: 'Bash', tool_use_id: 'toolu_q', command: 'cat staff.csv' }, 10)
+    observeRow(r, row('tool_decision', 11, { decision: 'accept', source: 'config', tool_name: 'Bash', tool_use_id: 'toolu_q' }, BLOCKED))
+    const ended = toolEnd(r, 'toolu_q', { result: { stdout: 'ana@example.com' } }, 20)
+    const after = observeRow(r, row('tool_result', 21, { tool_name: 'Bash', tool_use_id: 'toolu_q', success: 'true' }, INTERACTION))
+    const [tool] = named([...ended.spans, ...after.spans], 'tool')
+    expect(tool!.events).toEqual([expect.objectContaining({ name: 'tool.output', attributes: { bash_command: 'cat staff.csv', output: 'ana@example.com' } })])
+    expect(tool!.attributes['mainwave.redaction.findings']).toBeUndefined()
+  })
+
+  test("the model's thinking, off by default: its request's span carries what the packs found in it, and none of it", () => {
+    for (const [overrides, carried] of [[CAPTURES_ON, false], [{ ...CAPTURES_ON, 'response.thinking': 'on' }, true]] as const) {
+      const r = rebuild({ gate: packed(overrides) })
+      turnStart(r, { turnId: 't1', text: 'hi' }, 0)
+      observeRow(r, row('user_prompt', 100, { prompt: 'hi', prompt_length: '2' }, INTERACTION))
+      stepStart(r, undefined, 'claude-haiku-5-5')
+      const out = all(stepEnd(r, undefined, 110, { stopReason: 'end_turn', usage: usage(1201) }, 140, 'Write to ana@example.com.'), observeRow(r, request(141, 1201)))
+      const [req] = named(out.spans, 'llm_request')
+      expect(req!.attributes['response.thinking']).toBe(carried ? 'Write to ana@example.com.' : undefined)
+      expect(findings(req)).toEqual(carried ? [] : [{ pack: 'pii.contact', rule: 'email', field: 'response.thinking', count: 1 }])
+    }
+  })
+})
