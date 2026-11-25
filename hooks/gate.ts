@@ -19,9 +19,11 @@
 // Whatever the gate says, every identifier and content value goes through the always-on protections (protect.ts) before it is queued,
 // with the redaction packs in force (packs.ts): those the organization chose (`setOrgPacks`: its managed settings and its data
 // collection settings from Mainwave, orgsettings.ts), else the default, `DEFAULT_PACKS`; and those the person adds from their own user
-// settings (`setPersonPacks`). The person's add to the organization's, never take from them. A choice that can't be read, or that names
-// a pack the plugin does not have, holds every identifier and content value back (the record still goes): redaction that was asked for
-// never silently turns off.
+// settings (`setPersonPacks`). The person's add to the organization's, never take from them. Custom rules (rules.ts) come the same
+// ways (`setOrgRules`, `setPersonRules`) and run after the packs, each as the pack `custom.<name>`; the organization's allow-list
+// (`setAllowList`) spares a match of any pack but `secrets`. A choice that can't be read, that names a pack the plugin does not have,
+// or that gives a rule the plugin can't use, holds every identifier and content value back (the record still goes): redaction that
+// was asked for never silently turns off. So does a value the custom rules can't scan within their budget: that value alone.
 //
 // What the protections replace is reported on each record, as findings (`FINDINGS_STAMP`): by pack, rule and the data point the value
 // belongs to, with how many matches, never the value. They are read from the record as it would go with every data point on, so a value
@@ -33,16 +35,18 @@ import { CATALOG, DATA_POINTS, DEFAULTS, METRIC_OWNERS, OUTPUT_OWNERS, OWN_ROWS,
 import type { BuiltSpan, CopiedRow, MetricPoint } from './otlp.ts'
 import { addHit, DEFAULT_PACKS, EXEMPT_KEYS, PACK_NAMES, type Hits, type PackName } from './packs.ts'
 import { CONTENT_MAX_LENGTH, cut, redact } from './protect.ts'
+import { compileRule, type Rule, type RuleSpec } from './rules.ts'
 import { MARKER_KEYS } from './markers.ts'
 import { COMMAND_PREFIX, COMMAND_REF_KEYS, COUNT_RULES, filterStamps, FINDINGS_STAMP, MAX_FINDINGS, OPT_IN_STAMP, readFindings, REDACTION_COUNT, type Finding } from './stamps.ts'
 
 export type Setting = 'on' | 'off' | 'claude'
 /**
- * The redaction in force: the packs that run, `secrets` always among them, in the order they run; or `held`, when a choice of packs
- * can't be read or names a pack the plugin does not have, and no identifier or content value is sent. `held` says which, never the
- * value.
+ * The redaction in force: the packs that run, `secrets` always among them, in the order they run; the custom rules that run after them
+ * (rules.ts), where there are any; the allow-list, lowercased, where it has entries. Or `held`, when a choice of packs or rules can't
+ * be read, names a pack the plugin does not have, or gives a rule it can't use, and no identifier or content value is sent. `held` says
+ * which, never the value: a custom rule it can't use counts as a pack it does not have.
  */
-export type Redaction = { packs: readonly PackName[] } | { held: 'unreadable' | 'unknown pack' }
+export type Redaction = { packs: readonly PackName[]; custom?: readonly Rule[]; allow?: ReadonlySet<string> } | { held: 'unreadable' | 'unknown pack' }
 /** `optedIn`: the data points that are `on` because the person opted in, in catalog order. */
 export type Gate = { settings: ReadonlyMap<DataPointId, Setting | 'required'>; limit: number; optedIn: readonly DataPointId[]; redaction: Redaction }
 export type Overrides = Partial<Record<DataPointId, Setting>>
@@ -145,15 +149,46 @@ export function combinePacks(choices: Iterable<PackChoice>): PackChoice {
 }
 
 /**
- * The redaction in force from the organization's choice and the person's: the organization's packs, or `DEFAULT_PACKS` where it chose
- * none, with the person's added, and `secrets` always; in the order the packs run. `held` when either can't be read or names a pack
- * the plugin does not have.
+ * What one source says of the custom rules (rules.ts, `rulesOf`): the rules it gives, as written; `unreadable` for a value of the wrong
+ * shape or a source that can't be read; undefined when it says nothing.
  */
-export function resolveRedaction(org: PackChoice, person: PackChoice): Redaction {
-  if (org === 'unreadable' || person === 'unreadable') return { held: 'unreadable' }
+export type RuleChoice = readonly RuleSpec[] | 'unreadable' | undefined
+
+/** Several sources of rules as one choice, as `combinePacks` has packs. */
+export function combineRules(choices: Iterable<RuleChoice>): RuleChoice {
+  let out: RuleSpec[] | undefined
+  for (const c of choices) {
+    if (c === 'unreadable') return 'unreadable'
+    if (c !== undefined) out = [...(out ?? []), ...c]
+  }
+  return out
+}
+
+/** The custom rules and the allow-list beside the packs: the organization's rules, the person's, and the organization's allow-list. */
+export type CustomChoice = { org?: RuleChoice; person?: RuleChoice; allow?: ReadonlySet<string> }
+
+/**
+ * The redaction in force from the organization's choice and the person's: the organization's packs, or `DEFAULT_PACKS` where it chose
+ * none, with the person's added, and `secrets` always; in the order the packs run. Then every custom rule of the organization's and of
+ * the person's, the organization's first, each once, and the organization's allow-list. `held` when any of them can't be read, a pack
+ * named is one the plugin does not have (a `custom.<name>` counts as one where no rule has that name), or a rule can't be used.
+ */
+export function resolveRedaction(org: PackChoice, person: PackChoice, custom: CustomChoice = {}): Redaction {
+  if (org === 'unreadable' || person === 'unreadable' || custom.org === 'unreadable' || custom.person === 'unreadable') return { held: 'unreadable' }
+  const rules: Rule[] = []
+  for (const spec of [...(custom.org ?? []), ...(custom.person ?? [])]) {
+    const rule = compileRule(spec)
+    if ('refused' in rule) return { held: 'unknown pack' }
+    if (!rules.some(r => r.name === rule.name && r.pattern === rule.pattern)) rules.push(rule)
+  }
   const named = new Set<string>([...(org ?? DEFAULT_PACKS), ...(person ?? []), 'secrets'])
-  if ([...named].some(n => !(PACK_NAMES as readonly string[]).includes(n))) return { held: 'unknown pack' }
-  return { packs: PACK_NAMES.filter(p => named.has(p)) }
+  const known = (n: string) => (PACK_NAMES as readonly string[]).includes(n) || (n.startsWith('custom.') && rules.some(r => `custom.${r.name}` === n))
+  if ([...named].some(n => !known(n))) return { held: 'unknown pack' }
+  return {
+    packs: PACK_NAMES.filter(p => named.has(p)),
+    ...(rules.length > 0 ? { custom: rules } : {}),
+    ...(custom.allow !== undefined && custom.allow.size > 0 ? { allow: custom.allow } : {}),
+  }
 }
 
 /**
@@ -178,10 +213,15 @@ let optIn: readonly DataPointId[] = []
 /** The organization's choice of packs by where it came from: its data collection settings (`settings`), its managed settings. */
 let orgPacks: Partial<Record<'settings' | 'managed', PackChoice>> = {}
 let personPacks: PackChoice = undefined
+/** The organization's custom rules by where they came from, as its packs; the person's; the organization's allow-list. */
+let orgRules: Partial<Record<'settings' | 'managed', RuleChoice>> = {}
+let personRules: RuleChoice = undefined
+let allowList: ReadonlySet<string> = new Set()
 let current: Gate = resolveGate(env, overrides, limit, optIn)
 
 const refresh = () => {
-  current = resolveGate(env, overrides, limit, optIn, resolveRedaction(combinePacks(Object.values(orgPacks)), personPacks), inForce)
+  const custom: CustomChoice = { org: combineRules(Object.values(orgRules)), person: personRules, allow: allowList }
+  current = resolveGate(env, overrides, limit, optIn, resolveRedaction(combinePacks(Object.values(orgPacks)), personPacks, custom), inForce)
 }
 
 /** The gate in force for this load. */
@@ -225,10 +265,34 @@ export function setPersonPacks(choice: PackChoice): void {
   refresh()
 }
 
-/** The choices of packs of an earlier load stand for nothing: the default until this one reads its own. */
+/**
+ * The organization's custom rules from one source, as `setOrgPacks`: `settings`, its data collection settings (`custom_rules`), as the
+ * plugin keeps them (`RULES_KEY`); `managed`, the rules option in its managed settings. Every source's rules apply.
+ */
+export function setOrgRules(from: 'settings' | 'managed', choice: RuleChoice): void {
+  orgRules = { ...orgRules, [from]: choice }
+  refresh()
+}
+
+/** The custom rules the person adds, from their own user settings: read once per load, and again before each send. */
+export function setPersonRules(choice: RuleChoice): void {
+  personRules = choice
+  refresh()
+}
+
+/** The organization's allow-list (rules.ts, `allowListOf`), from its data collection settings: what no pack but `secrets` replaces. */
+export function setAllowList(entries: ReadonlySet<string>): void {
+  allowList = entries
+  refresh()
+}
+
+/** The choices of packs and rules of an earlier load stand for nothing: the default until this one reads its own. */
 export function resetPacks(): void {
   orgPacks = {}
   personPacks = undefined
+  orgRules = {}
+  personRules = undefined
+  allowList = new Set()
   refresh()
 }
 
@@ -246,6 +310,12 @@ export const OVERRIDES_KEY = 'dataPoints'
  * already queued.
  */
 export const PACKS_KEY = 'redactionPacks'
+
+/**
+ * Where the organization's custom rules are kept by hand, in the plugin's store, beside `PACKS_KEY`: a value of the rules option's shape
+ * (rules.ts, `rulesOf`), which applies, as `PACKS_KEY` does, while the store keeps no answer from Mainwave.
+ */
+export const RULES_KEY = 'redactionRules'
 
 const SETTINGS: readonly string[] = ['on', 'off', 'claude']
 
@@ -332,7 +402,8 @@ export function protectText(gate: Gate, text: string, key?: string, hits?: Hits,
   if (done === undefined) {
     const own: Hits = new Map()
     try {
-      done = { ...redact(text, exempt || 'held' in gate.redaction ? [] : gate.redaction.packs, own), hits: own }
+      const r = gate.redaction
+      done = exempt || 'held' in r ? { ...redact(text, [], own), hits: own } : { ...redact(text, r.packs, own, { custom: r.custom, allow: r.allow }), hits: own }
     } catch {
       return null
     }

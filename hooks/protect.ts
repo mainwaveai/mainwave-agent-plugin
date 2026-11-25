@@ -7,7 +7,7 @@
 //
 // Length: Claude Code's own limit for telemetry content, and its marker, so a value the plugin cuts reads as one Claude Code cut.
 
-import { addHit, scanPacks, type Hits, type PackName } from './packs.ts'
+import { addHit, scanPacks, type Extra, type Hits, type PackName } from './packs.ts'
 
 /** Claude Code's limit on a telemetry content value, in characters, when nothing sets a lower one. */
 export const CONTENT_MAX_LENGTH = 61_440
@@ -76,12 +76,16 @@ const ASSIGNED: readonly Rule[] = [
   },
 ]
 
+/** The names of the secret rules, as their markers write them. */
+const SECRET_NAMES: ReadonlySet<string> = new Set([...SECRETS, ...ASSIGNED].map(r => r.name))
+
 /**
- * A value with every secret replaced, then every match of the personal-data packs among `packs` (packs.ts), and how many were. The
- * secret rules always run, and first, so a pack never reads the digits inside a token they replace. Each match replaced is counted in
- * `hits` too, where given: a secret under the `secrets` pack and its rule's name, a pack's match under its pack and rule.
+ * A value with every secret replaced, then every match of the personal-data packs among `packs` and of the custom rules (packs.ts,
+ * `extra`), and how many were. The secret rules always run, and first, so a pack never reads the digits inside a token they replace,
+ * and the allow-list never spares a secret. Each match replaced is counted in `hits` too, where given: a secret under the `secrets` pack
+ * and its rule's name, a pack's match under its pack and rule.
  */
-export function redact(text: string, packs: readonly PackName[] = [], hits?: Hits): { text: string; count: number } {
+export function redact(text: string, packs: readonly PackName[] = [], hits?: Hits, extra?: Extra): { text: string; count: number } {
   let out = text
   let count = 0
   for (const rule of SECRETS) {
@@ -98,6 +102,6 @@ export function redact(text: string, packs: readonly PackName[] = [], hits?: Hit
       return next
     })
   }
-  const p = scanPacks(out, packs, hits)
+  const p = scanPacks(out, packs, hits, extra === undefined ? undefined : { ...extra, secretNames: SECRET_NAMES })
   return { text: p.text, count: count + p.count }
 }

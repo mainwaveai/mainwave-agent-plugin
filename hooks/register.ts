@@ -2663,7 +2663,7 @@ export async function sessionEnd($: SessionEndParams[0], e: SessionEndParams[1],
     if (collectorMalformed()) $.ui.log('mainwave: copy off: the collectorUrl option is not an https URL (or http on loopback)', { to: 'debug' })
     // Never the value: only why.
     const redaction = currentGate().redaction
-    if (isCopying() && 'held' in redaction) $.ui.log(`mainwave: identifier and content values held back: the redaction packs chosen ${redaction.held === 'unreadable' ? "can't be read" : 'name a pack this plugin does not have'}`, { to: 'debug' })
+    if (isCopying() && 'held' in redaction) $.ui.log(`mainwave: identifier and content values held back: the redaction packs chosen ${redaction.held === 'unreadable' ? "can't be read" : "name a pack this plugin does not have, or a custom rule it can't use"}`, { to: 'debug' })
     if (isCopying()) {
       const s = snapshot()
       const refusals = s.refusedIdentities > 0 ? `, ${s.refusedIdentities} organization and email refused` : ''

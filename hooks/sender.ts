@@ -42,12 +42,13 @@
 
 import type { EngineInterface, Timer } from 'claude-code'
 
-import { combinePacks, currentGate, gateMarker, gatePoint, gateResource, gateRow, optInOf, packsOf, setOptIn, setOrgPacks, setPersonPacks } from './gate.ts'
+import { combinePacks, combineRules, currentGate, gateMarker, gatePoint, gateResource, gateRow, optInOf, packsOf, setOptIn, setOrgPacks, setOrgRules, setPersonPacks, setPersonRules } from './gate.ts'
 import { fetchWithin, type FetchOutcome } from './http.ts'
 import { applyStoredSettings } from './orgsettings.ts'
 import { hostArchOf, isCowork, logsBody, metricsBody, resourceOf, tracesBody, type BuiltSpan, type CopiedRow, type MetricPoint } from './otlp.ts'
 import { routingIdentityOf } from './identity.ts'
-import { collectorIn, namesOption, OPT_IN_OPTION, optionValues, PACKS_OPTION, PROD_COLLECTOR, type Layer } from './settings.ts'
+import { collectorIn, namesOption, OPT_IN_OPTION, optionValues, PACKS_OPTION, PROD_COLLECTOR, RULES_OPTION, type Layer } from './settings.ts'
+import { rulesOf } from './rules.ts'
 
 export type Signal = 'logs' | 'traces' | 'metrics'
 export const SIGNALS: readonly Signal[] = ['logs', 'traces', 'metrics']
@@ -482,9 +483,10 @@ async function readLayer($: EngineInterface, source: 'user' | 'project' | 'local
 
 /**
  * The plugin's options the gate reads, once per load and again before each send, so a change reaches records already queued: the data
- * points the person opts in to and the packs they add, from their own user settings (gate.ts, `setOptIn`, `setPersonPacks`), and the
- * packs the organization chooses, in its managed settings, and its data collection settings from Mainwave, as this load had them or the
- * store keeps them (orgsettings.ts, `applyStoredSettings`: its explicit settings per data point, and what it gives in force, too).
+ * points the person opts in to and the packs and custom rules they add, from their own user settings (gate.ts, `setOptIn`,
+ * `setPersonPacks`, `setPersonRules`), and the packs and rules the organization chooses, in its managed settings, and its data
+ * collection settings from Mainwave, as this load had them or the store keeps them (orgsettings.ts, `applyStoredSettings`: its explicit
+ * settings per data point, what it gives in force, and its allow-list, too).
  * A user layer that cannot be read opts in to nothing; a layer or a store that cannot be read holds identifier and content values back,
  * as its packs are not known. A batch sent again under its idempotency key goes through the gate as it is then, as with any setting:
  * the collector keeps the copy it took first.
@@ -510,6 +512,17 @@ export async function readOptions($: EngineInterface): Promise<void> {
     setOrgPacks('managed', packs(policy))
   } catch {
     setOrgPacks('managed', 'unreadable')
+  }
+  const rules = (layer: Layer) => (layer === 'unreadable' ? 'unreadable' : combineRules(optionValues(layer, RULES_OPTION).map(rulesOf)))
+  try {
+    setPersonRules(rules(user))
+  } catch {
+    setPersonRules('unreadable')
+  }
+  try {
+    setOrgRules('managed', rules(policy))
+  } catch {
+    setOrgRules('managed', 'unreadable')
   }
 }
 

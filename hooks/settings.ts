@@ -41,6 +41,12 @@ export const OPT_IN_OPTION = 'extraDataPoints'
  */
 export const PACKS_OPTION = 'redactionPacks'
 
+/**
+ * The option that lists custom redaction rules (rules.ts, `rulesOf`): a list of `{ "name", "pattern" }`, undeclared and read from the
+ * same layers as `PACKS_OPTION`. The organization's apply to everyone; a person's add to them for their own sessions.
+ */
+export const RULES_OPTION = 'redactionRules'
+
 const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v)
 const has = (o: Record<string, unknown>, k: string) => Object.prototype.hasOwnProperty.call(o, k)
 
